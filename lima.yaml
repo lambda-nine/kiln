@@ -1,0 +1,30 @@
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 8GiB
+disk: 40GiB
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+mounts:
+  - location: "/Users/stephenestrada/Projects/kiln"
+    writable: true
+mountType: virtiofs
+containerd:
+  system: false
+  user: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y build-essential pkg-config strace iproute2 nftables bpftrace linux-tools-common busybox-static jq
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default
+      fi

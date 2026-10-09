@@ -1,0 +1,96 @@
+# kiln architecture
+
+kiln runs AI agent tool calls inside Linux sandboxes. This file records where
+it is today, where it's going, and the decisions that shape the path.
+
+## Today: one-shot CLI
+
+```
+sudo kiln run --memory 512M --cpus 1 --pids 128 -- <cmd>
+
+ kiln (parent: supervisor)                 child (sandbox PID 1: kiln-init)
+ ─────────────────────────                 ────────────────────────────────
+ 1. find image   /var/lib/kiln/images/<image>
+ 2. make run dir /var/lib/kiln/runs/<id>/{upper,work,merged}
+ 3. make cgroup  /sys/fs/cgroup/kiln/<id>, write limits
+ 4. clone(NEWUTS|NEWPID|NEWNS) ──────────►  blocks reading a pipe
+ 5. write child PID to cgroup.procs
+ 6. write 1 byte to the pipe ────────────►  cgroup namespace → hostname
+                                            → private mounts → overlay root
+                                            → minimal /dev → pivot_root
+                                            → /proc + read-only cgroupfs
+                                            → clean env → fork + exec cmd
+                                            → forward signals, reap zombies
+ 7. wait, forwarding SIGTERM/HUP/USR1/USR2
+ 8. cleanup: cgroup.kill, rmdir cgroup, rm run dir
+```
+
+No daemon and no database: all state is in the kernel and two directories.
+The parent is the supervisor, so nothing outlives the command.
+
+## Target
+
+```
+                    LLM API
+                       ▲
+ ┌─────────────────────┴───────────────────────┐
+ │ Harness: agent loop + long-term memory      │
+ │ tools: exec, read_file, write_file, diff    │
+ └──────────────┬──────────────────────────────┘
+                │ gRPC over a Unix socket
+ ┌──────────────▼──────────────────────────────┐   per node
+ │ kilnd (daemon)                              │
+ │  sandbox manager: create/exec/stop/delete   │
+ │    state machine + reconcile on startup     │
+ │  image store + overlay snapshots            │
+ │  cgroup manager · network manager           │
+ │  run records (SQLite) · /metrics            │
+ └──────────────┬──────────────────────────────┘
+                │ one shim process per sandbox
+ ┌──────────────▼──────────────────────────────┐
+ │ kiln-shim → kiln-init (sandbox PID 1)       │
+ └──────────────┬──────────────────────────────┘
+                ▼
+ kernel: namespaces · cgroups v2 · overlayfs · seccomp · Landlock · nftables
+
+ Multi-node: k3s across several VMs; a Go operator with a Sandbox CRD places
+ sandboxes on nodes; kilnd runs on each node as a DaemonSet.
+```
+
+## Decisions
+
+1. **Sandboxes live for an agent session, not one command.** Agents need state
+   between tool calls (installed packages, files), so a sandbox is created once
+   and many commands run in it via `setns`, like `docker exec`.
+2. **A daemon (`kilnd`) owns sandbox state.** On startup it reconciles: it scans
+   `/sys/fs/cgroup/kiln/` and `/var/lib/kiln/runs/` and adopts or cleans up what
+   it finds.
+3. **One shim process per sandbox.** Sandboxes survive a `kilnd` crash or
+   upgrade, the same reason containerd has `containerd-shim`.
+4. **Pluggable isolation backend.** Containers share the host kernel. The
+   backend sits behind a trait so a Firecracker microVM backend can be added
+   with the same API.
+5. **Network egress denied by default**, with a per-sandbox allowlist and an
+   egress proxy that logs requests.
+6. **The overlay upper layer is the audit log.** It is an exact diff of what a
+   sandbox changed, and the basis for snapshots later.
+
+## Failure modes
+
+| Failure                          | Status                                  |
+|----------------------------------|-----------------------------------------|
+| Memory hog                       | Handled: group OOM kill, reported       |
+| Fork bomb                        | Handled: `pids.max`                     |
+| CPU hog                          | Handled: `cpu.max` throttling           |
+| Signals to PID 1 ignored         | Handled: kiln-init                      |
+| Zombie processes                 | Handled: kiln-init reaps                |
+| Disk fill                        | Open: upper layer is unbounded          |
+| Supervisor crash leaves orphans  | Open: kilnd reconcile + shim            |
+| Host reboot leaves run dirs      | Open: reconcile on startup              |
+| Sandbox escape                   | Partial: needs userns, seccomp, Landlock, network rules |
+
+## Build order
+
+kiln-init → disk quota → user namespaces → seccomp/Landlock → networking →
+kilnd with long-lived sandboxes and exec → harness (with memory; first user is
+the idea-marathon app) → metrics → cold-start work → k3s operator.
