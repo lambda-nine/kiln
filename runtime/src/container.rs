@@ -15,6 +15,8 @@ use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 
 use crate::cgroup::{Cgroup, Limits};
 use crate::init;
+use crate::landlock;
+use crate::seccomp;
 use crate::quota;
 use crate::userns;
 
@@ -29,6 +31,8 @@ pub struct Config {
     pub keep: bool,
     pub limits: Limits,
     pub disk: Option<u64>,
+    pub read_only: bool,
+    pub writable: Vec<PathBuf>,
     pub stats: bool,
     pub cmd: Vec<String>,
 }
@@ -292,6 +296,19 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         std::env::set_var("HOME", "/root");
         std::env::set_var("TERM", term);
     }
+
+    // Lock the process down. no_new_privs first: setuid binaries stop granting
+    // privilege, and both Landlock and seccomp require it. Order matters only
+    // in that both must come before the command runs; both are inherited by
+    // every child and can't be undone.
+    nix::sys::prctl::set_no_new_privs().context("set no_new_privs")?;
+    if cfg.read_only {
+        let mut writable: Vec<PathBuf> =
+            landlock::DEFAULT_WRITABLE.iter().map(PathBuf::from).collect();
+        writable.extend(cfg.writable.iter().cloned());
+        landlock::restrict_writes(&writable)?;
+    }
+    seccomp::install()?;
 
     let argv: Vec<CString> = cfg
         .cmd

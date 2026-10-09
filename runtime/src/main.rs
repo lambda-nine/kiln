@@ -1,8 +1,12 @@
 mod cgroup;
 mod container;
 mod init;
+mod landlock;
 mod quota;
+mod seccomp;
 mod userns;
+
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -39,6 +43,13 @@ enum Command {
         /// Disk limit for everything the sandbox writes, like 1G, or "max".
         #[arg(long, default_value = "1G")]
         disk: String,
+        /// Make the filesystem read-only (even for root) except /tmp, /root,
+        /// /workspace and any --writable paths. Uses Landlock.
+        #[arg(long)]
+        read_only: bool,
+        /// Extra writable directory with --read-only (absolute, repeatable).
+        #[arg(long, value_name = "PATH", requires = "read_only")]
+        writable: Vec<PathBuf>,
         /// Print resource usage when the sandbox exits.
         #[arg(long)]
         stats: bool,
@@ -51,14 +62,39 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { hostname, image, keep, memory, cpus, pids, disk, stats, cmd } => {
+        Command::Run {
+            hostname,
+            image,
+            keep,
+            memory,
+            cpus,
+            pids,
+            disk,
+            read_only,
+            writable,
+            stats,
+            cmd,
+        } => {
+            if let Some(p) = writable.iter().find(|p| !p.is_absolute()) {
+                bail!("--writable needs an absolute path, got {}", p.display());
+            }
             let limits = cgroup::Limits {
                 memory: cgroup::parse_size(&memory)?,
                 cpus: parse_cpus(&cpus)?,
                 pids: cgroup::parse_max(&pids)?,
             };
             let disk = cgroup::parse_size(&disk)?;
-            let cfg = container::Config { hostname, image, keep, limits, disk, stats, cmd };
+            let cfg = container::Config {
+                hostname,
+                image,
+                keep,
+                limits,
+                disk,
+                read_only,
+                writable,
+                stats,
+                cmd,
+            };
             let code = container::run(&cfg)?;
             std::process::exit(code);
         }

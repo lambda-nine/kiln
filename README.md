@@ -18,6 +18,7 @@ cargo build
 sudo target/debug/kiln run -- sh
 sudo target/debug/kiln run --keep -- sh  # keep the run dir to see what changed
 sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats -- sh
+sudo target/debug/kiln run --read-only --writable /data -- sh  # Landlock
 ```
 
 ## Layers
@@ -38,7 +39,13 @@ sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats
    files are shifted into that range when fetched. The user namespace is
    created *last*, after all mounts, so every other namespace stays owned by
    the host: sandbox root can't mount, unmount or change the hostname.
-5. seccomp-bpf and Landlock.
+5. **seccomp and Landlock** (done): every sandbox gets `no_new_privs` and a
+   hand-written seccomp-bpf filter that denies ~40 risky syscalls (kernel
+   modules, `bpf`, `io_uring`, `keyctl`, `perf_event_open`, the mount API,
+   `open_by_handle_at`, clock changes) and any `clone`/`unshare` that creates a
+   namespace. `--read-only` adds a Landlock ruleset: read and execute anywhere,
+   write only to `/tmp`, `/root`, `/workspace`, `/dev` files and `--writable`
+   paths, even as root.
 6. Networking: veth, bridge, nftables egress rules.
 7. Cold-start time: measure it, then make it fast.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
@@ -129,3 +136,23 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   since `chown` clears them. That's Docker's userns-remap approach. Idmapped
   mounts (`mount_setattr` with `MOUNT_ATTR_IDMAP`) would avoid the copy and
   allow a different ID range per sandbox; all sandboxes share one range today.
+- **A seccomp filter is a tiny BPF program.** It runs on every syscall with
+  `struct seccomp_data` (syscall number, architecture, args) and returns an
+  action. kiln's checks the architecture first (syscall numbers differ per
+  arch, so a mismatch kills the process), then compares the number against the
+  denylist. Check it's active with `grep Seccomp /proc/self/status`.
+- **Why block namespace creation.** Sandbox root has every capability inside
+  its user namespace, so `unshare(CLONE_NEWNET)` would succeed and expose
+  netfilter and other root-only kernel code. The filter tests `args[0]` of
+  `clone` and `unshare` against all `CLONE_NEW*` bits. `clone3` hides its flags
+  in a struct the filter can't read, so it gets `ENOSYS` and libc falls back to
+  `clone`, the same trick Docker uses.
+- **no_new_privs.** Required before an unprivileged process can install a
+  seccomp filter or Landlock ruleset: once set, exec can never grant more
+  privilege (setuid bits stop working), so the filter can't be escaped through
+  a setuid binary. `su` from root to a user still works; it only drops.
+- **Landlock binds root.** File permissions don't stop root (`CAP_DAC_OVERRIDE`),
+  but Landlock is checked separately: with `--read-only`, sandbox root gets
+  "Permission denied" writing `/etc/motd`. A ruleset only has grants, no denies:
+  you list the rights you "handle", and anything handled is denied unless a
+  rule grants it beneath some directory.
