@@ -2,6 +2,7 @@ mod cgroup;
 mod container;
 mod init;
 mod quota;
+mod userns;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};

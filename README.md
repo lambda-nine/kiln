@@ -33,7 +33,11 @@ sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats
    (default 1 core) and `pids.max` (default 128). The sandbox has its own cgroup
    namespace and a read-only view of its own limits at `/sys/fs/cgroup`.
    `--stats` prints peak memory, CPU time, throttling and OOM kills on exit.
-4. Rootless: user namespaces with UID/GID maps.
+4. **User namespaces** (done): root inside the sandbox is uid 2000000000 on
+   the host. The sandbox maps IDs 0..65535 to 2000000000..2000065535, and image
+   files are shifted into that range when fetched. The user namespace is
+   created *last*, after all mounts, so every other namespace stays owned by
+   the host: sandbox root can't mount, unmount or change the hostname.
 5. seccomp-bpf and Landlock.
 6. Networking: veth, bridge, nftables egress rules.
 7. Cold-start time: measure it, then make it fast.
@@ -109,3 +113,19 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   peak of about 100 MiB: page cache is charged to the writer's cgroup. It's
   reclaimable, so it causes writeback rather than OOM kills, but it counts
   toward `memory.max`.
+- **Create the user namespace last.** Each namespace is owned by the user
+  namespace that was current when it was created, and capabilities only work
+  on namespaces your user namespace owns. kiln does all its mounts as real
+  root, then calls `unshare(CLONE_NEWUSER)`. Sandbox root has a full set of
+  capabilities (`CapEff: 000001ffffffffff`) that apply to nothing that matters:
+  `hostname`, `mount` and `umount` all fail with EPERM.
+- **Only an outsider can write the ID maps.** A new user namespace starts with
+  no mapping, so the process shows up as `nobody`. The parent (outside it)
+  writes `0 2000000000 65536` to `/proc/<pid>/uid_map` and `gid_map`, then the
+  child switches to uid 0. That's a second pipe handshake, child → parent.
+- **Image files must be shifted.** Inside the sandbox, host-root-owned files
+  look like they belong to `nobody`, and sandbox root can't change them. So the
+  fetch script adds 2000000000 to every file's owner, and puts setuid bits back
+  since `chown` clears them. That's Docker's userns-remap approach. Idmapped
+  mounts (`mount_setattr` with `MOUNT_ATTR_IDMAP`) would avoid the copy and
+  allow a different ID range per sandbox; all sandboxes share one range today.

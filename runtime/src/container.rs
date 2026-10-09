@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, chown, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,7 @@ use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 use crate::cgroup::{Cgroup, Limits};
 use crate::init;
 use crate::quota;
+use crate::userns;
 
 const STACK_SIZE: usize = 1024 * 1024;
 const KILN_ROOT: &str = "/var/lib/kiln";
@@ -53,6 +54,14 @@ pub fn run(cfg: &Config) -> Result<i32> {
             lower.display()
         );
     }
+    // The image's files must belong to the sandbox's ID range, or sandbox
+    // root would see them all as owned by "nobody" and couldn't change them.
+    if lower.metadata()?.uid() != userns::ID_BASE {
+        bail!(
+            "image {:?} isn't owned by the sandbox ID range (re-run: sudo scripts/fetch-alpine.sh)",
+            cfg.image
+        );
+    }
 
     let id = run_id();
     let run_dir = Path::new(KILN_ROOT).join("runs").join(&id);
@@ -84,15 +93,20 @@ fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     for dir in [&layers.upper, &layers.work, &layers.merged] {
         fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
     }
+    // The sandbox's "/" takes its owner from upper/, so hand it to sandbox root.
+    let id = Some(userns::ID_BASE);
+    chown(&layers.upper, id, id).context("chown upper")?;
     Ok(())
 }
 
 fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     let cgroup = Cgroup::create(id, &cfg.limits)?;
 
-    // The child blocks on this pipe until the parent has finished setting it
-    // up from the outside. O_CLOEXEC keeps the pipe out of the user's command.
-    let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
+    // Two one-byte handshakes over a pair of pipes. Parent → child: "you're in
+    // your cgroup" and later "your ID maps are written". Child → parent: "I've
+    // created my user namespace". O_CLOEXEC keeps them out of the command.
+    let (to_child_rx, to_child_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
+    let (to_parent_rx, to_parent_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
 
     // Handle signals by waiting for them (see wait_for) instead of dying, so
     // Ctrl-C or `kill` can't skip cleanup.
@@ -109,7 +123,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     let flags = CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS;
 
     let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(|| match init(cfg, layers, &ready_rx) {
+    let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx) {
         Ok(code) => code as isize,
         Err(e) => {
             eprintln!("kiln: {e:#}");
@@ -122,14 +136,28 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     let pid = unsafe { clone(child, &mut stack, flags, Some(Signal::SIGCHLD as i32)) }
         .context("clone (are you root?)")?;
 
-    // Move the child into its cgroup before it runs anything, then let it go.
-    // Doing this from the parent avoids a race where the command starts
-    // before its limits apply.
-    let setup = cgroup.add(pid).and_then(|()| {
-        write(&ready_tx, b"1").context("signal child")?;
+    // Our copy of the child's write end must go, or we'd never see EOF if the
+    // child dies before writing.
+    drop(to_parent_tx);
+
+    let setup = (|| -> Result<()> {
+        // Move the child into its cgroup before it runs anything, then let it
+        // go. Doing this from the parent avoids a race where the command
+        // starts before its limits apply.
+        cgroup.add(pid)?;
+        write(&to_child_tx, b"1").context("signal child")?;
+
+        // The child does its mounts as real root, then creates its user
+        // namespace and waits for us to write its ID maps.
+        let mut buf = [0u8; 1];
+        if read(&to_parent_rx, &mut buf).context("wait for child")? == 0 {
+            return Ok(()); // Child failed and printed why; wait_for collects it.
+        }
+        userns::write_maps(pid)?;
+        write(&to_child_tx, b"1").context("signal child")?;
         Ok(())
-    });
-    drop(ready_tx);
+    })();
+    drop(to_child_tx);
     if let Err(e) = setup {
         let _ = kill(pid, Signal::SIGKILL);
         let _ = wait_for(pid, &signals);
@@ -185,12 +213,9 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
 
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
 /// then becomes its init and returns the command's exit code.
-fn init(cfg: &Config, layers: &Layers, ready: &OwnedFd) -> Result<i32> {
-    // Wait for the parent to put us in our cgroup. EOF means it gave up.
-    let mut buf = [0u8; 1];
-    if read(ready, &mut buf).context("wait for parent")? == 0 {
-        bail!("parent failed to set up the sandbox");
-    }
+fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedFd) -> Result<i32> {
+    // Wait for the parent to put us in our cgroup.
+    wait_for_parent(from_parent)?;
 
     // A cgroup namespace makes our current cgroup look like the root, so the
     // sandbox sees /sys/fs/cgroup as just its own limits and nothing above.
@@ -248,6 +273,14 @@ fn init(cfg: &Config, layers: &Layers, ready: &OwnedFd) -> Result<i32> {
     )
     .context("mount /sys/fs/cgroup")?;
 
+    // Last step as real root. Every namespace above was created first, so it
+    // stays owned by the host's user namespace and sandbox root gets no power
+    // over it: no mounting, unmounting or changing the hostname.
+    unshare(CloneFlags::CLONE_NEWUSER).context("unshare user namespace")?;
+    write(to_parent, b"1").context("signal parent")?;
+    wait_for_parent(from_parent)?;
+    userns::become_root()?;
+
     // Start from a clean environment so host variables don't leak in.
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".into());
     // SAFETY: single-threaded, and nothing else reads the environment here.
@@ -267,6 +300,15 @@ fn init(cfg: &Config, layers: &Layers, ready: &OwnedFd) -> Result<i32> {
         .collect::<Result<_, _>>()
         .context("argument contains a NUL byte")?;
     init::run(&argv)
+}
+
+/// Blocks until the parent writes its next handshake byte. EOF means it gave up.
+fn wait_for_parent(from_parent: &OwnedFd) -> Result<()> {
+    let mut buf = [0u8; 1];
+    if read(from_parent, &mut buf).context("wait for parent")? == 0 {
+        bail!("parent failed to set up the sandbox");
+    }
+    Ok(())
 }
 
 /// Builds a minimal /dev: a small tmpfs holding bind mounts of a few safe host
