@@ -84,13 +84,13 @@ The parent is the supervisor, so nothing outlives the command.
 | CPU hog                          | Handled: `cpu.max` throttling           |
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |
-| Disk fill                        | Open: upper layer is unbounded          |
+| Disk fill                        | Handled: XFS project quota per run      |
 | Supervisor crash leaves orphans  | Open: kilnd reconcile + shim            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |
 | Sandbox escape                   | Partial: needs userns, seccomp, Landlock, network rules |
 
 ## Build order
 
-kiln-init → disk quota → user namespaces → seccomp/Landlock → networking →
+~~kiln-init~~ → ~~disk quota~~ → user namespaces → seccomp/Landlock → networking →
 kilnd with long-lived sandboxes and exec → harness (with memory; first user is
 the idea-marathon app) → metrics → cold-start work → k3s operator.

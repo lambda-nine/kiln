@@ -13,10 +13,11 @@ brew install lima
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln      # now in Ubuntu 24.04
 sudo scripts/fetch-alpine.sh             # once: unpack Alpine as the "alpine" image
+sudo scripts/setup-storage.sh            # once: XFS with project quotas for --disk
 cargo build
 sudo target/debug/kiln run -- sh
 sudo target/debug/kiln run --keep -- sh  # keep the run dir to see what changed
-sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --stats -- sh
+sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats -- sh
 ```
 
 ## Layers
@@ -40,6 +41,11 @@ sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --stats -- sh
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
    exits with the command's code. The host-side `kiln` survives Ctrl-C and
    `kill`, passes them on, and still cleans up.
+
+9. **Disk limits** (done): `/var/lib/kiln/runs` is an XFS filesystem (in a
+   sparse file on a loop device) mounted with `prjquota`. Each run directory
+   gets its own project ID with PROJINHERIT and a hard block limit (`--disk`,
+   default 1G). Done with raw `FS_IOC_FSSETXATTR` ioctls and `quotactl_fd`.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 
@@ -92,3 +98,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   process group, and the sandboxed command is in that group, so it already got
   the signal. Forwarding it too would deliver it twice. Ctrl-C ends a run with
   130 and everything is cleaned up.
+- **Project quotas cap a directory tree, not a user.** Classic quotas limit
+  what a UID owns. XFS project quotas limit whatever is tagged with a project
+  ID, and PROJINHERIT makes new files inherit the tag from their directory.
+  kiln uses the run directory's inode number as the ID. Inspect live usage
+  with `sudo xfs_quota -x -c 'report -p -h' /var/lib/kiln/runs`.
+- **A full quota looks like a full disk.** XFS returns `ENOSPC` ("No space
+  left on device"), not `EDQUOT`, when a project hits its limit.
+- **Writing files costs memory too.** Writing 100 MB to disk showed a memory
+  peak of about 100 MiB: page cache is charged to the writer's cgroup. It's
+  reclaimable, so it causes writeback rather than OOM kills, but it counts
+  toward `memory.max`.

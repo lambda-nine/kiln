@@ -1,6 +1,7 @@
 mod cgroup;
 mod container;
 mod init;
+mod quota;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -34,6 +35,9 @@ enum Command {
         /// Maximum number of processes and threads, or "max".
         #[arg(long, default_value = "128")]
         pids: String,
+        /// Disk limit for everything the sandbox writes, like 1G, or "max".
+        #[arg(long, default_value = "1G")]
+        disk: String,
         /// Print resource usage when the sandbox exits.
         #[arg(long)]
         stats: bool,
@@ -46,13 +50,14 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { hostname, image, keep, memory, cpus, pids, stats, cmd } => {
+        Command::Run { hostname, image, keep, memory, cpus, pids, disk, stats, cmd } => {
             let limits = cgroup::Limits {
                 memory: cgroup::parse_size(&memory)?,
                 cpus: parse_cpus(&cpus)?,
                 pids: cgroup::parse_max(&pids)?,
             };
-            let cfg = container::Config { hostname, image, keep, limits, stats, cmd };
+            let disk = cgroup::parse_size(&disk)?;
+            let cfg = container::Config { hostname, image, keep, limits, disk, stats, cmd };
             let code = container::run(&cfg)?;
             std::process::exit(code);
         }

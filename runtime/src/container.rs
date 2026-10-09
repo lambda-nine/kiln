@@ -15,6 +15,7 @@ use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 
 use crate::cgroup::{Cgroup, Limits};
 use crate::init;
+use crate::quota;
 
 const STACK_SIZE: usize = 1024 * 1024;
 const KILN_ROOT: &str = "/var/lib/kiln";
@@ -26,6 +27,7 @@ pub struct Config {
     pub image: String,
     pub keep: bool,
     pub limits: Limits,
+    pub disk: Option<u64>,
     pub stats: bool,
     pub cmd: Vec<String>,
 }
@@ -60,12 +62,10 @@ pub fn run(cfg: &Config) -> Result<i32> {
         work: run_dir.join("work"),
         merged: run_dir.join("merged"),
     };
-    for dir in [&layers.upper, &layers.work, &layers.merged] {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("create {} (are you root?)", dir.display()))?;
-    }
+    fs::create_dir_all(&run_dir)
+        .with_context(|| format!("create {} (are you root?)", run_dir.display()))?;
 
-    let result = spawn_and_wait(cfg, &id, &layers);
+    let result = prepare(cfg, &run_dir, &layers).and_then(|()| spawn_and_wait(cfg, &id, &layers));
 
     // The overlay mount lived in the sandbox's mount namespace, so it vanished
     // with the sandbox. Only the directories are left to clean up.
@@ -75,6 +75,16 @@ pub fn run(cfg: &Config) -> Result<i32> {
         eprintln!("kiln: failed to remove {}: {e}", run_dir.display());
     }
     result
+}
+
+fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
+    // The quota goes on the run dir while it's still empty, so upper/ and
+    // work/ (and everything the sandbox writes) inherit its project.
+    quota::limit(run_dir, cfg.disk)?;
+    for dir in [&layers.upper, &layers.work, &layers.merged] {
+        fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
@@ -131,7 +141,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
         eprintln!("kiln: sandbox ran out of memory and was killed (memory.max)");
     }
     if cfg.stats {
-        print_stats(&cgroup);
+        print_stats(&cgroup, &layers.upper);
     }
     Ok(code)
 }
@@ -155,7 +165,7 @@ fn wait_for(pid: Pid, signals: &SigSet) -> Result<i32> {
     }
 }
 
-fn print_stats(cgroup: &Cgroup) {
+fn print_stats(cgroup: &Cgroup, upper: &Path) {
     let mib = |b: u64| b as f64 / (1 << 20) as f64;
     let ms = |us: u64| us as f64 / 1000.0;
     let get = |v: Option<u64>| v.unwrap_or(0);
@@ -168,6 +178,9 @@ fn print_stats(cgroup: &Cgroup) {
         get(cgroup.value("pids.peak")),
         get(cgroup.stat("memory.events", "oom_kill")),
     );
+    if let Some(bytes) = quota::usage(upper) {
+        eprintln!("kiln: disk used {:.1} MiB", mib(bytes));
+    }
 }
 
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
