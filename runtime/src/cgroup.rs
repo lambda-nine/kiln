@@ -70,17 +70,19 @@ impl Cgroup {
         self.write("cgroup.procs", &pid.to_string())
     }
 
-    /// Reads one numeric file, like `memory.peak`.
-    pub fn value(&self, file: &str) -> Option<u64> {
-        fs::read_to_string(self.path.join(file)).ok()?.trim().parse().ok()
+    /// Reads one numeric file, like `memory.peak`. 0 if it's missing.
+    pub fn value(&self, file: &str) -> u64 {
+        let text = fs::read_to_string(self.path.join(file)).unwrap_or_default();
+        text.trim().parse().unwrap_or(0)
     }
 
     /// Reads one `key value` line from a flat-keyed file, like `cpu.stat`.
-    pub fn stat(&self, file: &str, key: &str) -> Option<u64> {
-        fs::read_to_string(self.path.join(file))
-            .ok()?
-            .lines()
+    /// 0 if it's missing.
+    pub fn stat(&self, file: &str, key: &str) -> u64 {
+        let text = fs::read_to_string(self.path.join(file)).unwrap_or_default();
+        text.lines()
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or(0)
     }
 
     fn write(&self, file: &str, value: &str) -> Result<()> {
@@ -111,27 +113,4 @@ impl Drop for Cgroup {
 
 fn write(path: &Path, value: &str) -> Result<()> {
     fs::write(path, value).with_context(|| format!("write {value:?} to {}", path.display()))
-}
-
-/// Parses a size like `512M`, `2G`, `65536` or `max`.
-pub fn parse_size(s: &str) -> Result<Option<u64>> {
-    if s == "max" {
-        return Ok(None);
-    }
-    let (num, mult) = match s.char_indices().last() {
-        Some((i, 'K' | 'k')) => (&s[..i], 1 << 10),
-        Some((i, 'M' | 'm')) => (&s[..i], 1 << 20),
-        Some((i, 'G' | 'g')) => (&s[..i], 1 << 30),
-        _ => (s, 1),
-    };
-    let n: u64 = num.parse().with_context(|| format!("invalid size {s:?}"))?;
-    Ok(Some(n * mult))
-}
-
-/// Parses a count like `128` or `max`.
-pub fn parse_max(s: &str) -> Result<Option<u64>> {
-    if s == "max" {
-        return Ok(None);
-    }
-    Ok(Some(s.parse().with_context(|| format!("invalid number {s:?}"))?))
 }

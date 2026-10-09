@@ -44,9 +44,13 @@ table inet kiln {
 
     chain forward {
         type filter hook forward priority filter; policy accept;
-        ct state established,related accept
+        # Every packet from a sandbox goes through its current policy, even on
+        # an established connection. Leases reuse IPs, and conntrack entries
+        # outlive sandboxes, so accepting "established" first would let a new
+        # sandbox continue flows only the previous one was allowed.
         iifname "kiln0" ip saddr vmap @egress
         iifname "kiln0" counter reject with icmpx admin-prohibited
+        oifname "kiln0" ct state established,related accept
         oifname "kiln0" counter drop
     }
     # Sandboxes may not talk to the host itself (sshd, later kilnd's API).
@@ -55,8 +59,8 @@ table inet kiln {
         iifname "kiln0" ct state established,related accept
         iifname "kiln0" counter reject with icmpx admin-prohibited
     }
-}
-table ip kiln_nat {
+    # NAT works in inet tables too (Linux 5.2+), so one table holds it all
+    # and the existence check in ensure_bridge covers everything.
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         ip saddr 10.88.0.0/16 oifname != "kiln0" masquerade
@@ -168,10 +172,10 @@ impl Network {
         format!("sb_{}", self.ip.to_string().replace('.', "_"))
     }
 
-    /// Interface names are capped at 15 bytes; the IP's host part is unique.
-    fn ifnames(&self) -> (String, String) {
-        let n = u32::from(self.ip) & 0xffff;
-        (format!("kv{n:04x}"), format!("kp{n:04x}"))
+    /// The host end of the veth pair. Interface names are capped at 15 bytes;
+    /// the IP's host part is unique.
+    fn host_if(&self) -> String {
+        format!("kv{:04x}", u32::from(self.ip) & 0xffff)
     }
 
     /// Packets the sandbox tried to send that its policy rejected.
@@ -195,7 +199,7 @@ impl Network {
 impl Drop for Network {
     fn drop(&mut self) {
         let chain = self.chain();
-        let (host_if, _) = self.ifnames();
+        let host_if = self.host_if();
         // Each step on its own so one failure doesn't skip the rest.
         let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {} }}", self.ip)], None);
         let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
@@ -211,10 +215,7 @@ impl Drop for Network {
 /// Configures the network namespace of `pid` (a freshly cloned sandbox that
 /// is still waiting on its parent). Returns `None` for `--net none`.
 pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
-    // Inside the namespace: loopback up (it starts down), and two sysctls
-    // Docker also sets, because sandbox root lacks CAP_NET_BIND_SERVICE and
-    // CAP_NET_RAW in a namespace it doesn't own: allow binding ports < 1024,
-    // and allow ping through ICMP sockets.
+    // Inside the namespace: loopback up (it starts down).
     let mut inside = String::from("link set lo up\n");
 
     let network = if matches!(plan.mode, Mode::None) {
@@ -222,25 +223,23 @@ pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
     } else {
         ensure_bridge()?;
         let network = lease()?;
-        let (host_if, peer_if) = network.ifnames();
+        let host_if = network.host_if();
         let ip = network.ip;
 
         run(
             "ip",
             &["-batch", "-"],
             Some(&format!(
-                "link add {host_if} type veth peer name {peer_if}\n\
+                "link add {host_if} type veth peer name eth0 netns {pid}\n\
                  link set {host_if} master {BRIDGE}\n\
                  link set dev {host_if} type bridge_slave isolated on\n\
-                 link set {host_if} up\n\
-                 link set {peer_if} netns {pid}\n"
+                 link set {host_if} up\n"
             )),
         )
         .context("create veth pair")?;
 
         inside.push_str(&format!(
-            "link set {peer_if} name eth0\n\
-             addr add {ip}/{PREFIX} dev eth0\n\
+            "addr add {ip}/{PREFIX} dev eth0\n\
              link set eth0 up\n\
              route add default via {GATEWAY}\n"
         ));
@@ -252,16 +251,7 @@ pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
     let pid_s = pid.to_string();
     run(
         "nsenter",
-        &[
-            "--target",
-            &pid_s,
-            "--net",
-            "--",
-            "sh",
-            "-c",
-            "sysctl -qw net.ipv4.ip_unprivileged_port_start=0 \
-             'net.ipv4.ping_group_range=0 2147483647' && ip -batch -",
-        ],
+        &["--target", &pid_s, "--net", "--", "ip", "-batch", "-"],
         Some(&inside),
     )
     .context("configure sandbox network namespace")?;
@@ -272,7 +262,9 @@ pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
 fn policy(network: &Network, plan: &Plan) -> String {
     let chain = network.chain();
     let rule = |body: &str| format!("add rule inet kiln {chain} {body}\n");
-    let mut nft = format!("add chain inet kiln {chain}\n");
+    // Flush in case a crashed run left this IP's chain behind: `add chain` is
+    // a no-op on an existing chain, and its old rules would come first.
+    let mut nft = format!("add chain inet kiln {chain}\nflush chain inet kiln {chain}\n");
 
     if !plan.resolvers.is_empty() {
         let dns = set(plan.resolvers.iter().map(|r| r.to_string()));

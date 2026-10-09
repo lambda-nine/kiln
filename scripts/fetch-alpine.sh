@@ -24,6 +24,8 @@ echo "$sha  $tmp/$file" | sha256sum -c -
 rm -rf "$dest"
 mkdir -p "$dest"
 tar -xzf "$tmp/$file" -C "$dest"
+# Mount points kiln needs, made once here so runs don't record them in upper/.
+mkdir -p "$dest/sys/fs/cgroup" "$dest/workspace"
 
 # Shift every file's owner and group by id_base (root:root becomes
 # 2000000000:2000000000). chown clears setuid/setgid bits, so put the mode back.

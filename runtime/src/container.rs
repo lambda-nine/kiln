@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::fs;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, chown, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +52,12 @@ struct Layers {
 /// Runs `cfg.cmd` in a fresh sandbox, waits for it, and returns a shell-style
 /// exit code (128 + signal number if it was killed).
 pub fn run(cfg: &Config) -> Result<i32> {
+    // A plain name, so `--image ../../somewhere` can't pick an arbitrary host
+    // directory (or another run's upper layer) as the root filesystem.
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
+    if cfg.image.is_empty() || cfg.image.starts_with('.') || !cfg.image.chars().all(safe) {
+        bail!("invalid image name {:?}", cfg.image);
+    }
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
     if !lower.is_dir() {
         bail!(
@@ -127,10 +133,14 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     //   NEWPID - its own PID numbering; the child becomes PID 1
     //   NEWNS  - its own mount table, so its mounts never touch the host
     //   NEWNET - its own interfaces, routes and firewall (only lo at first)
+    //   NEWIPC - its own System V shared memory, semaphores and message
+    //            queues, freed when the sandbox ends. Without it, sandboxes
+    //            could read and destroy each other's (they share host IDs).
     let flags = CloneFlags::CLONE_NEWUTS
         | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWNET;
+        | CloneFlags::CLONE_NEWNET
+        | CloneFlags::CLONE_NEWIPC;
 
     let mut stack = vec![0u8; STACK_SIZE];
     let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx) {
@@ -178,7 +188,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     }
 
     let code = wait_for(pid, &signals)?;
-    if cgroup.stat("memory.events", "oom_kill").unwrap_or(0) > 0 {
+    if cgroup.stat("memory.events", "oom_kill") > 0 {
         eprintln!("kiln: sandbox ran out of memory and was killed (memory.max)");
     }
     if cfg.stats {
@@ -212,15 +222,14 @@ fn wait_for(pid: Pid, signals: &SigSet) -> Result<i32> {
 fn print_stats(cgroup: &Cgroup, upper: &Path) {
     let mib = |b: u64| b as f64 / (1 << 20) as f64;
     let ms = |us: u64| us as f64 / 1000.0;
-    let get = |v: Option<u64>| v.unwrap_or(0);
     eprintln!(
         "kiln: memory peak {:.1} MiB | cpu {:.0} ms (throttled {} times, {:.0} ms) | pids peak {} | oom kills {}",
-        mib(get(cgroup.value("memory.peak"))),
-        ms(get(cgroup.stat("cpu.stat", "usage_usec"))),
-        get(cgroup.stat("cpu.stat", "nr_throttled")),
-        ms(get(cgroup.stat("cpu.stat", "throttled_usec"))),
-        get(cgroup.value("pids.peak")),
-        get(cgroup.stat("memory.events", "oom_kill")),
+        mib(cgroup.value("memory.peak")),
+        ms(cgroup.stat("cpu.stat", "usage_usec")),
+        cgroup.stat("cpu.stat", "nr_throttled"),
+        ms(cgroup.stat("cpu.stat", "throttled_usec")),
+        cgroup.value("pids.peak"),
+        cgroup.stat("memory.events", "oom_kill"),
     );
     if let Some(bytes) = quota::usage(upper) {
         eprintln!("kiln: disk used {:.1} MiB", mib(bytes));
@@ -230,6 +239,8 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
 /// then becomes its init and returns the command's exit code.
 fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedFd) -> Result<i32> {
+    close_fds_except(&[from_parent.as_raw_fd(), to_parent.as_raw_fd()])?;
+
     // Wait for the parent to put us in our cgroup.
     wait_for_parent(from_parent)?;
 
@@ -278,8 +289,13 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     )
     .context("mount /proc")?;
 
+    // /proc/sys/net belongs to the network namespace of whoever opens it, so
+    // these only change ours. Sandbox root won't own this namespace, so let
+    // it bind ports below 1024 and ping (ICMP sockets) anyway, like Docker.
+    fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0").context("sysctl")?;
+    fs::write("/proc/sys/net/ipv4/ping_group_range", "0 2147483647").context("sysctl")?;
+
     // Read-only, so the sandbox can read its limits and usage but not raise them.
-    fs::create_dir_all("/sys/fs/cgroup").context("create /sys/fs/cgroup")?;
     mount(
         Some("cgroup2"),
         "/sys/fs/cgroup",
@@ -302,6 +318,10 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     write(to_parent, b"1").context("signal parent")?;
     wait_for_parent(from_parent)?;
     userns::become_root()?;
+    // If the host-side kiln dies, take the sandbox down with it rather than
+    // leave it running unsupervised. Set after become_root, because changing
+    // credentials clears it.
+    nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).context("set pdeathsig")?;
 
     // Start from a clean environment so host variables don't leak in.
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".into());
@@ -321,10 +341,7 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     // every child and can't be undone.
     nix::sys::prctl::set_no_new_privs().context("set no_new_privs")?;
     if cfg.read_only {
-        let mut writable: Vec<PathBuf> =
-            landlock::DEFAULT_WRITABLE.iter().map(PathBuf::from).collect();
-        writable.extend(cfg.writable.iter().cloned());
-        landlock::restrict_writes(&writable)?;
+        landlock::restrict_writes(&cfg.writable)?;
     }
     seccomp::install()?;
 
@@ -335,6 +352,27 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         .collect::<Result<_, _>>()
         .context("argument contains a NUL byte")?;
     init::run(&argv)
+}
+
+/// Closes every file descriptor except stdin, stdout, stderr and `keep`.
+/// Anything else was inherited from whoever started kiln (an open host file,
+/// a directory, a socket), and namespaces, pivot_root and Landlock don't
+/// revoke open descriptors: each would be a handle straight through the
+/// sandbox walls. This also drops our copies of the parent's pipe ends, so a
+/// parent that dies mid-setup shows up here as EOF instead of a hang.
+fn close_fds_except(keep: &[RawFd]) -> Result<()> {
+    let mut keep: Vec<u32> = keep.iter().map(|&fd| fd as u32).collect();
+    keep.sort_unstable();
+    let mut first = 3;
+    for fd in keep.into_iter().chain([u32::MAX]) {
+        if fd > first {
+            // SAFETY: closes a range of descriptors; nothing below uses them.
+            let ret = unsafe { libc::syscall(libc::SYS_close_range, first, fd - 1, 0) };
+            nix::errno::Errno::result(ret).context("close_range")?;
+        }
+        first = fd.saturating_add(1);
+    }
+    Ok(())
 }
 
 /// Blocks until the parent writes its next handshake byte. EOF means it gave up.
@@ -374,6 +412,19 @@ fn setup_dev(dev: &Path) -> Result<()> {
     ] {
         symlink(target, dev.join(link)).with_context(|| format!("symlink /dev/{link}"))?;
     }
+
+    // POSIX shared memory (Python multiprocessing, Chromium, Postgres). Its
+    // pages are charged to the sandbox's cgroup, so it stays inside memory.max.
+    let shm = dev.join("shm");
+    fs::create_dir(&shm).context("create /dev/shm")?;
+    mount(
+        Some("tmpfs"),
+        &shm,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        Some("mode=1777,size=64m"),
+    )
+    .context("mount /dev/shm")?;
     Ok(())
 }
 

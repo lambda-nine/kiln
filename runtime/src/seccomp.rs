@@ -27,65 +27,64 @@ const NR: u32 = 0;
 const ARCH: u32 = 4;
 const ARG0_LOW: u32 = 16; // low 32 bits of args[0] (little-endian)
 
-/// Every CLONE_NEW* flag: NEWTIME, NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER,
-/// NEWPID, NEWNET. Sandbox root holds every capability inside its user
+/// Every CLONE_NEW* flag. Sandbox root holds every capability inside its user
 /// namespace, so without this it could create fresh namespaces and reach
 /// kernel code (netfilter, mounts) that's normally root-only.
-const CLONE_NEW_ANY: u32 = 0x0000_0080
-    | 0x0002_0000
-    | 0x0200_0000
-    | 0x0400_0000
-    | 0x0800_0000
-    | 0x1000_0000
-    | 0x2000_0000
-    | 0x4000_0000;
+const CLONE_NEW_ANY: u32 = (libc::CLONE_NEWTIME
+    | libc::CLONE_NEWNS
+    | libc::CLONE_NEWCGROUP
+    | libc::CLONE_NEWUTS
+    | libc::CLONE_NEWIPC
+    | libc::CLONE_NEWUSER
+    | libc::CLONE_NEWPID
+    | libc::CLONE_NEWNET) as u32;
 
 /// Denied outright with EPERM.
-const DENIED: &[(i64, &str)] = &[
+const DENIED: &[i64] = &[
     // Kernel modules and replacing the kernel.
-    (libc::SYS_init_module, "init_module"),
-    (libc::SYS_finit_module, "finit_module"),
-    (libc::SYS_delete_module, "delete_module"),
-    (libc::SYS_kexec_load, "kexec_load"),
-    (libc::SYS_kexec_file_load, "kexec_file_load"),
-    (libc::SYS_reboot, "reboot"),
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_kexec_load,
+    libc::SYS_kexec_file_load,
+    libc::SYS_reboot,
     // Big, bug-prone kernel subsystems.
-    (libc::SYS_bpf, "bpf"),
-    (libc::SYS_perf_event_open, "perf_event_open"),
-    (libc::SYS_userfaultfd, "userfaultfd"),
-    (libc::SYS_io_uring_setup, "io_uring_setup"),
-    (libc::SYS_io_uring_enter, "io_uring_enter"),
-    (libc::SYS_io_uring_register, "io_uring_register"),
+    libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
     // The kernel keyring isn't namespaced.
-    (libc::SYS_keyctl, "keyctl"),
-    (libc::SYS_add_key, "add_key"),
-    (libc::SYS_request_key, "request_key"),
+    libc::SYS_keyctl,
+    libc::SYS_add_key,
+    libc::SYS_request_key,
     // Opening files by handle bypasses path checks ("Shocker" container escape).
-    (libc::SYS_open_by_handle_at, "open_by_handle_at"),
-    (libc::SYS_name_to_handle_at, "name_to_handle_at"),
+    libc::SYS_open_by_handle_at,
+    libc::SYS_name_to_handle_at,
     // Joining namespaces, and the mount API.
-    (libc::SYS_setns, "setns"),
-    (libc::SYS_mount, "mount"),
-    (libc::SYS_umount2, "umount2"),
-    (libc::SYS_pivot_root, "pivot_root"),
-    (libc::SYS_fsopen, "fsopen"),
-    (libc::SYS_fsconfig, "fsconfig"),
-    (libc::SYS_fsmount, "fsmount"),
-    (libc::SYS_fspick, "fspick"),
-    (libc::SYS_move_mount, "move_mount"),
-    (libc::SYS_open_tree, "open_tree"),
-    (libc::SYS_mount_setattr, "mount_setattr"),
+    libc::SYS_setns,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
     // Host-wide state: clock, swap, accounting, kernel log, quotas.
-    (libc::SYS_settimeofday, "settimeofday"),
-    (libc::SYS_clock_settime, "clock_settime"),
-    (libc::SYS_clock_adjtime, "clock_adjtime"),
-    (libc::SYS_adjtimex, "adjtimex"),
-    (libc::SYS_swapon, "swapon"),
-    (libc::SYS_swapoff, "swapoff"),
-    (libc::SYS_acct, "acct"),
-    (libc::SYS_syslog, "syslog"),
-    (libc::SYS_quotactl, "quotactl"),
-    (libc::SYS_quotactl_fd, "quotactl_fd"),
+    libc::SYS_settimeofday,
+    libc::SYS_clock_settime,
+    libc::SYS_clock_adjtime,
+    libc::SYS_adjtimex,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_acct,
+    libc::SYS_syslog,
+    libc::SYS_quotactl,
+    libc::SYS_quotactl_fd,
 ];
 
 fn stmt(code: u32, k: u32) -> sock_filter {
@@ -117,7 +116,7 @@ fn program() -> Vec<sock_filter> {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
     ]);
 
-    for &(nr, _) in DENIED {
+    for &nr in DENIED {
         // if (nr == X) return EPERM; else skip the return.
         p.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1));
         p.push(stmt(BPF_RET | BPF_K, errno(Errno::EPERM)));
@@ -143,7 +142,9 @@ fn program() -> Vec<sock_filter> {
     p
 }
 
-/// Installs the filter on the calling thread. Needs no_new_privs (or
+/// Installs the filter on every thread of the calling process (TSYNC: a
+/// single-threaded no-op today, but a daemon with a thread pool would
+/// otherwise leave the other threads unfiltered). Needs no_new_privs (or
 /// CAP_SYS_ADMIN) first, so a filtered process can't exec a setuid binary
 /// that would run with the filter but more privilege.
 pub fn install() -> Result<()> {
@@ -152,7 +153,12 @@ pub fn install() -> Result<()> {
     // SAFETY: prog points at a valid BPF program that outlives the call; the
     // kernel copies it.
     let ret = unsafe {
-        libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog as *const sock_fprog)
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_TSYNC,
+            &prog as *const sock_fprog,
+        )
     };
     Errno::result(ret).context("install seccomp filter")?;
     Ok(())

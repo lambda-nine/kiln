@@ -6,28 +6,37 @@ it is today, where it's going, and the decisions that shape the path.
 ## Today: one-shot CLI
 
 ```
-sudo kiln run --memory 512M --cpus 1 --pids 128 -- <cmd>
+sudo kiln run [--memory --cpus --pids --disk --net --allow --read-only] -- <cmd>
 
- kiln (parent: supervisor)                 child (sandbox PID 1: kiln-init)
- ─────────────────────────                 ────────────────────────────────
- 1. find image   /var/lib/kiln/images/<image>
- 2. make run dir /var/lib/kiln/runs/<id>/{upper,work,merged}
- 3. make cgroup  /sys/fs/cgroup/kiln/<id>, write limits
- 4. clone(NEWUTS|NEWPID|NEWNS) ──────────►  blocks reading a pipe
- 5. write child PID to cgroup.procs
- 6. write 1 byte to the pipe ────────────►  cgroup namespace → hostname
-                                            → private mounts → overlay root
-                                            → minimal /dev → pivot_root
-                                            → /proc + read-only cgroupfs
-                                            → clean env → fork + exec cmd
-                                            → forward signals, reap zombies
-    (before exec: unshare(NEWUSER) ◄─► parent writes uid_map/gid_map)
- 7. wait, forwarding SIGTERM/HUP/USR1/USR2
- 8. cleanup: cgroup.kill, rmdir cgroup, rm run dir
+ kiln (parent: supervisor)                  child (sandbox PID 1: kiln-init)
+ ─────────────────────────                  ────────────────────────────────
+ 1. check image /var/lib/kiln/images/<name>
+ 2. run dir /var/lib/kiln/runs/<id>, XFS
+    project quota, then upper/ work/ merged/
+ 3. cgroup /sys/fs/cgroup/kiln/<id> + limits
+ 4. clone(NEWUTS|NEWPID|NEWNS|NEWNET|NEWIPC) ►  close inherited fds, wait
+ 5. child PID → cgroup.procs
+ 6. veth + IP + nft chain (unless --net none);
+    nsenter: lo up, eth0 address and route
+ 7. byte on the pipe ──────────────────────►  cgroup ns → hostname → private
+                                              mounts → overlay → /dev + shm →
+                                              pivot_root → /proc, net sysctls,
+                                              read-only cgroupfs, resolv.conf
+                                              unshare(NEWUSER), byte back
+ 8. write uid_map/gid_map ◄────────────────►  become root in the userns,
+                                              pdeathsig, clean env,
+                                              no_new_privs, Landlock, seccomp
+                                              fork + exec cmd; forward
+                                              signals, reap zombies
+ 9. wait, forwarding SIGTERM/HUP/USR1/USR2
+10. cleanup: nft chain, lease, cgroup.kill,
+    rmdir cgroup, rm run dir
 ```
 
-No daemon and no database: all state is in the kernel and two directories.
-The parent is the supervisor, so nothing outlives the command.
+No daemon and no database: all state is in the kernel and a few directories.
+The parent is the supervisor: if it's killed, `PR_SET_PDEATHSIG` kills the
+sandbox too, but its cgroup, run dir and lease are left for a future
+reconcile.
 
 ## Target
 
@@ -86,11 +95,15 @@ The parent is the supervisor, so nothing outlives the command.
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |
 | Disk fill                        | Handled: XFS project quota per run      |
-| Supervisor crash leaves orphans  | Open: kilnd reconcile + shim            |
+| I/O bandwidth hog                | Open: no `io` controller; `io.weight` would be the first step |
+| Supervisor crash leaves orphans  | Partial: pdeathsig kills the sandbox; cgroup, run dir and lease leak until kilnd reconcile |
+| Shared System V IPC              | Handled: IPC namespace per sandbox      |
+| Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
 | Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
-| Reaching the host or LAN         | Handled: input chain rejects kiln0; private ranges rejected |
+| Reaching the host or LAN         | Handled, except DNS: TCP/UDP 53 to the host's resolver, which on Lima is the Mac (192.168.5.2) |
+| Reused IP inheriting old flows   | Handled: policy checked on every outbound packet, not just new flows |
 | Sandbox-to-sandbox traffic       | Handled: bridge port isolation |
 | Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start; an egress proxy (decision 5) fixes it |
 | DNS tunneling                    | Open: DNS to the resolver is always allowed when networked |

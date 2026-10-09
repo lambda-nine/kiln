@@ -9,7 +9,7 @@ mod userns;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,94 +22,79 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command inside a new sandbox.
-    Run {
-        /// Hostname inside the sandbox (its own UTS namespace).
-        #[arg(long, default_value = "kiln")]
-        hostname: String,
-        /// Image to use as the read-only root filesystem.
-        #[arg(long, default_value = "alpine")]
-        image: String,
-        /// Keep the run's directory afterwards, to inspect what it changed.
-        #[arg(long)]
-        keep: bool,
-        /// Memory limit, like 256M or 2G, or "max".
-        #[arg(long, default_value = "512M")]
-        memory: String,
-        /// CPU limit in cores, like 0.5 or 2, or "max".
-        #[arg(long, default_value = "1")]
-        cpus: String,
-        /// Maximum number of processes and threads, or "max".
-        #[arg(long, default_value = "128")]
-        pids: String,
-        /// Disk limit for everything the sandbox writes, like 1G, or "max".
-        #[arg(long, default_value = "1G")]
-        disk: String,
-        /// Make the filesystem read-only (even for root) except /tmp, /root,
-        /// /workspace and any --writable paths. Uses Landlock.
-        #[arg(long)]
-        read_only: bool,
-        /// Extra writable directory with --read-only (absolute, repeatable).
-        #[arg(long, value_name = "PATH", requires = "read_only")]
-        writable: Vec<PathBuf>,
-        /// Network access: "none" (loopback only) or "full" (internet, but no
-        /// private or link-local ranges). --allow implies an allowlist.
-        #[arg(long, default_value = "none")]
-        net: String,
-        /// Allow traffic to HOST[:PORT] or IP[/PREFIX][:PORT] (repeatable).
-        /// Everything else is rejected. DNS to the host's resolvers is allowed.
-        #[arg(long, value_name = "DEST")]
-        allow: Vec<String>,
-        /// Print resource usage when the sandbox exits.
-        #[arg(long)]
-        stats: bool,
-        /// Command and arguments, after `--`.
-        #[arg(required = true, trailing_var_arg = true)]
-        cmd: Vec<String>,
-    },
+    Run(RunArgs),
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Hostname inside the sandbox (its own UTS namespace).
+    #[arg(long, default_value = "kiln")]
+    hostname: String,
+    /// Image to use as the read-only root filesystem.
+    #[arg(long, default_value = "alpine")]
+    image: String,
+    /// Keep the run's directory afterwards, to inspect what it changed.
+    #[arg(long)]
+    keep: bool,
+    /// Memory limit, like 256M or 2G, or "max".
+    #[arg(long, default_value = "512M")]
+    memory: String,
+    /// CPU limit in cores, like 0.5 or 2, or "max".
+    #[arg(long, default_value = "1")]
+    cpus: String,
+    /// Maximum number of processes and threads, or "max".
+    #[arg(long, default_value = "128")]
+    pids: String,
+    /// Disk limit for everything the sandbox writes, like 1G, or "max".
+    #[arg(long, default_value = "1G")]
+    disk: String,
+    /// Block writes to files and directories (even for root) except under
+    /// /tmp, /root, /workspace, /dev/shm and any --writable paths. Uses
+    /// Landlock, which doesn't cover metadata: chmod/chown still work.
+    #[arg(long)]
+    read_only: bool,
+    /// Extra writable directory with --read-only (absolute, repeatable).
+    #[arg(long, value_name = "PATH", requires = "read_only")]
+    writable: Vec<PathBuf>,
+    /// Network access: "none" (loopback only) or "full" (internet, but no
+    /// private or link-local ranges). --allow implies an allowlist.
+    #[arg(long, default_value = "none")]
+    net: String,
+    /// Allow traffic to HOST[:PORT] or IP[/PREFIX][:PORT] (repeatable).
+    /// Everything else is rejected. DNS to the host's resolvers is allowed.
+    #[arg(long, value_name = "DEST")]
+    allow: Vec<String>,
+    /// Print resource usage when the sandbox exits.
+    #[arg(long)]
+    stats: bool,
+    /// Command and arguments, after `--`.
+    #[arg(required = true, trailing_var_arg = true)]
+    cmd: Vec<String>,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Run {
-            hostname,
-            image,
-            keep,
-            memory,
-            cpus,
-            pids,
-            disk,
-            read_only,
-            writable,
-            net,
-            allow,
-            stats,
-            cmd,
-        } => {
-            if let Some(p) = writable.iter().find(|p| !p.is_absolute()) {
+    match Cli::parse().command {
+        Command::Run(args) => {
+            if let Some(p) = args.writable.iter().find(|p| !p.is_absolute()) {
                 bail!("--writable needs an absolute path, got {}", p.display());
             }
-            let limits = cgroup::Limits {
-                memory: cgroup::parse_size(&memory)?,
-                cpus: parse_cpus(&cpus)?,
-                pids: cgroup::parse_max(&pids)?,
-            };
-            let disk = cgroup::parse_size(&disk)?;
-            let net = net::Plan::new(&net, &allow)?;
             let cfg = container::Config {
-                hostname,
-                image,
-                keep,
-                limits,
-                disk,
-                read_only,
-                writable,
-                net,
-                stats,
-                cmd,
+                limits: cgroup::Limits {
+                    memory: parse_size(&args.memory)?,
+                    cpus: parse_cpus(&args.cpus)?,
+                    pids: parse_max(&args.pids)?,
+                },
+                disk: parse_size(&args.disk)?,
+                net: net::Plan::new(&args.net, &args.allow)?,
+                hostname: args.hostname,
+                image: args.image,
+                keep: args.keep,
+                read_only: args.read_only,
+                writable: args.writable,
+                stats: args.stats,
+                cmd: args.cmd,
             };
-            let code = container::run(&cfg)?;
-            std::process::exit(code);
+            std::process::exit(container::run(&cfg)?);
         }
     }
 }
@@ -122,4 +107,27 @@ fn parse_cpus(s: &str) -> Result<Option<f64>> {
         Ok(n) if n > 0.0 => Ok(Some(n)),
         _ => bail!("invalid --cpus {s:?}: expected a positive number or \"max\""),
     }
+}
+
+/// Parses a size like `512M`, `2G`, `65536` or `max`.
+pub fn parse_size(s: &str) -> Result<Option<u64>> {
+    if s == "max" {
+        return Ok(None);
+    }
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, 'K' | 'k')) => (&s[..i], 1 << 10),
+        Some((i, 'M' | 'm')) => (&s[..i], 1 << 20),
+        Some((i, 'G' | 'g')) => (&s[..i], 1 << 30),
+        _ => (s, 1),
+    };
+    let n: u64 = num.parse().with_context(|| format!("invalid size {s:?}"))?;
+    Ok(Some(n.checked_mul(mult).with_context(|| format!("size {s:?} is too large"))?))
+}
+
+/// Parses a count like `128` or `max`.
+pub fn parse_max(s: &str) -> Result<Option<u64>> {
+    if s == "max" {
+        return Ok(None);
+    }
+    Ok(Some(s.parse().with_context(|| format!("invalid number {s:?}"))?))
 }

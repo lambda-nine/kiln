@@ -25,8 +25,10 @@ sudo target/debug/kiln run --allow example.com:80 --stats -- sh
 
 ## Layers
 
-1. **Namespaces** (done): `clone()` with new UTS, PID and mount namespaces.
-   The command runs as PID 1 with its own hostname and its own `/proc`.
+1. **Namespaces** (done): `clone()` with new UTS, PID, mount and IPC
+   namespaces (network comes in layer 6). The sandbox has its own hostname,
+   its own `/proc`, and its own System V shared memory, semaphores and
+   message queues.
 2. **Root filesystem** (done): an overlayfs root, with the Alpine image as the
    read-only lower layer and a per-run upper layer. `pivot_root` swaps it in and
    the host's root is detached. `/dev` is a tmpfs with only a few safe devices.
@@ -52,8 +54,9 @@ sudo target/debug/kiln run --allow example.com:80 --stats -- sh
    `--net none` (default) is loopback only. `--net full` gets a veth pair on
    the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
    that reject private and link-local ranges (the VM's LAN, the Mac, cloud
-   metadata). `--allow HOST[:PORT]` (repeatable) allows only those
-   destinations plus DNS. Sandboxes can't reach the host or each other.
+   metadata), except DNS (TCP/UDP 53) to the host's resolver.
+   `--allow HOST[:PORT]` (repeatable) allows only those destinations plus that
+   DNS. Sandboxes can't reach the host or each other.
 7. Cold-start time: measure it, then make it fast.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
@@ -188,3 +191,46 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 - **DNS inside the sandbox.** systemd-resolved's `127.0.0.53` only exists in the
   host's namespace, so kiln writes the upstream resolvers into the sandbox's
   `/etc/resolv.conf` as real root, which makes it read-only for sandbox root.
+
+### From the first review
+
+Four independent reviewers attacked kiln at `bf66bdf`. What they found, and
+what each fix teaches:
+
+- **No IPC namespace meant shared System V IPC.** One sandbox created a private
+  shared-memory segment; a later sandbox read, changed and deleted it. User
+  namespaces didn't help, because every sandbox maps to the same host IDs.
+  Segments also outlived their sandbox, so they could leak memory past
+  `memory.max`. Fix: `CLONE_NEWIPC`; the kernel frees everything in it when the
+  namespace dies.
+- **Inherited file descriptors go straight through every wall.** A host file
+  opened as fd 9 by whoever ran kiln was readable *and writable* inside a
+  `--read-only` sandbox. Namespaces, `pivot_root` and Landlock check paths at
+  open time; they don't revoke descriptors already open. This is the same class
+  of bug as runc's CVE-2024-21626. Fix: the child closes every fd except
+  0/1/2 and its two pipe ends first thing (`close_range`).
+- **conntrack outlives sandboxes.** IPs are leased lowest-first, so the next
+  sandbox usually gets the previous one's IP. With `ct state established
+  accept` first in the forward chain, a restricted sandbox could continue a UDP
+  flow only the previous sandbox was allowed. Fix: every outbound packet goes
+  through the sandbox's current policy; "established" is only trusted for
+  replies coming back in.
+- **`nft add chain` is idempotent, so a leftover chain's rules win.** Fix:
+  `flush chain` right after `add chain`.
+- **Smaller fixes:** `--image` must be a plain name (it accepted `../..`);
+  size flags check for overflow; seccomp uses `SECCOMP_FILTER_FLAG_TSYNC` so a
+  future multi-threaded daemon can't leave a thread unfiltered; `/dev/shm`
+  exists (64 MB tmpfs, charged to the sandbox's memory); the sandbox dies with
+  its supervisor (`PR_SET_PDEATHSIG`, set after the credential change that
+  would clear it); `--read-only` needs Landlock ABI 3 so truncation is covered.
+- **Simplifications:** one nftables table (NAT works in `inet` tables, and the
+  old second table was never recreated if missing); the veth peer is created
+  directly inside the sandbox as `eth0`; the sandbox writes its two network
+  sysctls itself through `/proc/sys/net` (which is per network namespace)
+  instead of via `sh` and `sysctl`; Landlock only handles write rights; kiln's
+  own mount points live in the image, so `upper/` holds only what the sandbox
+  wrote (plus `resolv.conf` when networked).
+- **Known limits, documented rather than fixed:** `--read-only` covers file
+  contents and directory entries but not metadata (`chmod` on a file the
+  sandbox owns still works), and DNS to the host's resolver is allowed over TCP
+  and UDP, which on Lima means a port on the Mac.
