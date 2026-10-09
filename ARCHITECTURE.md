@@ -88,12 +88,17 @@ The parent is the supervisor, so nothing outlives the command.
 | Disk fill                        | Handled: XFS project quota per run      |
 | Supervisor crash leaves orphans  | Open: kilnd reconcile + shim            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |
-| Sandbox escape                   | Partial: userns, seccomp, Landlock done; needs network rules |
+| Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
+| Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
+| Reaching the host or LAN         | Handled: input chain rejects kiln0; private ranges rejected |
+| Sandbox-to-sandbox traffic       | Handled: bridge port isolation |
+| Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start; an egress proxy (decision 5) fixes it |
+| DNS tunneling                    | Open: DNS to the resolver is always allowed when networked |
 | Kernel attack surface            | Reduced: seccomp denylist; an allowlist would be stricter |
 | Sandboxes attacking each other   | Partial: all share one host ID range; per-sandbox ranges need idmapped mounts |
 
 ## Build order
 
-~~kiln-init~~ → ~~disk quota~~ → ~~user namespaces~~ → ~~seccomp/Landlock~~ → networking →
+~~kiln-init~~ → ~~disk quota~~ → ~~user namespaces~~ → ~~seccomp/Landlock~~ → ~~networking~~ →
 kilnd with long-lived sandboxes and exec → harness (with memory; first user is
 the idea-marathon app) → metrics → cold-start work → k3s operator.

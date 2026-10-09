@@ -2,6 +2,7 @@ mod cgroup;
 mod container;
 mod init;
 mod landlock;
+mod net;
 mod quota;
 mod seccomp;
 mod userns;
@@ -50,6 +51,14 @@ enum Command {
         /// Extra writable directory with --read-only (absolute, repeatable).
         #[arg(long, value_name = "PATH", requires = "read_only")]
         writable: Vec<PathBuf>,
+        /// Network access: "none" (loopback only) or "full" (internet, but no
+        /// private or link-local ranges). --allow implies an allowlist.
+        #[arg(long, default_value = "none")]
+        net: String,
+        /// Allow traffic to HOST[:PORT] or IP[/PREFIX][:PORT] (repeatable).
+        /// Everything else is rejected. DNS to the host's resolvers is allowed.
+        #[arg(long, value_name = "DEST")]
+        allow: Vec<String>,
         /// Print resource usage when the sandbox exits.
         #[arg(long)]
         stats: bool,
@@ -72,6 +81,8 @@ fn main() -> Result<()> {
             disk,
             read_only,
             writable,
+            net,
+            allow,
             stats,
             cmd,
         } => {
@@ -84,6 +95,7 @@ fn main() -> Result<()> {
                 pids: cgroup::parse_max(&pids)?,
             };
             let disk = cgroup::parse_size(&disk)?;
+            let net = net::Plan::new(&net, &allow)?;
             let cfg = container::Config {
                 hostname,
                 image,
@@ -92,6 +104,7 @@ fn main() -> Result<()> {
                 disk,
                 read_only,
                 writable,
+                net,
                 stats,
                 cmd,
             };

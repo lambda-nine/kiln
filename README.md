@@ -19,6 +19,8 @@ sudo target/debug/kiln run -- sh
 sudo target/debug/kiln run --keep -- sh  # keep the run dir to see what changed
 sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats -- sh
 sudo target/debug/kiln run --read-only --writable /data -- sh  # Landlock
+sudo target/debug/kiln run --net full -- wget -qO- http://example.com
+sudo target/debug/kiln run --allow example.com:80 --stats -- sh
 ```
 
 ## Layers
@@ -46,7 +48,12 @@ sudo target/debug/kiln run --read-only --writable /data -- sh  # Landlock
    namespace. `--read-only` adds a Landlock ruleset: read and execute anywhere,
    write only to `/tmp`, `/root`, `/workspace`, `/dev` files and `--writable`
    paths, even as root.
-6. Networking: veth, bridge, nftables egress rules.
+6. **Networking** (done): every sandbox has its own network namespace.
+   `--net none` (default) is loopback only. `--net full` gets a veth pair on
+   the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
+   that reject private and link-local ranges (the VM's LAN, the Mac, cloud
+   metadata). `--allow HOST[:PORT]` (repeatable) allows only those
+   destinations plus DNS. Sandboxes can't reach the host or each other.
 7. Cold-start time: measure it, then make it fast.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
@@ -156,3 +163,28 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   "Permission denied" writing `/etc/motd`. A ruleset only has grants, no denies:
   you list the rights you "handle", and anything handled is denied unless a
   rule grants it beneath some directory.
+- **The network namespace is created before the user namespace**, like the
+  others, so sandbox root can't run `ip link set eth0 down`, change its address
+  or routes, or touch the firewall. The host configures it from outside with
+  `nsenter --target <pid> --net ip -batch -`.
+- **Two sysctls make root-in-a-userns feel normal.** Binding ports below 1024
+  needs `CAP_NET_BIND_SERVICE` in the user namespace that *owns* the network
+  namespace, which sandbox root isn't. Setting
+  `net.ipv4.ip_unprivileged_port_start=0` and `net.ipv4.ping_group_range` inside
+  the namespace lets it bind port 80 and ping. Docker sets the same two.
+- **Policy is one verdict map.** `iifname "kiln0" ip saddr vmap @egress` jumps
+  to a per-sandbox chain keyed by its IP. Adding or removing a sandbox is one
+  map element plus one chain, with no rule handles to track. Rules end in
+  `reject with icmpx admin-prohibited` rather than `drop`, so blocked
+  connections fail in milliseconds ("Host is unreachable") instead of hanging.
+  Look at it with `sudo nft list table inet kiln`.
+- **Sandbox-to-sandbox traffic never hits the firewall.** Frames between two
+  ports of the same bridge are switched, not routed, so the inet forward hook
+  never sees them. kiln sets `isolated on` for each bridge port instead.
+- **IP leases need no lock.** A lease is a file in `/run/kiln/net/leases`
+  created with `O_EXCL`, which is atomic. `/run` is a tmpfs, so leases vanish
+  on reboot along with the bridge and rules, which kiln rebuilds on the next
+  run.
+- **DNS inside the sandbox.** systemd-resolved's `127.0.0.53` only exists in the
+  host's namespace, so kiln writes the upstream resolvers into the sandbox's
+  `/etc/resolv.conf` as real root, which makes it read-only for sandbox root.

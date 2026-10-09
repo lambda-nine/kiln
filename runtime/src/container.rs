@@ -16,6 +16,7 @@ use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 use crate::cgroup::{Cgroup, Limits};
 use crate::init;
 use crate::landlock;
+use crate::net;
 use crate::seccomp;
 use crate::quota;
 use crate::userns;
@@ -33,6 +34,7 @@ pub struct Config {
     pub disk: Option<u64>,
     pub read_only: bool,
     pub writable: Vec<PathBuf>,
+    pub net: net::Plan,
     pub stats: bool,
     pub cmd: Vec<String>,
 }
@@ -124,7 +126,11 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     //   NEWUTS - its own hostname
     //   NEWPID - its own PID numbering; the child becomes PID 1
     //   NEWNS  - its own mount table, so its mounts never touch the host
-    let flags = CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS;
+    //   NEWNET - its own interfaces, routes and firewall (only lo at first)
+    let flags = CloneFlags::CLONE_NEWUTS
+        | CloneFlags::CLONE_NEWPID
+        | CloneFlags::CLONE_NEWNS
+        | CloneFlags::CLONE_NEWNET;
 
     let mut stack = vec![0u8; STACK_SIZE];
     let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx) {
@@ -144,11 +150,14 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     // child dies before writing.
     drop(to_parent_tx);
 
+    let mut network = None;
     let setup = (|| -> Result<()> {
         // Move the child into its cgroup before it runs anything, then let it
         // go. Doing this from the parent avoids a race where the command
         // starts before its limits apply.
         cgroup.add(pid)?;
+        // Plug its network namespace in from the outside, same reasoning.
+        network = net::setup(pid, &cfg.net)?;
         write(&to_child_tx, b"1").context("signal child")?;
 
         // The child does its mounts as real root, then creates its user
@@ -174,6 +183,9 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
     }
     if cfg.stats {
         print_stats(&cgroup, &layers.upper);
+        if let Some(n) = &network {
+            eprintln!("kiln: ip {} | egress packets rejected {}", n.ip(), n.blocked_packets());
+        }
     }
     Ok(code)
 }
@@ -276,6 +288,12 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         None::<&str>,
     )
     .context("mount /sys/fs/cgroup")?;
+
+    // Written as real root, so it shows up inside as owned by "nobody":
+    // readable, but sandbox root can't point DNS somewhere else.
+    if let Some(conf) = cfg.net.resolv_conf() {
+        fs::write("/etc/resolv.conf", conf).context("write /etc/resolv.conf")?;
+    }
 
     // Last step as real root. Every namespace above was created first, so it
     // stays owned by the host's user namespace and sandbox root gets no power
