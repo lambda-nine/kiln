@@ -18,6 +18,7 @@ use crate::init;
 use crate::landlock;
 use crate::net;
 use crate::seccomp;
+use crate::storage;
 use crate::quota;
 use crate::userns;
 
@@ -76,7 +77,9 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
 
     let id = run_id();
-    let run_dir = Path::new(KILN_ROOT).join("runs").join(&id);
+    let runs = Path::new(KILN_ROOT).join("runs");
+    storage::prepare(&runs)?;
+    let run_dir = runs.join(&id);
     let layers = Layers {
         lower,
         upper: run_dir.join("upper"),

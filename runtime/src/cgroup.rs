@@ -9,8 +9,13 @@ use nix::unistd::Pid;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PARENT: &str = "kiln";
-const CONTROLLERS: &str = "+cpu +memory +pids";
+const CONTROLLERS: &str = "+cpu +memory +pids +io";
 const CPU_PERIOD_US: u64 = 100_000;
+/// All sandboxes together get half the disk share of a host service when the
+/// disk is contended (siblings like system.slice default to 100). Sandboxes
+/// share their half equally (each defaults to 100 among themselves). Needs
+/// iocost on the disk; see storage.rs.
+const KILN_IO_WEIGHT: &str = "default 50";
 
 /// Resource limits for one sandbox. `None` means unlimited ("max").
 pub struct Limits {
@@ -34,6 +39,7 @@ impl Cgroup {
         let parent = root.join(PARENT);
         fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
         write(&parent.join("cgroup.subtree_control"), CONTROLLERS)?;
+        write(&parent.join("io.weight"), KILN_IO_WEIGHT)?;
 
         let path = parent.join(name);
         fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;

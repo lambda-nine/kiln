@@ -14,6 +14,7 @@ limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln      # now in Ubuntu 24.04
 sudo scripts/fetch-alpine.sh             # once: unpack Alpine as the "alpine" image
 sudo scripts/setup-storage.sh            # once: XFS with project quotas for --disk
+scripts/install.sh                       # once: /usr/local/bin/kiln + kiln-dns service
 cargo build
 sudo target/debug/kiln run -- sh
 sudo target/debug/kiln run --keep -- sh  # keep the run dir to see what changed
@@ -54,9 +55,12 @@ sudo target/debug/kiln run --allow example.com:80 --stats -- sh
    `--net none` (default) is loopback only. `--net full` gets a veth pair on
    the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
    that reject private and link-local ranges (the VM's LAN, the Mac, cloud
-   metadata), except DNS (TCP/UDP 53) to the host's resolver.
-   `--allow HOST[:PORT]` (repeatable) allows only those destinations plus that
-   DNS. Sandboxes can't reach the host or each other.
+   metadata). `--allow HOST[:PORT]` (repeatable) allows only those
+   destinations. Sandboxes can't reach the host or each other. DNS goes only
+   to `kiln dns`, a small forwarder on the bridge (10.88.0.1) run by the
+   `kiln-dns` systemd service: with `--allow` it resolves only the allowed
+   names (and their subdomains), and it logs every query to the journal
+   (`journalctl -u kiln-dns -f`).
 7. Cold-start time: measure it, then make it fast.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
@@ -234,3 +238,32 @@ what each fix teaches:
   contents and directory entries but not metadata (`chmod` on a file the
   sandbox owns still works), and DNS to the host's resolver is allowed over TCP
   and UDP, which on Lima means a port on the Mac.
+
+### DNS, disk I/O, and a loop-device OOM
+
+- **A DNS forwarder closes the last way out.** Before, every networked sandbox
+  could reach the VM's resolver directly, which on Lima is a port on the Mac,
+  and could leak data through query names (`<secret>.attacker.com`). Now the
+  only resolver a sandbox can reach is `kiln dns` on 10.88.0.1. It looks up
+  the asking sandbox's policy by source IP (`/run/kiln/net/dns/<ip>`): `*` for
+  `--net full`, otherwise only the `--allow` hostnames. Anything else gets
+  `REFUSED`. It parses just enough of the DNS wire format to read the question:
+  a 12-byte header, then length-prefixed labels.
+- **`O_DIRECT` writes could OOM-kill a sandbox.** Sandbox storage is XFS
+  inside a file on a loop device. By default the loop driver writes that
+  backing file through the page cache, and the kernel charges those pages to
+  the sandbox that caused the I/O. A sandbox writing 1.5 GB with `O_DIRECT`
+  under a 512 MB limit was OOM-killed: its own writes bypassed the cache, so
+  the only pages it had were the loop driver's dirty ones. Setting direct I/O
+  on the loop device (`LOOP_SET_DIRECT_IO`) fixed it (memory peak 2.4 MiB),
+  and made writes faster. It doesn't survive a reboot, so kiln sets it on
+  every run (`storage.rs`).
+- **`io.weight` needs a proportional I/O controller.** This VM's disk uses
+  `mq-deadline` and the kernel has no BFQ, so weights did nothing. kiln turns on
+  iocost for the real disk under the loop device (`io.cost.qos`) and gives
+  all sandboxes together half the weight of host services. With loop direct
+  I/O, a sandbox's writes show up on the real disk under its own cgroup
+  (`io.stat` for 253:0, with `cost.usage`). Honest result: on this VM it
+  doesn't change throughput yet. iocost only enforces weights when its model
+  says the disk is saturated, and the Mac's SSD behind virtio never gets
+  there with the default model. Tuning `io.cost.model` would be the next step.

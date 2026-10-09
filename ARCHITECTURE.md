@@ -95,18 +95,19 @@ reconcile.
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |
 | Disk fill                        | Handled: XFS project quota per run      |
-| I/O bandwidth hog                | Open: no `io` controller; `io.weight` would be the first step |
+| I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
+| O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
 | Supervisor crash leaves orphans  | Partial: pdeathsig kills the sandbox; cgroup, run dir and lease leak until kilnd reconcile |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
 | Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
-| Reaching the host or LAN         | Handled, except DNS: TCP/UDP 53 to the host's resolver, which on Lima is the Mac (192.168.5.2) |
+| Reaching the host or LAN         | Handled: only kiln's DNS forwarder on 10.88.0.1:53 is reachable |
 | Reused IP inheriting old flows   | Handled: policy checked on every outbound packet, not just new flows |
 | Sandbox-to-sandbox traffic       | Handled: bridge port isolation |
-| Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start; an egress proxy (decision 5) fixes it |
-| DNS tunneling                    | Open: DNS to the resolver is always allowed when networked |
+| Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start. Next step: the DNS forwarder adds the IPs it resolves to the sandbox's nft set |
+| DNS tunneling                    | Handled with --allow (only allowed names resolve); logged but allowed with --net full |
 | Kernel attack surface            | Reduced: seccomp denylist; an allowlist would be stricter |
 | Sandboxes attacking each other   | Partial: all share one host ID range; per-sandbox ranges need idmapped mounts |
 

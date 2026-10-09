@@ -14,9 +14,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
@@ -24,7 +25,7 @@ use nix::unistd::Pid;
 
 const BRIDGE: &str = "kiln0";
 const NETWORK: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 0);
-const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
+pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
 const PREFIX: u8 = 16;
 /// On /run (a tmpfs), so leases vanish on reboot along with the bridge and
 /// the nftables rules they refer to.
@@ -53,10 +54,12 @@ table inet kiln {
         oifname "kiln0" ct state established,related accept
         oifname "kiln0" counter drop
     }
-    # Sandboxes may not talk to the host itself (sshd, later kilnd's API).
+    # Sandboxes may not talk to the host itself (sshd, later kilnd's API),
+    # except kiln's DNS forwarder on the bridge address.
     chain input {
         type filter hook input priority filter; policy accept;
         iifname "kiln0" ct state established,related accept
+        iifname "kiln0" ip daddr 10.88.0.1 meta l4proto { tcp, udp } th dport 53 accept
         iifname "kiln0" counter reject with icmpx admin-prohibited
     }
     # NAT works in inet tables too (Linux 5.2+), so one table holds it all
@@ -81,13 +84,14 @@ pub enum Mode {
 pub struct Allowed {
     /// As written by the user, kept as a rule comment.
     label: String,
+    /// The hostname, if it was one; the DNS forwarder will resolve only these.
+    host: Option<String>,
     addrs: Vec<String>,
     port: Option<u16>,
 }
 
 pub struct Plan {
     mode: Mode,
-    resolvers: Vec<Ipv4Addr>,
 }
 
 impl Plan {
@@ -101,15 +105,25 @@ impl Plan {
             ("full", false) => bail!("--allow can't be combined with --net full"),
             (other, _) => bail!("invalid --net {other:?}: expected none or full"),
         };
-        Ok(Plan { mode, resolvers: host_resolvers() })
+        Ok(Plan { mode })
     }
 
-    /// Contents for the sandbox's /etc/resolv.conf, if it has a network.
+    /// Contents for the sandbox's /etc/resolv.conf, if it has a network: the
+    /// `kiln dns` forwarder on the bridge.
     pub fn resolv_conf(&self) -> Option<String> {
-        if matches!(self.mode, Mode::None) || self.resolvers.is_empty() {
-            return None;
+        match self.mode {
+            Mode::None => None,
+            _ => Some(format!("nameserver {GATEWAY}\n")),
         }
-        Some(self.resolvers.iter().map(|r| format!("nameserver {r}\n")).collect())
+    }
+
+    /// The names this sandbox may resolve, as the forwarder's policy file.
+    fn dns_policy(&self) -> String {
+        match &self.mode {
+            Mode::None => String::new(),
+            Mode::Full => "*\n".into(),
+            Mode::Allow(allowed) => allowed.iter().filter_map(|a| a.host.as_ref()).map(|h| format!("{h}\n")).collect(),
+        }
     }
 }
 
@@ -141,12 +155,13 @@ fn parse_allowed(s: &str) -> Result<Allowed> {
         }
         ips
     };
-    Ok(Allowed { label: s.to_string(), addrs, port })
+    let host = (!literal).then(|| dest.to_ascii_lowercase());
+    Ok(Allowed { label: s.to_string(), host, addrs, port })
 }
 
 /// The host's real upstream resolvers. systemd-resolved's 127.0.0.53 only
 /// listens in the host's namespace, so read the file it forwards to.
-fn host_resolvers() -> Vec<Ipv4Addr> {
+pub fn host_resolvers() -> Vec<Ipv4Addr> {
     ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"]
         .iter()
         .filter_map(|p| fs::read_to_string(p).ok())
@@ -196,8 +211,14 @@ impl Network {
     }
 }
 
+/// The DNS forwarder's policy file for the sandbox at `ip`.
+pub fn dns_policy_path(ip: Ipv4Addr) -> PathBuf {
+    Path::new(STATE_DIR).join("dns").join(ip.to_string())
+}
+
 impl Drop for Network {
     fn drop(&mut self) {
+        let _ = fs::remove_file(dns_policy_path(self.ip));
         let chain = self.chain();
         let host_if = self.host_if();
         // Each step on its own so one failure doesn't skip the rest.
@@ -222,7 +243,14 @@ pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
         None
     } else {
         ensure_bridge()?;
+        let forwarder = SocketAddr::from((GATEWAY, 53));
+        if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
+            eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
+        }
         let network = lease()?;
+        let policy_file = dns_policy_path(network.ip);
+        fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
+        fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
         let host_if = network.host_if();
         let ip = network.ip;
 
@@ -266,10 +294,6 @@ fn policy(network: &Network, plan: &Plan) -> String {
     // a no-op on an existing chain, and its old rules would come first.
     let mut nft = format!("add chain inet kiln {chain}\nflush chain inet kiln {chain}\n");
 
-    if !plan.resolvers.is_empty() {
-        let dns = set(plan.resolvers.iter().map(|r| r.to_string()));
-        nft += &rule(&format!("ip daddr {dns} meta l4proto {{ tcp, udp }} th dport 53 accept comment \"dns\""));
-    }
     match &plan.mode {
         Mode::None => {}
         Mode::Full => {
@@ -295,7 +319,7 @@ fn set(items: impl Iterator<Item = String>) -> String {
 
 /// Creates the bridge and base ruleset if this boot doesn't have them yet.
 /// Held under a lock so two sandboxes starting at once don't both create them.
-fn ensure_bridge() -> Result<()> {
+pub fn ensure_bridge() -> Result<()> {
     fs::create_dir_all(STATE_DIR).with_context(|| format!("create {STATE_DIR}"))?;
     let lock_file = File::create(Path::new(STATE_DIR).join("lock")).context("create lock")?;
     let _lock = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e).context("lock")?;

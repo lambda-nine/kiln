@@ -1,10 +1,12 @@
 mod cgroup;
 mod container;
+mod dns;
 mod init;
 mod landlock;
 mod net;
 mod quota;
 mod seccomp;
+mod storage;
 mod userns;
 
 use std::path::PathBuf;
@@ -22,7 +24,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a command inside a new sandbox.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
+    /// Serve DNS to sandboxes on 10.88.0.1:53 (run by the kiln-dns service).
+    Dns,
 }
 
 #[derive(clap::Args)]
@@ -96,6 +100,7 @@ fn main() -> Result<()> {
             };
             std::process::exit(container::run(&cfg)?);
         }
+        Command::Dns => dns::serve(),
     }
 }
 
