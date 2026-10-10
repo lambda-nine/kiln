@@ -131,8 +131,15 @@ pub fn limit(dir: &Path, bytes: Option<u64>) -> Result<()> {
     quotactl(&dir_file, Q_XSETQLIM, id, &mut quota).context("set disk quota")
 }
 
-/// Bytes used by `dir`'s project, if it has one.
-pub fn usage(dir: &Path) -> Option<u64> {
+/// A project's disk use and hard limit, in bytes.
+pub struct Usage {
+    pub used: u64,
+    /// `None` when the project has no limit (`--disk max`).
+    pub limit: Option<u64>,
+}
+
+/// Disk use of `dir`'s project, if it has one.
+pub fn usage(dir: &Path) -> Option<Usage> {
     let dir_file = File::open(dir).ok()?;
     let mut attr = FsXattr::default();
     // SAFETY: fd is an open directory and attr has the kernel's layout.
@@ -142,7 +149,8 @@ pub fn usage(dir: &Path) -> Option<u64> {
     }
     let mut quota = FsDiskQuota::default();
     quotactl(&dir_file, Q_XGETQUOTA, attr.projid, &mut quota).ok()?;
-    Some(quota.bcount * BASIC_BLOCK)
+    let limit = (quota.blk_hardlimit > 0).then(|| quota.blk_hardlimit * BASIC_BLOCK);
+    Some(Usage { used: quota.bcount * BASIC_BLOCK, limit })
 }
 
 /// quotactl_fd(2) (Linux 5.14+): like quotactl, but names the filesystem by

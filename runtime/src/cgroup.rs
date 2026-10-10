@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
@@ -78,17 +79,13 @@ impl Cgroup {
 
     /// Reads one numeric file, like `memory.peak`. 0 if it's missing.
     pub fn value(&self, file: &str) -> u64 {
-        let text = fs::read_to_string(self.path.join(file)).unwrap_or_default();
-        text.trim().parse().unwrap_or(0)
+        read_value(&self.path, file).unwrap_or(0)
     }
 
     /// Reads one `key value` line from a flat-keyed file, like `cpu.stat`.
     /// 0 if it's missing.
     pub fn stat(&self, file: &str, key: &str) -> u64 {
-        let text = fs::read_to_string(self.path.join(file)).unwrap_or_default();
-        text.lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.parse().ok())
-            .unwrap_or(0)
+        read_flat(&self.path, file).get(key).copied().unwrap_or(0)
     }
 
     fn write(&self, file: &str, value: &str) -> Result<()> {
@@ -115,6 +112,43 @@ impl Drop for Cgroup {
         }
         eprintln!("kiln: gave up removing busy cgroup {}", self.path.display());
     }
+}
+
+/// /sys/fs/cgroup/kiln, the parent of every sandbox's cgroup. Its counters are
+/// hierarchical: they include sandboxes that have already exited.
+pub fn parent_dir() -> PathBuf {
+    Path::new(CGROUP_ROOT).join(PARENT)
+}
+
+/// The cgroups of running sandboxes, as (run ID, directory). Read-only: unlike
+/// `Cgroup`, nothing here kills or removes anything.
+pub fn sandboxes() -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(parent_dir()) else { return Vec::new() };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect();
+    found.sort();
+    found
+}
+
+/// A single-value file like `memory.current` or `pids.max`. `None` if it's
+/// missing or says "max" (no limit).
+pub fn read_value(dir: &Path, file: &str) -> Option<u64> {
+    fs::read_to_string(dir.join(file)).ok()?.trim().parse().ok()
+}
+
+/// Every `key value` line of a flat-keyed file like `cpu.stat` or
+/// `memory.events`. Empty if the file is missing.
+pub fn read_flat(dir: &Path, file: &str) -> HashMap<String, u64> {
+    let text = fs::read_to_string(dir.join(file)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            Some((key.to_string(), value.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 fn write(path: &Path, value: &str) -> Result<()> {

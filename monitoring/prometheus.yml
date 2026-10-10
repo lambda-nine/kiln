@@ -1,0 +1,29 @@
+# Prometheus config for the kiln VM, installed to /etc/prometheus/prometheus.yml
+# by scripts/setup-monitoring.sh. Prometheus pulls ("scrapes") each target's
+# /metrics every few seconds and stores the samples as time series.
+global:
+  # Most sandboxes live for seconds, so scrape often. Prometheus's default
+  # is 1m, which would miss most of them entirely.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # `kiln metrics` (kiln-metrics.service): per-sandbox cgroup, disk and
+  # network stats, plus totals over all sandboxes.
+  - job_name: kiln
+    static_configs:
+      - targets: ["127.0.0.1:9840"]
+
+  # `kiln dns` (kiln-dns.service): DNS queries forwarded and refused.
+  - job_name: kiln-dns
+    static_configs:
+      - targets: ["127.0.0.1:9841"]
+
+  # node_exporter: the VM itself (CPU, memory, disks, network).
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

@@ -3,6 +3,7 @@ mod container;
 mod dns;
 mod init;
 mod landlock;
+mod metrics;
 mod net;
 mod quota;
 mod seccomp;
@@ -27,6 +28,14 @@ enum Command {
     Run(Box<RunArgs>),
     /// Serve DNS to sandboxes on 10.88.0.1:53 (run by the kiln-dns service).
     Dns,
+    /// Serve running sandboxes' resource use as Prometheus metrics.
+    Metrics {
+        /// Address to listen on; /metrics is the scrape path.
+        #[arg(long, default_value = metrics::DEFAULT_LISTEN)]
+        listen: String,
+    },
+    /// Show running sandboxes' resource use, sampled over one second.
+    Stats,
 }
 
 #[derive(clap::Args)]
@@ -101,6 +110,11 @@ fn main() -> Result<()> {
             std::process::exit(container::run(&cfg)?);
         }
         Command::Dns => dns::serve(),
+        Command::Metrics { listen } => metrics::serve_metrics(&listen),
+        Command::Stats => {
+            metrics::print_stats();
+            Ok(())
+        }
     }
 }
 

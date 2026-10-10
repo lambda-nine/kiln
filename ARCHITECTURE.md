@@ -34,6 +34,9 @@ sudo kiln run [--memory --cpus --pids --disk --net --allow --read-only] -- <cmd>
 ```
 
 No daemon and no database: all state is in the kernel and a few directories.
+`kiln metrics` (a separate, read-only service) reads that state for
+Prometheus; each IP lease file holds its run ID so traffic and rejected
+packets can be tied to a sandbox.
 The parent is the supervisor: if it's killed, `PR_SET_PDEATHSIG` kills the
 sandbox too, but its cgroup, run dir and lease are left for a future
 reconcile.
@@ -114,5 +117,5 @@ reconcile.
 ## Build order
 
 ~~kiln-init~~ → ~~disk quota~~ → ~~user namespaces~~ → ~~seccomp/Landlock~~ → ~~networking~~ →
-kilnd with long-lived sandboxes and exec → harness (with memory; first user is
-the idea-marathon app) → metrics → cold-start work → k3s operator.
+~~metrics~~ → kilnd with long-lived sandboxes and exec → harness (with memory;
+first user is the idea-marathon app) → cold-start work → k3s operator.

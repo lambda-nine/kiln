@@ -1,0 +1,18 @@
+[Unit]
+Description=kiln Prometheus exporter for sandbox resource use (127.0.0.1:9840)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kiln metrics --listen 127.0.0.1:9840
+Restart=on-failure
+# Read-only: it reads cgroup files, XFS quotas (quotactl needs
+# CAP_SYS_ADMIN to read other projects) and nftables counters (`nft list`
+# needs CAP_NET_ADMIN), and writes nothing.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

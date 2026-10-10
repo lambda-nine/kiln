@@ -7,20 +7,30 @@
 //! included). Allowed queries go to the host's upstream resolver; the rest
 //! get REFUSED. With an allowlist, that also closes DNS as a way to smuggle
 //! data out, since an attacker's domain never gets resolved. Every query is
-//! logged to stdout, which systemd sends to the journal.
+//! logged to stdout, which systemd sends to the journal, and counted for
+//! Prometheus on http://127.0.0.1:9841/metrics.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::metrics;
 use crate::net;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const HEADER_LEN: usize = 12;
+/// Localhost only: the sandboxes' side of the host is the bridge, and the
+/// input chain rejects them anyway.
+const METRICS_LISTEN: &str = "127.0.0.1:9841";
+
+/// Queries answered since the forwarder started, by (outcome, query type).
+static QUERIES: Mutex<BTreeMap<(&str, String), u64>> = Mutex::new(BTreeMap::new());
 
 pub fn serve() -> Result<()> {
     net::ensure_bridge()?;
@@ -30,6 +40,12 @@ pub fn serve() -> Result<()> {
     let udp = UdpSocket::bind((net::GATEWAY, 53)).context("bind udp 53")?;
     let tcp = TcpListener::bind((net::GATEWAY, 53)).context("bind tcp 53")?;
     println!("kiln dns: listening on {}:53, forwarding to {upstream}", net::GATEWAY);
+
+    thread::spawn(|| {
+        if let Err(e) = metrics::serve(METRICS_LISTEN, render_metrics) {
+            eprintln!("kiln dns: metrics: {e:#}");
+        }
+    });
 
     thread::spawn(move || {
         for stream in tcp.incoming().flatten() {
@@ -75,13 +91,10 @@ fn answer(query: &[u8], from: SocketAddr, upstream: Ipv4Addr, transport: Transpo
     let IpAddr::V4(sandbox) = from.ip() else { return None };
     let question = parse_question(query)?;
     let allowed = allowed(sandbox, &question.name);
-    println!(
-        "{sandbox} {} {} {}",
-        qtype_name(question.qtype),
-        question.name,
-        if allowed { "allowed" } else { "refused" }
-    );
+    let qtype = qtype_name(question.qtype);
+    println!("{sandbox} {qtype} {} {}", question.name, if allowed { "allowed" } else { "refused" });
     if !allowed {
+        count("refused", qtype);
         return Some(refused(query, question.end));
     }
     let reply = match transport {
@@ -90,7 +103,31 @@ fn answer(query: &[u8], from: SocketAddr, upstream: Ipv4Addr, transport: Transpo
     };
     // On upstream failure, say so (SERVFAIL) rather than leave the client
     // waiting for its own timeout.
-    Some(reply.unwrap_or_else(|_| error_reply(query, question.end, 2)))
+    match reply {
+        Ok(reply) => {
+            count("forwarded", qtype);
+            Some(reply)
+        }
+        Err(_) => {
+            count("servfail", qtype);
+            Some(error_reply(query, question.end, 2))
+        }
+    }
+}
+
+fn count(outcome: &'static str, qtype: String) {
+    let mut queries = QUERIES.lock().unwrap_or_else(|e| e.into_inner());
+    *queries.entry((outcome, qtype)).or_default() += 1;
+}
+
+fn render_metrics() -> String {
+    let mut m = metrics::Exposition::default();
+    let name = "kiln_dns_queries_total";
+    m.family(name, "counter", "DNS queries from sandboxes by outcome: forwarded upstream, refused by the sandbox's policy, or servfail (upstream failed).");
+    for ((outcome, qtype), n) in QUERIES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        m.sample(name, &[("outcome", outcome), ("qtype", qtype)], n);
+    }
+    m.finish()
 }
 
 /// Reads the sandbox's policy file. No file means an unknown sender: refuse.

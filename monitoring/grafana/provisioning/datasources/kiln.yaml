@@ -1,0 +1,12 @@
+# Grafana reads this at startup and creates the data source, so there's
+# nothing to click through. The fixed uid is what the dashboard refers to.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: kiln-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s

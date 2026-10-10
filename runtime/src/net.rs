@@ -12,6 +12,7 @@
 //! root can't change its own address, routes or firewall. All configuration is
 //! done from the host side with `ip` and `nft`, the same tools you'd type.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -187,28 +188,90 @@ impl Network {
         format!("sb_{}", self.ip.to_string().replace('.', "_"))
     }
 
-    /// The host end of the veth pair. Interface names are capped at 15 bytes;
-    /// the IP's host part is unique.
     fn host_if(&self) -> String {
-        format!("kv{:04x}", u32::from(self.ip) & 0xffff)
+        host_if(self.ip)
     }
 
     /// Packets the sandbox tried to send that its policy rejected.
     pub fn blocked_packets(&self) -> u64 {
         let out = Command::new("nft").args(["list", "chain", "inet", "kiln", &self.chain()]).output();
-        let Ok(out) = out else { return 0 };
-        let text = String::from_utf8_lossy(&out.stdout);
-        let words: Vec<&str> = text.split_whitespace().collect();
-        words
-            .windows(2)
-            .filter(|w| w[0] == "packets")
-            .filter_map(|w| w[1].parse::<u64>().ok())
-            .sum()
+        out.map(|o| sum_packets(&String::from_utf8_lossy(&o.stdout))).unwrap_or(0)
     }
 
     pub fn ip(&self) -> Ipv4Addr {
         self.ip
     }
+}
+
+/// The host end of the veth pair for the sandbox at `ip`. Interface names are
+/// capped at 15 bytes; the IP's host part is unique.
+pub fn host_if(ip: Ipv4Addr) -> String {
+    format!("kv{:04x}", u32::from(ip) & 0xffff)
+}
+
+/// The IP of every networked sandbox, by run ID, read from the lease files.
+pub fn leases() -> HashMap<String, Ipv4Addr> {
+    let Ok(entries) = fs::read_dir(Path::new(STATE_DIR).join("leases")) else { return HashMap::new() };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let ip = e.file_name().to_str()?.parse().ok()?;
+            let run = fs::read_to_string(e.path()).ok()?;
+            Some((run.trim().to_string(), ip))
+        })
+        .collect()
+}
+
+/// Packet counters from kiln's nftables table, read in one `nft list table`.
+#[derive(Default)]
+pub struct Rejected {
+    /// Per running sandbox: packets its egress policy rejected.
+    pub by_sandbox: HashMap<Ipv4Addr, u64>,
+    /// The same, summed over every sandbox since boot, including exited ones
+    /// (whose chains are gone). From the named counter `egress_rejected`.
+    pub egress_total: u64,
+    /// Packets from sandboxes to the host itself (the input chain).
+    pub host_total: u64,
+}
+
+pub fn rejected() -> Rejected {
+    let mut found = Rejected::default();
+    let Ok(out) = Command::new("nft").args(["list", "table", "inet", "kiln"]).output() else { return found };
+    // The listing is nested blocks. Track which top-level block (a chain, a
+    // set or a named counter) each line is in by counting braces, and add up
+    // the "packets N" of the counters inside it.
+    let mut depth = 0;
+    let mut block = String::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if depth == 1 && words.len() >= 2 {
+            block = format!("{} {}", words[0], words[1]);
+        }
+        let packets = sum_packets(line);
+        match block.split_once(' ') {
+            Some(("counter", "egress_rejected")) => found.egress_total += packets,
+            Some(("chain", "input")) => found.host_total += packets,
+            Some(("chain", name)) => {
+                if let Some(ip) = name.strip_prefix("sb_").and_then(|n| n.replace('_', ".").parse().ok()) {
+                    *found.by_sandbox.entry(ip).or_default() += packets;
+                }
+            }
+            _ => {}
+        }
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+    }
+    found
+}
+
+/// Adds up every "packets N" in some `nft list` output.
+fn sum_packets(text: &str) -> u64 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words
+        .windows(2)
+        .filter(|w| w[0] == "packets")
+        .filter_map(|w| w[1].parse::<u64>().ok())
+        .sum()
 }
 
 /// The DNS forwarder's policy file for the sandbox at `ip`.
@@ -235,7 +298,7 @@ impl Drop for Network {
 
 /// Configures the network namespace of `pid` (a freshly cloned sandbox that
 /// is still waiting on its parent). Returns `None` for `--net none`.
-pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
+pub fn setup(pid: Pid, run_id: &str, plan: &Plan) -> Result<Option<Network>> {
     // Inside the namespace: loopback up (it starts down).
     let mut inside = String::from("link set lo up\n");
 
@@ -247,7 +310,7 @@ pub fn setup(pid: Pid, plan: &Plan) -> Result<Option<Network>> {
         if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
             eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
         }
-        let network = lease()?;
+        let network = lease(run_id)?;
         let policy_file = dns_policy_path(network.ip);
         fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
         fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
@@ -293,11 +356,17 @@ fn policy(network: &Network, plan: &Plan) -> String {
     // Flush in case a crashed run left this IP's chain behind: `add chain` is
     // a no-op on an existing chain, and its old rules would come first.
     let mut nft = format!("add chain inet kiln {chain}\nflush chain inet kiln {chain}\n");
+    // Each reject bumps two counters: this chain's own (gone when the sandbox
+    // is), and the named counter shared by all sandboxes, which lives as long
+    // as the table, so `kiln metrics` can count rejects from exited sandboxes.
+    // Adding an existing counter is a no-op, like `add chain`.
+    nft += "add counter inet kiln egress_rejected\n";
+    let reject = "counter name \"egress_rejected\" counter reject with icmpx admin-prohibited";
 
     match &plan.mode {
         Mode::None => {}
         Mode::Full => {
-            nft += &rule("ip daddr @private counter reject with icmpx admin-prohibited comment \"private ranges\"");
+            nft += &rule(&format!("ip daddr @private {reject} comment \"private ranges\""));
             nft += &rule("accept");
         }
         Mode::Allow(allowed) => {
@@ -306,7 +375,7 @@ fn policy(network: &Network, plan: &Plan) -> String {
                 let label = a.label.replace('"', "");
                 nft += &rule(&format!("ip daddr {}{port} accept comment \"{label}\"", set(a.addrs.iter().cloned())));
             }
-            nft += &rule("counter reject with icmpx admin-prohibited comment \"not allowed\"");
+            nft += &rule(&format!("{reject} comment \"not allowed\""));
         }
     }
     nft += &format!("add element inet kiln egress {{ {} : jump {chain} }}\n", network.ip);
@@ -345,8 +414,9 @@ pub fn ensure_bridge() -> Result<()> {
 }
 
 /// Leases the lowest free address. Creating the lease file with O_EXCL is
-/// atomic, so concurrent sandboxes can't get the same IP without a lock.
-fn lease() -> Result<Network> {
+/// atomic, so concurrent sandboxes can't get the same IP without a lock. The
+/// file holds the run ID, so `kiln metrics` can tell whose IP it is.
+fn lease(run_id: &str) -> Result<Network> {
     let dir = Path::new(STATE_DIR).join("leases");
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let first = u32::from(GATEWAY) + 1;
@@ -355,7 +425,11 @@ fn lease() -> Result<Network> {
         let ip = Ipv4Addr::from(n);
         let path = dir.join(ip.to_string());
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(_) => return Ok(Network { ip, lease: path }),
+            Ok(mut file) => {
+                let network = Network { ip, lease: path };
+                file.write_all(run_id.as_bytes()).context("write lease")?;
+                return Ok(network);
+            }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
         }

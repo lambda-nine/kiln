@@ -1,0 +1,11 @@
+# Loads every dashboard JSON in the folder below, and reloads it when the
+# file changes (scripts/setup-monitoring.sh copies the repo's version there).
+apiVersion: 1
+providers:
+  - name: kiln
+    folder: kiln
+    type: file
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards/kiln

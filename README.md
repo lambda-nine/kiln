@@ -14,7 +14,8 @@ limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln      # now in Ubuntu 24.04
 sudo scripts/fetch-alpine.sh             # once: unpack Alpine as the "alpine" image
 sudo scripts/setup-storage.sh            # once: XFS with project quotas for --disk
-scripts/install.sh                       # once: /usr/local/bin/kiln + kiln-dns service
+scripts/install.sh                       # once: /usr/local/bin/kiln + kiln-dns and kiln-metrics services
+scripts/setup-monitoring.sh              # once: Prometheus + Grafana on http://localhost:3000
 cargo build
 sudo target/debug/kiln run -- sh
 sudo target/debug/kiln run --keep -- sh  # keep the run dir to see what changed
@@ -22,6 +23,8 @@ sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats
 sudo target/debug/kiln run --read-only --writable /data -- sh  # Landlock
 sudo target/debug/kiln run --net full -- wget -qO- http://example.com
 sudo target/debug/kiln run --allow example.com:80 --stats -- sh
+sudo kiln stats                          # running sandboxes, like docker stats
+sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 ```
 
 ## Layers
@@ -71,6 +74,17 @@ sudo target/debug/kiln run --allow example.com:80 --stats -- sh
    sparse file on a loop device) mounted with `prjquota`. Each run directory
    gets its own project ID with PROJINHERIT and a hard block limit (`--disk`,
    default 1G). Done with raw `FS_IOC_FSSETXATTR` ioctls and `quotactl_fd`.
+
+10. **Metrics** (done): `kiln metrics` serves every running sandbox's memory,
+    CPU and throttling, PIDs, block I/O, pressure stalls, disk quota use,
+    network traffic and rejected packets in the Prometheus text format on
+    127.0.0.1:9840, read straight from cgroup files, XFS quotas, veth
+    counters and nftables. `kiln dns` counts forwarded and refused queries on
+    127.0.0.1:9841. `scripts/setup-monitoring.sh` installs Prometheus (scraping
+    every 5 s), node_exporter and Grafana with the dashboard below provisioned
+    from `monitoring/`. `kiln stats` prints the same numbers as a table.
+
+![kiln dashboard in Grafana](docs/kiln-dashboard.png)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 
@@ -267,3 +281,38 @@ what each fix teaches:
   doesn't change throughput yet. iocost only enforces weights when its model
   says the disk is saturated, and the Mac's SSD behind virtio never gets
   there with the default model. Tuning `io.cost.model` would be the next step.
+
+### Metrics
+
+- **The exporter has no state.** Every scrape reads the kernel's own
+  counters: `memory.current`, `cpu.stat`, `pids.current`, `io.stat` and the
+  `*.pressure` files in each sandbox's cgroup, the XFS project quota of its run
+  directory, `/sys/class/net/kvNNNN/statistics` for its veth, and `nft list
+  table inet kiln`. The text format is simple enough to write by hand: `# HELP`
+  and `# TYPE` lines, then `name{label="value"} number`. Counters end in
+  `_total` and only go up; Grafana turns them into rates with `rate()`.
+- **Short runs fall between scrapes.** A sandbox that's OOM-killed half a
+  second after it starts never shows up in a 5 s scrape; its cgroup is gone.
+  The parent cgroup saves the day: `/sys/fs/cgroup/kiln/memory.events` and
+  `cpu.stat` are hierarchical and keep counting sandboxes after they're
+  removed, so `kiln_all_oom_kills_total` and `kiln_all_cpu_seconds_total`
+  include every run since boot. Not everything aggregates: the parent's
+  `nr_throttled` only counts throttling by the parent's own limit, so
+  throttling is per sandbox only.
+- **Same idea for the firewall.** A sandbox's nftables chain (and its
+  counters) is deleted when it exits, so each reject also bumps a named
+  counter, `egress_rejected`, that lives as long as the table. One rule can
+  carry two counters: `counter name "egress_rejected" counter reject`.
+- **An OOM kill counts processes, not sandboxes.** With `memory.oom.group`
+  the kernel kills every process in the sandbox at once, and `oom_kill` goes
+  up by one per process.
+- **Throttling as a share of periods.** `nr_throttled / nr_periods` is the
+  share of 100 ms periods in which the sandbox used up its `cpu.max` quota and
+  was paused. A busy loop under `--cpus 0.5` sits at 100%. Pressure stall
+  information (`cpu.pressure`) shows the same thing as time: about 50% of
+  wall time spent waiting for CPU.
+- **A veth pair is a mirror.** The sandbox's bytes sent show up as bytes
+  *received* on the host end (`rx_bytes`), so the exporter swaps them.
+- **Page cache counts as memory.** Writing 60 MB to disk shows ~60 MiB of
+  `file` memory in `memory.stat` (and in `memory.current`), with almost no
+  `anon` memory. It's reclaimable, so it doesn't cause OOM kills.

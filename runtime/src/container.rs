@@ -77,9 +77,8 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
 
     let id = run_id();
-    let runs = Path::new(KILN_ROOT).join("runs");
-    storage::prepare(&runs)?;
-    let run_dir = runs.join(&id);
+    storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
+    let run_dir = run_dir(&id);
     let layers = Layers {
         lower,
         upper: run_dir.join("upper"),
@@ -170,7 +169,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
         // starts before its limits apply.
         cgroup.add(pid)?;
         // Plug its network namespace in from the outside, same reasoning.
-        network = net::setup(pid, &cfg.net)?;
+        network = net::setup(pid, id, &cfg.net)?;
         write(&to_child_tx, b"1").context("signal child")?;
 
         // The child does its mounts as real root, then creates its user
@@ -234,8 +233,8 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
         cgroup.value("pids.peak"),
         cgroup.stat("memory.events", "oom_kill"),
     );
-    if let Some(bytes) = quota::usage(upper) {
-        eprintln!("kiln: disk used {:.1} MiB", mib(bytes));
+    if let Some(disk) = quota::usage(upper) {
+        eprintln!("kiln: disk used {:.1} MiB", mib(disk.used));
     }
 }
 
@@ -431,10 +430,23 @@ fn setup_dev(dev: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A run ID is the start time in nanoseconds (hex) and kiln's PID: unique,
+/// sortable, and it names the run's cgroup and run directory.
 fn run_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}-{}", std::process::id())
+}
+
+/// When run `id` started, in seconds since the Unix epoch.
+pub fn run_started(id: &str) -> Option<f64> {
+    let (nanos, _) = id.split_once('-')?;
+    Some(u128::from_str_radix(nanos, 16).ok()? as f64 / 1e9)
+}
+
+/// /var/lib/kiln/runs/<id>: the run's overlay layers, under its disk quota.
+pub fn run_dir(id: &str) -> PathBuf {
+    Path::new(KILN_ROOT).join("runs").join(id)
 }
