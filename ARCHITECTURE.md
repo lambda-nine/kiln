@@ -97,7 +97,7 @@ reconcile.
 | CPU hog                          | Handled: `cpu.max` throttling           |
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |
-| Disk fill                        | Handled: XFS project quota per run      |
+| Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
 | Supervisor crash leaves orphans  | Partial: pdeathsig kills the sandbox; cgroup, run dir and lease leak until kilnd reconcile |

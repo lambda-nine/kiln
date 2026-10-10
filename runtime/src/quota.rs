@@ -30,8 +30,15 @@ const Q_XGETQUOTA: u32 = ((b'X' as u32) << 8) + 3;
 const Q_XSETQLIM: u32 = ((b'X' as u32) << 8) + 4;
 const FS_DQUOT_VERSION: i8 = 1;
 const FS_PROJ_QUOTA: i8 = 1 << 1;
+const FS_DQ_ISOFT: u16 = 1 << 0;
+const FS_DQ_IHARD: u16 = 1 << 1;
 const FS_DQ_BSOFT: u16 = 1 << 2;
 const FS_DQ_BHARD: u16 = 1 << 3;
+/// Empty files consume almost no quota blocks, so give each project a separate
+/// inode budget. This ratio allows normal source trees while preventing a
+/// small block quota from consuming the host filesystem's entire inode pool.
+const BYTES_PER_INODE: u64 = 16 * 1024;
+const MIN_INODES: u64 = 128;
 
 /// `struct fsxattr` from <linux/fs.h>.
 #[repr(C)]
@@ -119,13 +126,16 @@ pub fn limit(dir: &Path, bytes: Option<u64>) -> Result<()> {
     // Always write the limit, even "none" (0): IDs are inode numbers, which
     // get reused, and a reused ID would otherwise inherit an old limit.
     let blocks = bytes.map_or(0, |b| b.div_ceil(BASIC_BLOCK));
+    let inodes = bytes.map_or(0, |b| b.div_ceil(BYTES_PER_INODE).max(MIN_INODES));
     let mut quota = FsDiskQuota {
         version: FS_DQUOT_VERSION,
         flags: FS_PROJ_QUOTA,
-        fieldmask: FS_DQ_BHARD | FS_DQ_BSOFT,
+        fieldmask: FS_DQ_IHARD | FS_DQ_ISOFT | FS_DQ_BHARD | FS_DQ_BSOFT,
         id,
         blk_hardlimit: blocks,
         blk_softlimit: blocks,
+        ino_hardlimit: inodes,
+        ino_softlimit: inodes,
         ..Default::default()
     };
     quotactl(&dir_file, Q_XSETQLIM, id, &mut quota).context("set disk quota")

@@ -72,8 +72,9 @@ sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 
 9. **Disk limits** (done): `/var/lib/kiln/runs` is an XFS filesystem (in a
    sparse file on a loop device) mounted with `prjquota`. Each run directory
-   gets its own project ID with PROJINHERIT and a hard block limit (`--disk`,
-   default 1G). Done with raw `FS_IOC_FSSETXATTR` ioctls and `quotactl_fd`.
+   gets its own project ID with PROJINHERIT and hard block and inode limits
+   (`--disk`, default 1G). Done with raw `FS_IOC_FSSETXATTR` ioctls and
+   `quotactl_fd`.
 
 10. **Metrics** (done): `kiln metrics` serves every running sandbox's memory,
     CPU and throttling, PIDs, block I/O, pressure stalls, disk quota use,
