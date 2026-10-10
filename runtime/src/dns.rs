@@ -126,7 +126,11 @@ fn answer(query: &[u8], from: SocketAddr, upstream: Ipv4Addr, transport: Transpo
     let question = parse_question(query)?;
     let allowed = allowed(sandbox, &question.name);
     let qtype = qtype_name(question.qtype);
-    println!("{sandbox} {qtype} {} {}", question.name, if allowed { "allowed" } else { "refused" });
+    println!(
+        "{sandbox} {qtype} {} {}",
+        question.name.escape_default(),
+        if allowed { "allowed" } else { "refused" }
+    );
     if !allowed {
         count("refused", qtype);
         return Some(refused(query, question.end));
