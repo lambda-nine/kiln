@@ -30,10 +30,21 @@ sudo install -m 644 monitoring/grafana/dashboards/kiln.json /var/lib/grafana/das
 # Grafana settings as environment variables (GF_<SECTION>_<KEY>), in a
 # systemd drop-in so grafana.ini stays as packaged. Anonymous visitors can
 # view dashboards without logging in; the port is only reachable from the Mac.
-# Log in as admin/admin (Grafana asks for a new password) to edit.
+# Generate the administrator password once and keep it in a root-only file.
+admin_env=/etc/grafana/kiln-admin.env
+if ! sudo test -s "$admin_env"; then
+    admin_password=$(openssl rand -hex 24)
+    printf 'GF_SECURITY_ADMIN_PASSWORD=%s\n' "$admin_password" |
+        sudo install -m 600 /dev/stdin "$admin_env"
+else
+    admin_password=$(sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' "$admin_env")
+fi
+[ -n "$admin_password" ] || { echo "$admin_env does not contain an admin password" >&2; exit 1; }
+
 sudo install -d /etc/systemd/system/grafana-server.service.d
 sudo tee /etc/systemd/system/grafana-server.service.d/kiln.conf >/dev/null <<'CONF'
 [Service]
+EnvironmentFile=/etc/grafana/kiln-admin.env
 Environment=GF_AUTH_ANONYMOUS_ENABLED=true
 Environment=GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
 Environment=GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/kiln/kiln.json
@@ -45,6 +56,9 @@ CONF
 sudo systemctl daemon-reload
 sudo systemctl enable --now prometheus prometheus-node-exporter grafana-server
 sudo systemctl restart prometheus grafana-server
+# The environment setting initializes a fresh database. Reset the existing
+# administrator too, so upgrading an installation still removes admin/admin.
+sudo grafana cli admin reset-admin-password "$admin_password" >/dev/null
 
 echo "Waiting for Grafana..."
 for _ in $(seq 60); do
@@ -54,3 +68,4 @@ done
 curl -sf http://127.0.0.1:3000/api/health >/dev/null || { echo "Grafana didn't come up: journalctl -u grafana-server"; exit 1; }
 echo "Prometheus: http://localhost:9090/targets"
 echo "Grafana:    http://localhost:3000 (kiln dashboard)"
+echo "Grafana administrator password: sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' $admin_env"
