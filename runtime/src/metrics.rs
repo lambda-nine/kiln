@@ -34,7 +34,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
-use std::thread::sleep;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -45,6 +46,8 @@ use crate::net;
 use crate::quota;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9840";
+const HTTP_WORKERS: usize = 4;
+const HTTP_QUEUE_CAPACITY: usize = 32;
 
 /// Everything known about one running sandbox.
 struct Sandbox {
@@ -355,13 +358,31 @@ pub fn serve_metrics(listen: &str) -> Result<()> {
 }
 
 /// A minimal HTTP/1.1 server: enough for Prometheus, which sends one GET per
-/// scrape. Requests are handled one at a time, each with a short timeout, so a
-/// stuck client delays the next scrape by at most that long.
+/// scrape. A bounded worker pool prevents slow clients from serializing all
+/// scrapes without allowing connections to create unbounded host threads.
 pub fn serve(listen: &str, render: fn() -> String) -> Result<()> {
     let listener = TcpListener::bind(listen).with_context(|| format!("listen on {listen}"))?;
     println!("kiln: serving metrics on http://{listen}/metrics");
+    let (streams_tx, streams_rx) = mpsc::sync_channel(HTTP_QUEUE_CAPACITY);
+    let streams_rx = Arc::new(Mutex::new(streams_rx));
+    for _ in 0..HTTP_WORKERS {
+        let streams_rx = Arc::clone(&streams_rx);
+        thread::spawn(move || loop {
+            let stream = {
+                let receiver = streams_rx.lock().unwrap_or_else(|e| e.into_inner());
+                receiver.recv()
+            };
+            match stream {
+                Ok(stream) => {
+                    let _ = handle(stream, render);
+                }
+                Err(_) => return,
+            }
+        });
+    }
     for stream in listener.incoming().flatten() {
-        let _ = handle(stream, render);
+        // A scrape client will retry if all workers and queue slots are busy.
+        let _ = streams_tx.try_send(stream);
     }
     Ok(())
 }
