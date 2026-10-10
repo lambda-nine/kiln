@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,8 @@ use crate::net;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const HEADER_LEN: usize = 12;
+const WORKERS: usize = 16;
+const QUEUE_CAPACITY: usize = 256;
 /// Localhost only: the sandboxes' side of the host is the bridge, and the
 /// input chain rejects them anyway.
 const METRICS_LISTEN: &str = "127.0.0.1:9841";
@@ -47,24 +49,56 @@ pub fn serve() -> Result<()> {
         }
     });
 
+    let udp = Arc::new(udp);
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel(QUEUE_CAPACITY);
+    let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+    for _ in 0..WORKERS {
+        let jobs_rx = Arc::clone(&jobs_rx);
+        let udp = Arc::clone(&udp);
+        thread::spawn(move || worker(jobs_rx, udp, upstream));
+    }
+
+    let tcp_jobs = jobs_tx.clone();
     thread::spawn(move || {
         for stream in tcp.incoming().flatten() {
-            thread::spawn(move || {
-                let _ = serve_tcp(stream, upstream);
-            });
+            // A full queue means the service is already at its configured
+            // concurrency bound. Dropping the stream makes the client retry
+            // without consuming another host task.
+            let _ = tcp_jobs.try_send(Job::Tcp(stream));
         }
     });
 
     let mut buf = [0u8; 4096];
     loop {
         let (n, from) = udp.recv_from(&mut buf).context("recv")?;
-        let query = buf[..n].to_vec();
-        let udp = udp.try_clone().context("clone socket")?;
-        thread::spawn(move || {
-            if let Some(reply) = answer(&query, from, upstream, Transport::Udp) {
-                let _ = udp.send_to(&reply, from);
+        // Keep both host threads and queued memory bounded. UDP clients retry
+        // naturally when an overloaded forwarder drops a datagram.
+        let _ = jobs_tx.try_send(Job::Udp(buf[..n].to_vec(), from));
+    }
+}
+
+enum Job {
+    Tcp(TcpStream),
+    Udp(Vec<u8>, SocketAddr),
+}
+
+fn worker(jobs: Arc<Mutex<mpsc::Receiver<Job>>>, udp: Arc<UdpSocket>, upstream: Ipv4Addr) {
+    loop {
+        let job = {
+            let receiver = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            receiver.recv()
+        };
+        match job {
+            Ok(Job::Tcp(stream)) => {
+                let _ = serve_tcp(stream, upstream);
             }
-        });
+            Ok(Job::Udp(query, from)) => {
+                if let Some(reply) = answer(&query, from, upstream, Transport::Udp) {
+                    let _ = udp.send_to(&reply, from);
+                }
+            }
+            Err(_) => return,
+        }
     }
 }
 

@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/kiln dns
 Restart=on-failure
+TasksMax=64
+MemoryMax=128M
 # It creates the kiln0 bridge and nftables table if missing, binds port 53 on
 # the bridge and reads /run/kiln. Nothing else needs writing.
 NoNewPrivileges=yes
