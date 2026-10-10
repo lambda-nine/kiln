@@ -1,0 +1,1008 @@
+% kiln: a design paper. Build with `tectonic kiln.tex` in this directory.
+\documentclass[10pt,letterpaper]{article}
+
+\usepackage{fontspec}
+\setmainfont{XCharter}[Extension=.otf, UprightFont=*-Roman, BoldFont=*-Bold,
+  ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic, Numbers=Lining]
+\setmonofont{Inconsolatazi4}[Extension=.otf, UprightFont=*-Regular,
+  BoldFont=*-Bold, Scale=0.9]
+\usepackage[letterpaper,margin=0.85in]{geometry}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[font=small,labelfont=bf,skip=4pt]{caption}
+\usepackage{titlesec}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc,backgrounds}
+\usepackage[hidelinks]{hyperref}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{10pt plus 2pt minus 2pt}{4pt}
+\titlespacing*{\subsection}{0pt}{7pt plus 2pt minus 1pt}{3pt}
+\setlength{\parskip}{3pt plus 1pt}
+\setlength{\parindent}{0pt}
+\setlength{\emergencystretch}{2.5em}
+\setlist{itemsep=1pt,topsep=2pt,parsep=0pt,leftmargin=1.3em}
+\setlength{\textfloatsep}{10pt plus 2pt minus 2pt}
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\us}{\char`\_}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{basicstyle=\ttfamily\footnotesize,columns=fullflexible,keepspaces=true,
+  backgroundcolor=\color{codebg},frame=none,xleftmargin=4pt,xrightmargin=4pt,
+  aboveskip=4pt,belowskip=4pt,showstringspaces=false}
+
+\tikzset{
+  box/.style={draw, rounded corners=2pt, align=center, fill=white, inner sep=3pt},
+  proc/.style={box, fill=blue!7},
+  svc/.style={box, fill=orange!12},
+  kern/.style={box, fill=gray!14},
+  st/.style={box, fill=green!8, font=\scriptsize\ttfamily},
+  arr/.style={-{Stealth[length=2mm]}, semithick},
+  lab/.style={font=\scriptsize, inner sep=1.5pt},
+}
+
+\title{\vspace{-1.6em}\textbf{kiln: a small Linux sandbox runtime, built layer by layer}\\[2pt]
+\large A design paper}
+\author{Stephen Estrada\\{\small\code{github.com/stcrestrada/kiln}}}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.2em}
+
+\begin{abstract}
+\noindent kiln is a container runtime of about 2{,}600 lines of Rust that runs one
+command at a time in an isolated Linux sandbox. It was built to learn, from the
+kernel interfaces up, what a container actually is: seven namespaces, an overlay
+root filesystem swapped in with \code{pivot\us{}root}, cgroup v2 limits on memory,
+CPU, processes and block I/O, XFS project quotas for disk, a user namespace that
+makes sandbox root an unprivileged host UID, a seccomp filter and a Landlock
+ruleset, a per-sandbox network namespace on a bridge with an nftables egress
+policy, a policy-enforcing DNS forwarder, and a stateless Prometheus exporter.
+Each layer was written directly against the kernel's files and system calls (and
+the standard \code{ip} and \code{nft} tools for networking), with no container
+libraries. This paper describes each layer as a concept and the design
+decision behind it, what an independent review found and what it taught, and what
+is still missing.
+\end{abstract}
+
+% ---------------------------------------------------------------------------
+\section{Motivation and goals}
+
+kiln is a learning project with a specific aim: real depth in Linux systems
+concepts (cgroups, namespaces, filesystems, networking, observability). The
+fastest way to get that depth is to build the thing that exercises it, so kiln
+re-implements the core of a container runtime: the part that \code{runc} and
+Docker hide. Its intended use is running tool calls for AI agents (shell
+commands, scripts, package installs) where the code is untrusted and its
+resource use unpredictable.
+
+\textbf{Goals.} (1)~Every isolation and limit mechanism is implemented by kiln
+itself against the kernel interface: \code{clone}, \code{mount}, cgroupfs
+files, \code{ioctl}s, raw BPF, \code{nft} rules. (2)~Every limit has a
+measurable failure mode that was triggered on purpose (an OOM kill, a fork bomb,
+a full disk, a rejected packet). (3)~No daemon and no database: all state lives in
+the kernel and a few directories, so the system can be inspected with
+\code{cat}, \code{nft list} and \code{findmnt}. (4)~Defaults are closed: no
+network unless asked, limits on by default.
+
+\textbf{Non-goals (for now).} OCI image and runtime-spec compatibility, rootless
+operation, multi-tenant production hardening, and long-lived sandboxes (the
+next phase, \S\ref{sec:future}).
+
+\textbf{Environment.} macOS has no namespaces or cgroups, so kiln runs in an
+Ubuntu 24.04 arm64 VM under Lima (4 vCPU, 4\,GiB) with the source tree shared into
+the VM. The image is Alpine's minirootfs, fetched and checksum-verified by a script.
+
+% ---------------------------------------------------------------------------
+\section{Architecture overview}
+
+kiln is one binary with four subcommands. \code{kiln run} is the runtime: it
+creates a sandbox, supervises it, and tears it down. \code{kiln dns} and
+\code{kiln metrics} are long-running host services under systemd: a DNS
+forwarder for sandboxes and a Prometheus exporter. \code{kiln stats} prints a
+\code{docker stats}-style table. Figure~\ref{fig:arch} shows how they relate.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\footnotesize]
+  % user-space processes
+  \node[proc, text width=30mm] (run) at (0,0.1) {\textbf{kiln run}\\supervisor, host root;\\waits, forwards signals};
+  \node[proc, text width=25mm] (init) at (5.5,0.55) {\textbf{kiln-init} (PID 1)};
+  \node[proc, text width=25mm] (cmd) at (5.5,-0.45) {command (PID 2)};
+  \draw[arr] (init) -- node[lab, right] {fork + exec} (cmd);
+  \node[draw, dashed, rounded corners=3pt, fit=(init)(cmd), inner sep=5pt,
+        label={[font=\scriptsize, align=center]above:sandbox: 7 namespaces\\(UTS, PID, mount, net, IPC, cgroup, user)}] (sb) {};
+  \node[svc, text width=27mm] (dns) at (10.1,0.55) {\textbf{kiln dns}\\10.88.0.1:53 (systemd)};
+  \node[svc, text width=27mm] (met) at (10.1,-0.65) {\textbf{kiln metrics}\\127.0.0.1:9840 (systemd)};
+  \node[svc, text width=27mm] (prom) at (10.1,2.05) {Prometheus (5\,s scrape)\\$\rightarrow$ Grafana};
+  \draw[arr] (run) -- node[lab, above] {clone + 2 pipes} (sb.west |- run);
+  \draw[arr, dashed] (cmd.east) -- node[lab, above, sloped] {DNS} (dns.west);
+  \draw[arr] (prom) -- (dns);
+  \draw[arr] (prom.east) to[out=-30, in=30] node[lab, right] {scrape} (met.east);
+  % kernel
+  \foreach \x/\n/\t in {0/k1/{namespaces},2.55/k2/{cgroups v2\\(+ iocost)},5.1/k3/{overlayfs +\\XFS project quota},7.65/k4/{seccomp-bpf +\\Landlock},10.2/k5/{bridge, veth,\\nftables}}
+    \node[kern, text width=21mm, minimum height=9mm] (\n) at (\x,-2.25) {\t};
+  \begin{scope}[on background layer]
+    \node[draw, fill=gray!4, rounded corners=3pt, fit=(k1)(k5), inner sep=4pt,
+          label={[font=\scriptsize]left:\rotatebox{90}{kernel}}] (kern) {};
+  \end{scope}
+  \draw[arr] (run.south) -- node[lab, left, align=right] {creates and\\configures} (run.south |- kern.north);
+  \draw[arr] (met.south) -- node[lab, right, xshift=1pt] {reads} (met.south |- kern.north);
+  % state
+  \node[st, anchor=west] (s1) at (-1.0,-3.45) {/var/lib/kiln/images/<name>};
+  \node[st, right=2mm of s1] (s2) {/var/lib/kiln/runs/<id>};
+  \node[st, right=2mm of s2] (s3) {/sys/fs/cgroup/kiln/<id>};
+  \node[st, right=2mm of s3] (s4) {/run/kiln/net/\{leases,dns\}};
+  \node[font=\scriptsize, left=1mm of s1] {state:};
+\end{tikzpicture}
+\caption{kiln's parts. The supervisor creates each sandbox and configures the
+kernel on its behalf; the two services run under systemd and are shared by all
+sandboxes. All state is kernel objects plus the four directories at the bottom.}
+\label{fig:arch}
+\end{figure}
+
+\textbf{No daemon, no database.} A run's identity is its \emph{run ID}, the start
+time in nanoseconds (hex) plus kiln's PID: unique, sortable, and used to name both
+its cgroup (\code{/sys/fs/cgroup/kiln/<id>}) and its run directory
+(\code{/var/lib/kiln/runs/<id>}). An IP lease is a file named after the address
+whose contents are the run ID, which is how the exporter attributes traffic. The
+DNS forwarder's per-sandbox policy is a file named after the sandbox's IP. Any
+tool, including the exporter, finds running sandboxes by listing
+\code{/sys/fs/cgroup/kiln/}. The cost of this design is that nothing reconciles
+state after a crash; \S\ref{sec:limits} returns to this.
+
+\textbf{Resource ownership through RAII.} The supervisor holds a \code{Cgroup}
+value and an optional \code{Network} value. Their destructors run in reverse
+order on every exit path: the network's nftables element and chain, veth and
+lease go first, then \code{cgroup.kill} and \code{rmdir} of the cgroup, and finally
+the run directory (unless \code{--keep}). The overlay mount needs no cleanup: it
+exists only in the sandbox's mount namespace and disappears with it.
+
+% ---------------------------------------------------------------------------
+\section{Process and namespace setup}
+\label{sec:startup}
+
+A namespace gives a process its own instance of one kind of global kernel
+resource. kiln creates five at \code{clone} time: UTS (hostname), PID (the child
+becomes PID 1 of a new numbering), mount, network, and IPC (System V shared
+memory, semaphores and message queues). The child later unshares two more: a
+cgroup namespace and, last of all, a user namespace. The child has its own 1\,MiB
+stack and no \code{CLONE\us{}VM}, so it gets a copy of the parent's address space
+and can read the configuration without sharing memory with the parent.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+    pnote/.style={box, fill=blue!5, text width=43mm, align=left, anchor=east, font=\scriptsize},
+    cnote/.style={box, fill=blue!5, text width=56mm, align=left, anchor=west, font=\scriptsize},
+    msg/.style={arr, thick}]
+  \def\P{4.6} \def\C{9.4}
+  \node[proc, font=\footnotesize\bfseries] (ph) at (\P,0) {kiln (parent, host root)};
+  \node[proc, font=\footnotesize\bfseries] (ch) at (\C,0) {child (sandbox PID 1)};
+  \draw[gray, thick] (ph.south) -- (\P,-9.0);
+  \draw[gray, thick] (ch.south) -- (\C,-9.0);
+  % parent steps
+  \node[pnote] at (\P-0.15,-0.95) {check image; create run dir and set its XFS project quota; create \code{upper/}, \code{work/}, \code{merged/}; create cgroup kiln/<id> and write limits};
+  \draw[msg] (\P,-1.75) -- node[lab, above, align=center] {\code{clone(NEWUTS|NEWPID|}\\\code{NEWNS|NEWNET|NEWIPC)}} (\C,-1.75);
+  \node[cnote] at (\C+0.15,-1.75) {close every inherited fd except 0, 1, 2 and the two pipe ends (\code{close\us{}range}); block on the pipe};
+  \node[pnote] at (\P-0.15,-2.65) {write child PID to \code{cgroup.procs}; lease IP, create veth pair, add nft chain; \code{nsenter}: lo up, eth0 address, default route};
+  \draw[msg] (\P,-3.35) -- node[lab, above] {byte 1: ``in your cgroup, net ready''} (\C,-3.35);
+  \node[cnote, anchor=north west] at (\C+0.15,-3.1) {\code{unshare(NEWCGROUP)}; \code{sethostname}; mark \code{/} \code{MS\us{}PRIVATE} recursively; mount overlay on merged/; build \code{/dev} and \code{/dev/shm}; \code{pivot\us{}root(".", ".")} and detach the old root; mount \code{/proc}; write two net sysctls; mount cgroup2 read-only; write \code{/etc/resolv.conf}; \code{unshare(NEWUSER)}};
+  \draw[msg] (\C,-5.15) -- node[lab, above] {byte: ``user namespace exists''} (\P,-5.15);
+  \node[pnote] at (\P-0.15,-5.75) {write \code{uid\us{}map} and \code{gid\us{}map}: \code{0 2000000000 65536}};
+  \draw[msg] (\P,-6.3) -- node[lab, above] {byte 2: ``ID maps written''} (\C,-6.3);
+  \node[cnote, anchor=north west] at (\C+0.15,-6.05) {\code{setgroups([])}, \code{setresgid/setresuid(0)}; \code{PR\us{}SET\us{}PDEATHSIG}; clean environment; \code{no\us{}new\us{}privs}; Landlock (if \code{--read-only}); seccomp; fork + exec the command as PID~2, then forward signals and reap};
+  \node[pnote] at (\P-0.15,-7.3) {\code{sigwait} loop: forward TERM, HUP, USR1, USR2; swallow INT, QUIT};
+  \draw[msg] (\C,-8.05) -- node[lab, above] {exit status (SIGCHLD)} (\P,-8.05);
+  \node[pnote] at (\P-0.15,-8.65) {cleanup: nft element + chain, veth, lease; \code{cgroup.kill}, \code{rmdir}; remove run dir};
+\end{tikzpicture}
+\caption{Sandbox startup. Three one-byte messages over two \code{O\us{}CLOEXEC}
+pipes order the steps that must happen outside the sandbox (cgroup placement,
+network plumbing, ID maps) relative to those that must happen inside it.
+If either side dies, the other reads EOF instead of hanging.}
+\label{fig:startup}
+\end{figure}
+
+Figure~\ref{fig:startup} is the whole startup protocol. Three ordering
+constraints shape it:
+
+\begin{enumerate}
+\item \textbf{Limits before the first instruction.} The parent moves the child
+into its cgroup and plugs in its network \emph{before} releasing it. If the child
+moved itself, the command could start before its limits applied. (\code{clone3}
+with \code{CLONE\us{}INTO\us{}CGROUP} does this in one call; kiln uses the explicit
+handshake, which it needs anyway for network setup and the ID maps.)
+\item \textbf{The cgroup namespace after the move.} A cgroup namespace makes the
+process's \emph{current} cgroup appear as the root. Created before the move, the
+host's cgroup would become the sandbox's root.
+\item \textbf{The user namespace last.} Every namespace is owned by the user
+namespace that was current when it was created, and capabilities only act on
+namespaces that one's user namespace owns. Creating the user namespace after all
+the others leaves them owned by the host, so sandbox root, with a full capability
+set, cannot mount, unmount, change the hostname or reconfigure its network.
+\end{enumerate}
+
+\textbf{File descriptors are the first thing closed.} Namespaces,
+\code{pivot\us{}root} and Landlock all check \emph{paths} at open time; none of
+them revokes a descriptor that is already open. A descriptor inherited from
+whatever started kiln is therefore a handle straight through every wall
+(\S\ref{sec:review}). The child closes everything except stdio and its two pipe
+ends before doing anything else, which also means a parent that dies mid-setup
+shows up as EOF on the pipe.
+
+% ---------------------------------------------------------------------------
+\section{Root filesystem: overlayfs and pivot\_root}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+    layer/.style={box, text width=46mm, align=left, minimum height=10mm, font=\scriptsize},
+    cell/.style={box, text width=23mm, minimum height=7mm, font=\scriptsize},
+    empty/.style={cell, draw=gray!50, dashed, text=gray}]
+  \node[layer, fill=blue!7] (m) at (0,0) {\textbf{merged/} $\rightarrow$ the sandbox's \code{/}\\after \code{pivot\us{}root}; overlay mounted\\in the sandbox's mount ns only};
+  \node[layer, fill=orange!12] (u) at (0,-1.45) {\textbf{upper/} (read-write, this run only)\\\code{runs/<id>/upper}, under the run's\\XFS project quota; \textbf{work/} beside it};
+  \node[layer, fill=gray!14] (l) at (0,-2.9) {\textbf{lower} (read-only, shared image)\\\code{images/alpine}, owners shifted\\to 2000000000 and up};
+  % columns
+  \def\a{4.4} \def\b{7.0} \def\c{9.6}
+  \node[font=\scriptsize\bfseries] at (\a,0.95) {read \code{/bin/sh}};
+  \node[font=\scriptsize\bfseries] at (\b,0.95) {\code{rm /etc/motd}};
+  \node[font=\scriptsize\bfseries] at (\c,0.95) {write \code{/root/f}};
+  \node[cell, fill=blue!7] (m1) at (\a,0) {\code{/bin/sh}\\(from lower)};
+  \node[cell, fill=blue!7, text=gray] (m2) at (\b,0) {absent};
+  \node[cell, fill=blue!7] (m3) at (\c,0) {\code{/root/f}\\(from upper)};
+  \node[empty] (u1) at (\a,-1.45) {nothing};
+  \node[cell, fill=orange!12] (u2) at (\b,-1.45) {whiteout:\\char dev 0/0};
+  \node[cell, fill=orange!12] (u3) at (\c,-1.45) {\code{/root/f}\\(new file)};
+  \node[cell, fill=gray!14] (l1) at (\a,-2.9) {\code{/bin/sh}};
+  \node[cell, fill=gray!14] (l2) at (\b,-2.9) {\code{/etc/motd}\\(unchanged)};
+  \node[empty] (l3) at (\c,-2.9) {nothing};
+  \draw[arr, gray] (l1) to[out=150, in=-150] (m1);
+  \draw[arr, gray] (u2) -- node[lab, right] {hides} (m2);
+  \draw[arr, gray] (u3) -- (m3);
+\end{tikzpicture}
+\caption{The overlay root. Reads fall through to the shared image; writes and
+deletions land only in the run's upper layer, so \code{upper/} is an exact record
+of what the sandbox changed. On top of \code{merged/}, the sandbox mounts its own
+\code{/proc}, a minimal \code{/dev} tmpfs, a 64\,MiB \code{/dev/shm} and a
+read-only cgroup2 at \code{/sys/fs/cgroup}.}
+\label{fig:overlay}
+\end{figure}
+
+Every sandbox shares one read-only image and gets a private writable layer
+(Figure~\ref{fig:overlay}). overlayfs merges them: lookups check the upper
+layer first; the first write to a lower file copies it up; a deletion leaves a
+\emph{whiteout} (a 0/0 character device) in the upper layer. Two consequences
+matter for agents. Destroying the image from inside is impossible (\code{rm -rf
+/bin} only writes whiteouts), and \code{upper/} is a precise, free audit log of
+the run's changes; \code{--keep} preserves it for inspection. Mount points that
+kiln itself needs (\code{/sys/fs/cgroup}, \code{/workspace}) are created in the
+image at fetch time, so \code{upper/} holds only what the sandbox wrote.
+
+\textbf{Swapping roots.} \code{chroot} only changes how paths are resolved and
+leaves the old root reachable to a sufficiently privileged process.
+\code{pivot\us{}root} changes the mount namespace's root mount itself. kiln uses
+the \code{pivot\us{}root(".", ".")} idiom: with the current directory at the new
+root, the old root ends up stacked on top of it, and \code{umount2(".",
+MNT\us{}DETACH)} then removes it, leaving no mount through which the host
+filesystem can be reached.
+
+\textbf{Mount propagation.} On systemd hosts \code{/} is a \emph{shared} mount, so
+even in a new mount namespace, new mounts would propagate back to the host, and
+\code{pivot\us{}root} refuses to operate on shared mounts. The child first marks
+everything \code{MS\us{}REC|MS\us{}PRIVATE}. During a run, \code{findmnt -t
+overlay} on the host is empty.
+
+\textbf{A minimal /dev.} Instead of the host's \code{/dev} (which includes disks),
+the sandbox gets a 64\,KiB tmpfs holding bind mounts of six devices (\code{null},
+\code{zero}, \code{full}, \code{random}, \code{urandom}, \code{tty}), the usual
+\code{fd} and \code{std*} symlinks, and a \code{/dev/shm} tmpfs whose pages are
+charged to the sandbox's memory limit. A fresh \code{/proc} (mounted
+\code{nosuid,nodev,noexec}) shows only the sandbox's PID namespace.
+
+% ---------------------------------------------------------------------------
+\section{Resource limits with cgroups v2}
+
+cgroup v2 is a single hierarchy of directories; each directory is a group of
+processes, and controller files inside it set limits and report usage. Two rules
+shape kiln's layout (Figure~\ref{fig:cgroups}). Controllers are enabled
+top-down: a cgroup can only use \code{memory}, \code{cpu}, \code{pids} or
+\code{io} if its parent lists them in \code{cgroup.subtree\us{}control}. And a
+cgroup that delegates controllers to children cannot hold processes itself (``no
+internal processes''). So sandboxes live \emph{under} \code{/sys/fs/cgroup/kiln/},
+which itself stays empty.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+    cg/.style={box, fill=green!8, font=\scriptsize, align=left},
+    note/.style={font=\scriptsize, align=left, text=black!75}]
+  \node[cg] (root) at (0,0) {\code{/sys/fs/cgroup}\\subtree\us{}control: +cpu +memory +pids +io\\\code{io.cost.qos}: iocost on the disk under the loop device};
+  \node[cg, fill=gray!10] (sys) at (-4.3,-1.6) {\code{system.slice}\\io.weight 100 (default)};
+  \node[cg, fill=gray!10] (usr) at (-1.25,-1.6) {\code{user.slice}};
+  \node[cg] (kiln) at (2.9,-1.6) {\code{kiln/}\quad (no processes)\\subtree\us{}control: +cpu +memory +pids +io\\\code{io.weight}: default 50\\hierarchical \code{memory.events}, \code{cpu.stat}};
+  \node[cg, fill=orange!12] (a) at (0.1,-3.65) {\code{kiln/<run A>}\\\code{memory.max} 536870912\\\code{memory.swap.max} 0\\\code{memory.oom.group} 1\\\code{cpu.max} 100000 100000\\\code{pids.max} 128};
+  \node[cg, fill=orange!12] (b) at (3.3,-3.65) {\code{kiln/<run B>}\\\code{memory.max} 33554432\\\code{cpu.max} 50000 100000\\\ldots};
+  \node[cg, fill=orange!12, text width=13mm, align=center] (c) at (5.75,-3.65) {\ldots};
+  \foreach \n in {sys,usr,kiln} \draw[semithick] (root.south) -- (\n.north);
+  \foreach \n in {a,b,c} \draw[semithick] (kiln.south) -- (\n.north);
+  \node[note, anchor=west, text width=40mm] at (7.0,-3.4) {Inside run A, its cgroup namespace makes \code{kiln/<run A>} appear as \code{/}, mounted read-only: the sandbox can read its limits and usage but not raise them.};
+\end{tikzpicture}
+\caption{cgroup hierarchy. Limits are set per run; the parent sets the sandboxes'
+collective I/O share and provides counters that survive individual runs.}
+\label{fig:cgroups}
+\end{figure}
+
+\begin{table}[t]
+\centering\small
+\caption{Limits, their defaults, and the kernel interface behind each.}
+\label{tab:limits}
+\begin{tabularx}{\linewidth}{@{}l l >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+Flag & Default & Kernel interface & At the limit \\
+\midrule
+\code{--memory} & 512M & \code{memory.max}; \code{memory.swap.max}=0; \code{memory.oom.group}=1 & reclaim, then the OOM killer kills every process in the sandbox \\
+\code{--cpus} & 1 & \code{cpu.max} = ``$q$ 100000'', $q$ = cores $\times$ 100\,000\,\textmu s & throttled for the rest of each 100\,ms period \\
+\code{--pids} & 128 & \code{pids.max} & \code{fork}/\code{clone} fail; counted in \code{pids.events} \\
+\code{--disk} & 1G & XFS project quota: block hard limit, plus one inode per 16\,KiB (min.\ 128) & writes fail with \code{ENOSPC} \\
+(all runs) & --- & parent \code{io.weight} ``default 50'' with iocost & proportional share, only under contention \\
+(all runs) & --- & tmpfs \code{size=}: 64\,KiB \code{/dev}, 64\,MiB \code{/dev/shm} & \code{ENOSPC}; shm pages count toward \code{memory.max} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Table~\ref{tab:limits} lists every limit. The design decisions behind them:
+
+\begin{itemize}
+\item \textbf{Kill the sandbox, not a process.} \code{memory.oom.group} makes an
+OOM kill take out the whole group. A half-killed tool call (a shell whose child
+died) is harder to reason about than one that failed outright. Swap is disabled
+for the group (when a memory limit is set) so a memory hog hits its limit instead of degrading into swap.
+\item \textbf{CPU is a quota per period}, not a share: \code{--cpus 0.25} writes
+\code{25000 100000}, so a 2\,s busy loop gets 500\,ms of CPU and is throttled once in
+each of 20 periods (\code{nr\us{}throttled} in \code{cpu.stat}).
+\item \textbf{Page cache is memory.} Writing 100\,MB to disk showed a memory peak of
+about 100\,MiB, because file pages are charged to the writer's cgroup. They are
+reclaimable, so they cause writeback rather than OOM kills, but they count toward
+\code{memory.max}, which matters for \S\ref{sec:io}.
+\item \textbf{Teardown is atomic.} \code{cgroup.kill} SIGKILLs every process in
+the group in one write, including anything that escaped the command's process
+tree; the directory is then removed once empty.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{kiln-init: PID 1 and signals}
+
+The kernel treats a PID namespace's init specially: signals sent to it from
+inside its namespace are dropped unless it installed a handler, and orphaned
+processes are re-parented to it. A normal program as PID 1 therefore ignores
+\code{kill} and \code{timeout} and never reaps orphans. Before kiln-init,
+\code{kiln run -- timeout 2 sh -c 'while :; do :; done'} never ended: busybox
+\code{timeout} signalled from inside the namespace and PID 1 ignored it.
+
+So PID 1 is kiln itself (the same binary, already running in the child), playing
+the role \code{tini} plays for Docker. It blocks all signals, forks the command
+as PID 2 (which restores an empty mask and \code{exec}s), and then loops on
+\code{sigwait}: on SIGCHLD it reaps \emph{every} exited child (several exits can
+coalesce into one signal), and SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 are forwarded
+to the command. When the command exits, init returns its status (128 + signal
+number if it was killed, 127 if \code{exec} failed) and exits; the kernel then
+kills whatever is left in the PID namespace.
+
+\textbf{Waiting for signals rather than handling them.} Both kiln-init and the
+supervisor block signals with \code{sigprocmask} and consume them synchronously
+with \code{sigwait} in the same loop that reaps children. There are no
+asynchronous handlers, so there are no async-signal-safety rules to get wrong.
+The supervisor therefore survives Ctrl-C and \code{kill}, passes them on, and
+still cleans up.
+
+\textbf{Not forwarding SIGINT.} The terminal sends SIGINT, SIGQUIT and SIGWINCH to
+its whole foreground process group, and the sandboxed command is in that group, so
+it already received them. Forwarding would deliver them twice. Ctrl-C ends a run
+with 130 and full cleanup.
+
+% ---------------------------------------------------------------------------
+\section{Disk quotas with XFS project quotas}
+
+Without a disk limit, one sandbox can fill the host filesystem. Classic quotas
+limit what a UID owns, which does not fit (all sandboxes map to the same host IDs,
+\S\ref{sec:userns}). XFS \emph{project} quotas instead limit whatever is tagged
+with a 32-bit project ID, and the \code{PROJINHERIT} flag on a directory makes
+everything created beneath it inherit the tag. This is how Docker's overlay2 driver
+limits container size.
+
+\textbf{Storage.} \code{/var/lib/kiln/runs} is an XFS filesystem inside a sparse
+file (20\,GB by default), mounted through a loop device with \code{prjquota}, so no spare
+partition is needed. Per run, kiln tags the still-empty run directory with
+\code{FS\us{}IOC\us{}FSSETXATTR} (project ID plus \code{PROJINHERIT}) and sets the
+limits with \code{quotactl\us{}fd} (\code{Q\us{}XSETQLIM}), both as raw
+\code{ioctl}/syscall calls against \code{\#[repr(C)]} structs whose sizes are
+asserted at compile time. \code{upper/} and \code{work/} are created afterwards,
+so they and everything the sandbox writes are charged to the run.
+
+\textbf{Design decisions.} (1)~The project ID is the run directory's inode
+number: unique on the filesystem for as long as the directory exists, so no ID
+allocator is needed. (2)~Because inode numbers are reused, kiln \emph{always}
+writes the limit, even ``unlimited'' (0); otherwise a new run could inherit a
+dead run's limit. (3)~Blocks alone are not enough: empty files cost almost no
+blocks, so a small block quota could still exhaust the filesystem's inodes. Each
+project also gets an inode limit of one per 16\,KiB of quota (at least 128).
+(4)~A full quota surfaces to the program as \code{ENOSPC} (``No space left on
+device''), not \code{EDQUOT}, which is the honest description from inside.
+
+% ---------------------------------------------------------------------------
+\section{User namespaces and ID mapping}
+\label{sec:userns}
+
+Without a user namespace, root in the sandbox is root on the host, and every
+other wall becomes the last one. With it, sandbox UIDs and GIDs 0--65535 map to
+host IDs 2\,000\,000\,000--2\,000\,065\,535, a range no real user owns (well above
+the \code{/etc/subuid} range given to the VM's user). An escaped process lands on
+the host as UID 2\,000\,000\,000, which owns nothing.
+
+\textbf{Only an outsider can write the maps.} A fresh user namespace has no
+mapping, so its process appears as the overflow ID (\code{nobody}). The parent,
+which holds \code{CAP\us{}SETUID}/\code{CAP\us{}SETGID} over the parent namespace,
+writes \code{0 2000000000 65536} to the child's \code{uid\us{}map} and
+\code{gid\us{}map}; the child then drops supplementary groups and switches to
+UID/GID 0. That is the second pipe handshake in Figure~\ref{fig:startup}.
+
+\textbf{Capabilities that apply to nothing.} Inside, root has a full capability
+set (\code{CapEff: 000001ffffffffff}), but since the mount, UTS, network, IPC,
+PID and cgroup namespaces are owned by the host's user namespace,
+\code{hostname}, \code{mount}, \code{umount} and \code{ip link set} all fail with
+\code{EPERM}.
+
+\textbf{Image files must be shifted.} Host-root-owned image files would appear as
+\code{nobody} inside, and sandbox root could not modify them. The fetch script
+therefore adds 2\,000\,000\,000 to every file's owner and group, restoring setuid
+bits that \code{chown} clears (Docker's userns-remap approach), and kiln refuses
+to start if the image root is not owned by the base ID. The upper layer is
+chowned to the same ID so the sandbox's \code{/} belongs to sandbox root. The
+known cost is that all sandboxes share one ID range (\S\ref{sec:limits}).
+
+\textbf{Two sysctls make root-in-a-userns feel normal.} Binding a port below 1024
+requires \code{CAP\us{}NET\us{}BIND\us{}SERVICE} in the user namespace that owns the
+network namespace, which sandbox root is not. Before creating the user namespace,
+the child sets \code{ip\us{}unprivileged\us{}port\us{}start=0} and
+\code{ping\us{}group\us{}range} through \code{/proc/sys/net}, which is per network
+namespace. Docker sets the same two.
+
+% ---------------------------------------------------------------------------
+\section{Syscall filtering and Landlock}
+
+Namespaces control what a process can \emph{see}; the kernel is still shared, and
+every system call is attack surface. Two final restrictions are applied just
+before the command starts, both inherited by every descendant and irrevocable.
+
+\textbf{no\_new\_privs} comes first. It guarantees that \code{exec} can never grant
+more privilege (setuid bits stop working), which is the precondition for an
+unprivileged process to install a seccomp filter or Landlock ruleset: otherwise a
+filtered process could exec a setuid binary that runs with the filter but with
+more privilege.
+
+\textbf{seccomp-bpf.} A seccomp filter is a small classic-BPF program the kernel
+runs on every syscall, over a struct holding the architecture, syscall number and
+arguments. kiln's is hand-assembled. It first checks the architecture, since
+syscall numbers differ per ABI, and kills the process on a mismatch (and, on
+x86-64, on x32 syscalls). It then denies, with \code{EPERM}, about 40 syscalls in
+a few families: loading kernel modules and kexec; large, historically bug-prone
+subsystems (\code{bpf}, \code{perf\us{}event\us{}open}, \code{userfaultfd},
+\code{io\us{}uring}); the kernel keyring, which is not namespaced;
+open-by-handle, which bypasses path checks; \code{setns} and the whole mount API;
+and host-wide state (clocks, swap, accounting, kernel log, quotas). Finally it
+denies any \code{clone} or \code{unshare} whose flags include a
+\code{CLONE\us{}NEW*} bit. That matters because sandbox root holds every capability
+\emph{inside} its user namespace: a new network or mount namespace it created
+would be its own, exposing root-only kernel code. \code{clone3} passes its flags
+in memory the filter cannot read, so it returns \code{ENOSYS}, which makes libc
+fall back to \code{clone} (the approach Docker uses). The filter is installed
+with \code{SECCOMP\us{}FILTER\us{}FLAG\us{}TSYNC}, a no-op for today's
+single-threaded child but correct for a future multi-threaded one.
+
+\emph{Decision: a denylist.} Docker's default profile is an allowlist of roughly
+350 syscalls, which is stricter. kiln chose a short denylist because it can be read
+and reasoned about in one sitting; the cost is that new kernel syscalls are
+allowed by default.
+
+\textbf{Landlock} (with \code{--read-only}) restricts which paths may be written,
+and unlike file permissions it binds root (\code{CAP\us{}DAC\us{}OVERRIDE} does not
+apply). A ruleset declares the access rights it \emph{handles}; any handled right
+is denied unless a rule grants it beneath some directory. kiln handles only
+write-type rights (writing, truncating, creating, removing and renaming across
+directories), so reading and executing stay allowed everywhere, and grants them
+beneath \code{/tmp}, \code{/root}, \code{/workspace}, \code{/dev/shm} and any
+\code{--writable} paths; existing \code{/dev} files stay writable but no new
+devices can be created. kiln requires Landlock ABI~3 (Linux 6.2), the first that
+covers truncation; on older kernels \code{--read-only} would silently allow files
+to be emptied. Landlock does not cover metadata, so \code{chmod} on a file the
+sandbox owns still works.
+
+% ---------------------------------------------------------------------------
+\section{Networking: bridge, veth pairs and nftables}
+
+Every sandbox gets its own network namespace. With \code{--net none} (the
+default) it contains only loopback. With \code{--net full} or \code{--allow}, the
+supervisor connects it to the host (Figure~\ref{fig:net}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+    ns/.style={box, fill=blue!7, text width=33mm, align=left, font=\scriptsize},
+    ifc/.style={box, fill=white, font=\scriptsize\ttfamily, inner sep=2pt},
+    rule/.style={box, fill=orange!12, align=left, font=\scriptsize},
+    bad/.style={box, fill=red!8, draw=red!60!black, align=left, font=\scriptsize}]
+  \node[ns] (a) at (-0.3,1.1) {\textbf{sandbox A}\\\code{--allow example.com:80}\\eth0 10.88.0.2};
+  \node[ns] (b) at (-0.3,-0.5) {\textbf{sandbox B}\\\code{--net full}\\eth0 10.88.0.3};
+  \node[ns, fill=gray!10] (c) at (-0.3,-2.05) {\textbf{sandbox C}\\\code{--net none}: lo only, no veth};
+  \node[ifc] (va) at (2.9,1.1) {kv0002};
+  \node[ifc] (vb) at (2.9,-0.5) {kv0003};
+  \draw[very thick] (a.east) -- node[lab, above] {veth} (va.west);
+  \draw[very thick] (b.east) -- node[lab, above] {veth} (vb.west);
+  \node[box, fill=green!8, minimum height=33mm, text width=15mm] (br) at (4.75,0.3) {\textbf{kiln0}\\bridge\\10.88.0.1/16\\[2pt]ports\\isolated};
+  \draw[very thick] (va.east) -- (va.east -| br.west);
+  \draw[very thick] (vb.east) -- (vb.east -| br.west);
+  \node[rule, text width=37mm] (fwd) at (8.2,1.25) {\textbf{forward} (inet kiln)\\\code{ip saddr vmap @egress}\\$\rightarrow$ per-sandbox chain \code{sb\us{}10\us{}88\us{}0\us{}2}\\anything else: reject};
+  \node[rule, text width=37mm] (inp) at (8.2,-1.05) {\textbf{input}: only UDP/TCP 53\\to 10.88.0.1; host otherwise\\rejected};
+  \node[svc, text width=22mm] (dns) at (8.2,-2.35) {\textbf{kiln dns}\\per-IP name policy};
+  \node[rule, text width=24mm] (nat) at (12.4,1.25) {\textbf{postrouting}\\masquerade\\$\rightarrow$ VM eth0};
+  \node[box, fill=gray!8, text width=17mm] (net) at (12.4,2.75) {internet};
+  \node[bad, text width=24mm] (priv) at (12.4,-0.5) {\textbf{rejected}: 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16};
+  \node[box, fill=gray!8, text width=24mm] (up) at (12.4,-2.35) {host's upstream\\resolver};
+  \draw[arr] (br.east |- fwd) -- (fwd.west);
+  \draw[arr] (br.east |- inp) -- (inp.west);
+  \draw[arr] (inp) -- (dns);
+  \draw[arr] (fwd) -- node[lab, above] {accept} (nat);
+  \draw[arr] (nat) -- (net);
+  \draw[arr, red!60!black] ($(fwd.south east)+(-0.3,0)$) |- node[lab, pos=0.8, above] {reject} (priv.west);
+  \draw[arr] (dns) -- node[lab, above] {allowed names} (up);
+\end{tikzpicture}
+\caption{Network topology. Each networked sandbox has a veth pair whose host end
+is an isolated port on \code{kiln0}. All policy is in one nftables table: a
+verdict map sends each sandbox's packets to its own chain, the input chain admits
+only DNS to the forwarder, and NAT masquerades the rest out of the VM.}
+\label{fig:net}
+\end{figure}
+
+\textbf{Plumbing from outside.} The network namespace is created at \code{clone}
+time, before the user namespace, so sandbox root cannot change its address,
+routes or firewall. The supervisor configures it before releasing the child: it
+leases an address, creates a veth pair whose peer is created directly inside the
+sandbox's namespace as \code{eth0}, attaches the host end to \code{kiln0} as an
+isolated port, installs the sandbox's nftables chain, and then runs \code{ip}
+inside the namespace via \code{nsenter} to bring up \code{lo}, assign the address
+and add a default route via 10.88.0.1. The bridge and the base
+ruleset are created once per boot (checked on every run under an \code{flock}),
+and \code{ip\us{}forward} is enabled.
+
+\textbf{Leases without a lock.} A lease is a file in \code{/run/kiln/net/leases}
+created with \code{O\us{}EXCL}, which is atomic, so concurrent runs cannot get the
+same address. Because \code{/run} is a tmpfs, leases vanish on reboot together
+with the bridge and rules they refer to.
+
+\textbf{Policy is one verdict map.} The base table's forward chain begins:
+\begin{lstlisting}
+iifname "kiln0" ip saddr vmap @egress   # jump to this sandbox's chain
+iifname "kiln0" counter reject with icmpx admin-prohibited
+oifname "kiln0" ct state established,related accept
+oifname "kiln0" counter drop
+\end{lstlisting}
+Adding a sandbox is one map element plus one chain; removing it deletes both, with
+no rule handles to track. For \code{--net full} the chain rejects the private
+and link-local set (the VM's LAN, the Mac behind it, cloud metadata at
+169.254.169.254) and accepts the rest. For \code{--allow HOST[:PORT]} it accepts
+only the listed addresses (hostnames are resolved once, at start) and rejects
+everything else. The sandbox's source address is trustworthy because sandbox root
+cannot change it. Rules end in \code{reject} rather than \code{drop}, so a blocked
+connection fails in milliseconds instead of hanging until a timeout, which matters
+for an agent waiting on a tool call.
+
+\textbf{Isolation between sandboxes.} Frames between two ports of one bridge are
+switched, not routed, so the inet forward hook never sees them. kiln sets the
+bridge port flag \code{isolated on} instead, which stops isolated ports from
+talking to each other at layer~2. The input chain keeps sandboxes off the host's
+own services (\code{sshd}, and later kilnd's API).
+
+% ---------------------------------------------------------------------------
+\section{The DNS forwarder}
+
+Name resolution was the last way out. Originally, networked sandboxes could reach
+the VM's resolver directly, which on Lima is a port on the Mac, and DNS can carry
+data in query names (\code{<secret>.attacker.example}). Now each networked
+sandbox's \code{/etc/resolv.conf} (written as real root, so read-only for sandbox
+root) points at \code{kiln dns} on 10.88.0.1:53 (UDP and TCP), the only resolver
+the input chain lets it reach.
+
+\textbf{Policy by source address.} For each query, the forwarder reads the
+policy file named after the sender's IP in \code{/run/kiln/net/dns/}: \code{*}
+for \code{--net full}, otherwise the \code{--allow} hostnames, one per line, each
+also matching its subdomains. Allowed queries are forwarded to the host's
+upstream resolver (read from systemd-resolved's \code{resolv.conf}, since
+127.0.0.53 only exists in the host's namespace); others get \code{REFUSED}; a
+missing file means an unknown sender and is refused. With \code{--allow}, this
+closes DNS as an exfiltration channel: an attacker's domain is never resolved.
+
+\textbf{Minimal parsing.} The forwarder parses only what it needs: the 12-byte
+header (exactly one question), then length-prefixed labels, then QTYPE and
+QCLASS. Compression pointers, which a query has no use for, are rejected.
+Malformed queries are dropped. Upstream replies are accepted only if the
+transaction ID matches; an upstream failure becomes \code{SERVFAIL} so the client
+does not wait for its own timeout.
+
+\textbf{Bounded by design.} Sandboxes can send it unlimited traffic, so the
+forwarder must not turn that into unlimited host resources: 16 worker threads
+consume a queue of 256 jobs, and when the queue is full new UDP datagrams and TCP
+connections are dropped, which DNS clients handle by retrying. The systemd unit
+caps tasks and memory and sets \code{NoNewPrivileges}. Every query is logged to
+the journal with control characters escaped (a query name is attacker-chosen
+bytes) and counted for Prometheus by outcome and type. The worker bound, the log escaping and the
+unit's task cap came from the second review (\S\ref{sec:review}).
+
+% ---------------------------------------------------------------------------
+\section{Storage and I/O accounting}
+\label{sec:io}
+
+\textbf{An OOM kill caused by someone else's cache.} A sandbox writing 1.5\,GB
+with \code{O\us{}DIRECT} under a 512\,MB limit was OOM-killed. Its own writes
+bypassed the page cache, but the loop driver, by default, writes the XFS image's
+backing file \emph{through} the page cache, and those dirty pages were charged to
+the sandbox that caused the I/O. It held nothing reclaimable of its own. Setting
+direct I/O on the loop device (\code{LOOP\us{}SET\us{}DIRECT\us{}IO}) removed the
+double caching: the same test peaked at 2.4\,MiB, and writes got faster. The
+setting does not survive reboot, so kiln checks it on every run.
+
+\textbf{Proportional I/O.} \code{io.weight} only does something under a
+proportional I/O controller. The VM's disk uses \code{mq-deadline} and the kernel
+has no BFQ, so kiln enables iocost (\code{io.cost.qos}) on the real disk under the
+loop device and gives all sandboxes together half the weight of a host service.
+With loop direct I/O, a sandbox's writes reach the real disk tagged with its
+cgroup and appear in its \code{io.stat}. \emph{Honest result:} on this VM, weights
+do not change throughput yet. iocost only enforces weights when its model judges
+the device saturated, and the Mac's SSD behind virtio never reaches that under the
+default model; tuning \code{io.cost.model} is the next step. The accounting works;
+enforcement is unproven.
+
+% ---------------------------------------------------------------------------
+\section{Metrics: Prometheus and Grafana}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.6\linewidth]{../kiln-dashboard.png}
+\caption{The kiln Grafana dashboard during \code{scripts/metrics-demo.sh}: one
+sandbox under \code{--cpus 0.5} (throttled in 100\% of periods, about 50\% CPU
+pressure), one using two cores, one hitting its allowlist (rejected packets,
+refused DNS queries), and OOM kills counted from the parent cgroup although
+those sandboxes exited between scrapes.}
+\label{fig:dash}
+\end{figure}
+
+\textbf{A stateless exporter.} \code{kiln metrics} keeps no state. Each scrape
+reads the kernel's own counters: \code{memory.current}, \code{memory.stat},
+\code{cpu.stat}, \code{pids.current}, \code{io.stat} and the \code{*.pressure}
+(PSI) files of each sandbox's cgroup; the XFS project quota of its run directory;
+the host end of its veth in \code{/sys/class/net}; and \code{nft list table inet
+kiln}. It writes the Prometheus text format by hand (\code{\# HELP}, \code{\#
+TYPE}, then \code{name\{labels\} value}; counters end in \code{\us{}total}).
+Prometheus scrapes it every 5\,s, because most sandboxes live for seconds and the
+default 1\,min interval would miss them. Grafana is provisioned with a kiln
+dashboard; anonymous visitors can view it, and the administrator password is
+generated at install time instead of the default.
+
+\textbf{Short runs fall between scrapes.} A sandbox OOM-killed half a second after
+starting never appears in a 5\,s scrape; its cgroup is gone. The fix is to read
+the \emph{parent}: \code{kiln/memory.events} and \code{kiln/cpu.stat} are
+hierarchical and keep counting after children are removed, so
+\code{kiln\us{}all\us{}oom\us{}kills\us{}total} and
+\code{kiln\us{}all\us{}cpu\us{}seconds\us{}total} include every run since boot. Not
+everything aggregates: the parent's \code{nr\us{}throttled} counts only throttling
+by the parent's own limit. The firewall has the same problem, since a sandbox's
+chain and its counters are deleted with it; each reject therefore also bumps a
+named counter, \code{egress\us{}rejected}, that lives as long as the table.
+
+\textbf{Reading the numbers correctly.} A veth pair is a mirror: what the
+sandbox sends is \emph{received} by the host end, so the exporter swaps rx and
+tx. An OOM kill counts processes, not sandboxes: with \code{memory.oom.group},
+\code{oom\us{}kill} rises by one per process killed. Throttling is reported as the
+share of 100\,ms periods in which the quota ran out; a busy loop under
+\code{--cpus 0.5} sits at 100\%, and \code{cpu.pressure} shows the same as about
+50\% of wall time stalled. The exporter's HTTP server, like the DNS forwarder,
+uses a small fixed worker pool and a bounded queue.
+
+% ---------------------------------------------------------------------------
+\section{Independent review: what it found and taught}
+\label{sec:review}
+
+kiln was reviewed independently twice. After networking landed, four
+reviewers attacked it with the goal of breaking isolation. After the metrics
+layer, a second review by a separate security-focused model (``Daybreak'')
+examined the whole system, including the host-side services. It found five
+issues; all five were fixed and each fix was verified with a regression script.
+Table~\ref{tab:review} summarizes both rounds by class of issue, not by
+individual reproduction.
+
+\begin{table}[t]
+\centering\small
+\caption{Classes of issues found, the fix, and the design lesson.}
+\label{tab:review}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{27mm} >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+Class & Finding and fix & Lesson \\
+\midrule
+A missing namespace & No IPC namespace: sandboxes shared System V IPC objects, which could also outlive the run and its memory limit. Fix: \code{CLONE\us{}NEWIPC}. & Enumerate every kernel-global resource. User namespaces do not separate sandboxes that share one ID range. \\
+Inherited handles & A file descriptor open in kiln's caller was readable and writable inside a \code{--read-only} sandbox. Fix: close all but stdio and the pipes first. & Path checks do not revoke handles. Same class as runc's CVE-2024-21626. \\
+State that outlives its owner & conntrack entries and reused IPs let a new sandbox continue a flow only the previous one was allowed; an idempotent \code{add chain} kept a crashed run's rules. Fix: policy on every outbound packet; flush after add. & Anything keyed by a reusable identifier (IP, inode number) must be reset, not assumed fresh. The quota code follows the same rule. \\
+Input at a trust boundary & \code{--image} accepted \code{../..}; size flags could overflow. Fix: plain names only; checked multiplication. & Validate CLI input as if it came from an agent, because eventually it will. \\
+Lifecycle edge cases & Fix: seccomp \code{TSYNC}; \code{PR\us{}SET\us{}PDEATHSIG} set \emph{after} the credential change that clears it; Landlock ABI~3 required so truncation is covered. & Kernel features have ordering and version preconditions; failing loudly beats degrading silently. \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Second review (security-focused model, after the metrics layer)}} \\
+\midrule
+Unbounded host-side work & The DNS forwarder started a thread per query, so sandboxes could make it create threads without limit; the metrics server handled one connection at a time, so one slow client stalled every scrape. Fix: fixed worker pools with bounded queues that drop on overflow; \code{TasksMax} on the unit. & Anything a sandbox can talk to is part of the isolation boundary. Its resource use must be bounded independently of what sandboxes do. \\
+A limit on one dimension only & The disk quota capped blocks but not inodes; empty files cost almost no blocks, so one sandbox could exhaust the filesystem's inodes. Fix: an inode limit of one per 16\,KiB of quota (minimum 128). & Limit every dimension of a resource: bytes \emph{and} count, as \code{memory.max} and \code{pids.max} do for memory and processes. \\
+Untrusted bytes in a trusted channel & DNS query names (arbitrary bytes chosen by the sandbox) were written to the journal unescaped. Fix: escape control characters. & Logs are an output that operators trust; escape attacker-controlled data before it reaches them. \\
+Insecure defaults & Grafana kept its default administrator password. Fix: generate one at install time into a root-only file, and reset it on existing installs. & The observability stack ships as part of the system; its defaults are the system's defaults. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The review also produced simplifications: one nftables table instead of two (NAT
+works in \code{inet} tables, and the old second table was never recreated if
+missing); the veth peer created directly inside the sandbox as \code{eth0}; the
+two network sysctls written by the sandbox itself through \code{/proc/sys/net}
+instead of a shelled-out \code{sysctl}; Landlock handling only write rights. Two
+issues were documented rather than fixed: Landlock does not cover metadata, and
+DNS to the host's resolver was reachable. The second was later closed by the
+forwarder. Separately, testing found the \code{O\us{}DIRECT} OOM of
+\S\ref{sec:io}. The meta-lesson of the first round: each layer was correct in
+isolation; the bugs were at the seams, in what one mechanism assumed another had
+already handled. The second round's lesson: isolating sandboxes moves the attack
+surface onto the shared services that serve them.
+
+% ---------------------------------------------------------------------------
+\section{Known limitations and future work}
+\label{sec:limits}\label{sec:future}
+
+\textbf{Limitations today.}
+\begin{itemize}
+\item \emph{No reconcile.} If the supervisor is killed, \code{PR\us{}SET\us{}PDEATHSIG}
+kills the sandbox, but its cgroup, run directory and lease leak; after a host
+reboot, run directories remain.
+\item \emph{One shared ID range.} All sandboxes map to the same host IDs, so
+they are not separated from each other by the user namespace. Idmapped mounts
+(\code{mount\us{}setattr} with \code{MOUNT\us{}ATTR\us{}IDMAP}) would allow a range per
+sandbox without copying the image.
+\item \emph{Allowlist drift.} \code{--allow} hostnames are resolved once at start;
+CDN addresses change. The forwarder also allows subdomains of an allowed name
+whose addresses the firewall does not. Next step: the forwarder adds the
+addresses it resolves to the sandbox's nftables set.
+\item \emph{DNS tunnelling under \code{--net full}} is logged but allowed.
+\item \emph{Kernel surface.} The seccomp denylist is weaker than an allowlist, and
+all sandboxes share the host kernel. IPv4 only.
+\item \emph{I/O weights} are wired and accounted but not enforced on this VM.
+\end{itemize}
+
+\textbf{Future work.} The build order continues with:
+(1)~\textbf{Persistent sandboxes.} Agents need state between tool calls
+(installed packages, files), so a sandbox will live for an agent session and run
+many commands via \code{setns}, like \code{docker exec}. A daemon,
+\code{kilnd}, will own sandbox state as a state machine with run records in
+SQLite, reconcile on startup by scanning \code{/sys/fs/cgroup/kiln/} and
+\code{/var/lib/kiln/runs/}, and run one shim process per sandbox so sandboxes
+survive a daemon crash or upgrade (the reason containerd has
+\code{containerd-shim}). The isolation backend sits behind a trait so a
+Firecracker microVM backend can offer the same API with a separate kernel.
+(2)~\textbf{The agent harness}: an agent loop with long-term memory and tools
+(\code{exec}, \code{read\us{}file}, \code{write\us{}file}, \code{diff}) talking to
+kilnd over gRPC on a Unix socket, with the overlay upper layer as the audit log
+and the basis for snapshots, and an egress proxy that logs requests.
+(3)~\textbf{Cold start}: measure, then optimize.
+(4)~\textbf{A Kubernetes operator}: k3s across several VMs, a Go operator with a
+\code{Sandbox} custom resource that places sandboxes on nodes, and kilnd on each
+node as a DaemonSet.
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+
+A container is not one feature but a set of independent kernel mechanisms, each
+closing one door, and most of the engineering is in their ordering and their
+seams: limits must apply before the first instruction, the user namespace must
+come last, descriptors must be closed before anything else, and every identifier
+the kernel reuses must be reset. Building each layer directly against the kernel,
+measuring its failure mode, and then having others try to break it made those
+seams concrete.
+
+\vspace{-0.3em}
+\begingroup
+\renewcommand{\section}[2]{\subsection*{#2}}
+\small
+\begin{thebibliography}{99}\setlength{\itemsep}{0pt}
+\bibitem{ns} Linux manual pages: \emph{namespaces}(7), \emph{user\_namespaces}(7), \emph{pid\_namespaces}(7), \emph{cgroup\_namespaces}(7), \emph{clone}(2), \emph{pivot\_root}(2), \emph{seccomp}(2), \emph{landlock}(7), \emph{quotactl}(2).
+\bibitem{cg} T.~Heo et al., \emph{Control Group v2}, Linux kernel documentation, \code{Documentation/admin-guide/cgroup-v2.rst}.
+\bibitem{ovl} \emph{Overlay Filesystem}, Linux kernel documentation, \code{Documentation/filesystems/overlayfs.rst}.
+\bibitem{ll} M.~Salaün, \emph{Landlock: unprivileged access control}, Linux kernel documentation, \code{Documentation/userspace-api/landlock.rst}.
+\bibitem{xfs} \emph{xfs\_quota}(8) and \emph{XFS project quotas}, xfsprogs documentation.
+\bibitem{runc} CVE-2024-21626: runc file descriptor leak (``Leaky Vessels''), GitHub advisory GHSA-xr7r-f8xq-vfvv, January 2024.
+\bibitem{docker} Docker documentation: \emph{Seccomp security profiles for Docker}; \emph{Isolate containers with a user namespace} (userns-remap).
+\bibitem{tini} \emph{tini}: a tiny but valid init for containers, \code{github.com/krallin/tini}.
+\bibitem{nft} \emph{nftables wiki}: verdict maps, NAT in inet tables, named counters.
+\bibitem{prom} Prometheus documentation: \emph{Exposition formats}.
+\end{thebibliography}
+\endgroup
+
+% ---------------------------------------------------------------------------
+\clearpage
+\appendix
+\section{Common questions and answers}
+\label{app:qa}
+\small
+
+
+\newcommand{\qa}[2]{\par\smallskip\textbf{Q: #1}\par\nopagebreak #2\par}
+\newcommand{\qgroup}[1]{\par\medskip{\normalsize\textbf{#1}}\par}
+
+\qgroup{Positioning}
+
+\qa{How does kiln compare with Docker and runc?}
+{Docker is a stack: a daemon, containerd, a per-container shim, and runc, which
+does the actual namespace, cgroup and mount setup from an OCI bundle. kiln covers
+roughly runc's job plus the parts of Docker that matter for sandboxing (image
+storage with overlayfs, bridge networking with NAT, disk quotas, an egress
+policy, metrics) in one binary. It has no OCI image or runtime-spec support, no
+image distribution, and no daemon yet. It exists for depth, not to replace them.}
+
+\qa{And with gVisor and Firecracker?}
+{All three answer ``how much of the host kernel does untrusted code reach?''
+kiln, like runc, lets the sandbox call the host kernel directly and narrows that
+with namespaces, seccomp and Landlock. gVisor intercepts syscalls and serves most
+of them from a user-space kernel, so far less host kernel code is reachable, at a
+cost in syscall-heavy workloads. Firecracker runs a guest kernel in a KVM microVM:
+the strongest boundary of the three, at the cost of a VM per sandbox. kiln's
+planned backend trait is meant to let a microVM backend sit behind the same API.}
+
+\qa{Why Rust?}
+{A runtime runs as root and parses untrusted input (DNS packets, HTTP requests),
+so memory safety matters. \code{unsafe} is confined to small, commented blocks
+around raw syscalls and \code{ioctl}s, which makes the dangerous parts easy to
+audit; \code{\#[repr(C)]} structs have their sizes checked at compile time; and
+\code{Drop} gives every kernel object (cgroup, nft chain, lease) cleanup on every
+exit path. Rust also has no runtime threads, so \code{clone} and \code{fork} behave
+as in C. Go's multi-threaded runtime is why runc does its namespace setup in a
+small C shim before Go starts.}
+
+\qa{Why no daemon yet?}
+{A one-shot CLI was enough to learn each kernel layer, and it keeps the state
+model trivial: everything lives in the kernel and a few directories, so there is
+nothing to get out of sync. A daemon becomes necessary once sandboxes outlive one
+command. The current design prepares for it: run IDs name cgroups and run
+directories, so a daemon can rebuild its view by scanning them.}
+
+
+\qgroup{Mechanisms}
+
+\qa{How do you guarantee limits apply before the command runs?}
+{The child blocks on a pipe immediately after \code{clone}. The parent writes its
+PID to \code{cgroup.procs} and sets up networking, and only then writes the byte
+that releases it. \code{clone3} with \code{CLONE\us{}INTO\us{}CGROUP} would do this
+atomically.}
+
+\qa{Why is the user namespace created last?}
+{Each namespace is owned by the user namespace current at its creation, and
+capabilities apply only to namespaces one's user namespace owns. Creating it last
+means the mount, network, UTS, IPC, PID and cgroup namespaces belong to the host,
+so sandbox root's capabilities do not reach them.}
+
+\qa{Sandbox root has all capabilities in its user namespace. Can't it just create new namespaces?}
+{That is exactly what the seccomp filter prevents: any \code{clone} or
+\code{unshare} with a \code{CLONE\us{}NEW*} flag gets \code{EPERM}, \code{clone3}
+gets \code{ENOSYS}, and \code{setns} and the mount API are denied.}
+
+\qa{Why does the command run as PID 2?}
+{PID 1 of a namespace ignores signals from inside it unless it installed a handler,
+and inherits all orphans. kiln-init forwards termination signals and reaps zombies,
+so \code{timeout}, \code{kill} and long-running shells behave normally.}
+
+\qa{Why overlayfs instead of copying the image for each run?}
+{Copying costs time and disk per run; an overlay mount is constant-time, every
+sandbox shares the image's page cache, and the upper layer is an exact diff of
+the run, which is both an audit log and the basis for snapshots.}
+
+\qa{Why cgroup v2?}
+{One hierarchy instead of one per controller, and the features kiln relies on
+exist only there: \code{memory.oom.group}, \code{cgroup.kill}, pressure stall
+information, iocost, and cgroup namespaces that show a sandbox only its own
+subtree. Ubuntu 24.04 uses v2 by default.}
+
+\qa{What does an agent see when a sandbox runs out of memory?}
+{\code{memory.oom.group} kills every process in the sandbox at once, so the run
+ends with exit code 137 (128 + SIGKILL), and the supervisor reads
+\code{oom\us{}kill} from \code{memory.events} and says so. Writing large files does
+not cause this: page cache is charged but reclaimable.}
+
+\qa{Why XFS project quotas rather than limiting by UID?}
+{All sandboxes share one host ID range, so a UID quota could not tell them apart.
+A project quota limits a directory tree, and \code{PROJINHERIT} tags everything
+the sandbox creates. The run directory's inode number serves as a free,
+collision-free project ID, and each project gets both a block and an inode limit.}
+
+\qa{Why did a sandbox using O\_DIRECT get OOM-killed?}
+{The loop device under the XFS image buffered the backing file in the page cache,
+and those pages were charged to the sandbox's cgroup. Switching the loop device
+to direct I/O removed the double caching.}
+
+\qa{Why reject instead of drop, and why isn't ``established'' accepted first?}
+{Reject makes blocked connections fail fast, which an agent loop needs. Outbound
+packets are always checked against the sandbox's current policy because IPs are
+reused and conntrack entries outlive sandboxes; ``established'' is trusted only for
+replies coming back in.}
+
+\qa{How do you stop data exfiltration through DNS?}
+{Sandboxes can reach only kiln's forwarder. With \code{--allow}, it resolves only
+the allowed names and their subdomains and refuses the rest, so an attacker's domain
+never reaches a resolver. With \code{--net full}, queries are logged but allowed.}
+
+\qa{Why is the DNS forwarder a separate service?}
+{It listens on one shared address, 10.88.0.1:53, for every sandbox, and it keeps
+no per-run state: each run only writes a policy file named after its IP. A single
+long-lived service under systemd, with its own task and memory caps, is simpler
+and easier to bound than a forwarder per run.}
+
+\qgroup{Operations}
+
+\qa{How do metrics survive short-lived runs?}
+{A run that ends between two 5\,s scrapes takes its cgroup and nftables chain
+with it. The exporter therefore also reads the parent cgroup, whose
+\code{memory.events} and \code{cpu.stat} are hierarchical and keep counting after
+children are removed, and a named nftables counter that every reject increments
+and that lives as long as the table. Totals since boot stay exact even when no
+scrape ever saw the run.}
+
+\qa{What happens if the supervisor is killed with SIGKILL?}
+{The sandbox dies too (\code{PR\us{}SET\us{}PDEATHSIG}). Its cgroup, run directory
+and IP lease are left behind; the planned daemon will reconcile them on startup.
+Catchable signals (Ctrl-C, \code{kill}) are consumed by \code{sigwait} and lead to
+a normal cleanup.}
+
+\qa{How fast does a sandbox start?}
+{It has not been measured yet; cold-start work is on the roadmap after the
+daemon and the harness. The expected costs are known: creating the cgroup, quota and overlay,
+and for networked runs several \code{ip}, \code{nft} and \code{nsenter} process
+launches, which netlink calls would replace.}
+
+\qa{How would you test it?}
+{Today, each limit was verified by triggering its failure mode on purpose (OOM
+kill, fork bomb, full disk, rejected packet), \code{scripts/metrics-demo.sh}
+exercises the whole stack, and the second review's fixes have a regression
+script. Next: run that suite in a VM in CI; turn each review finding into a test
+that asserts the attack now fails; unit-test the seccomp program and size
+parsing; and fuzz the DNS question parser, the one piece that parses
+sandbox-controlled bytes on the host.}
+
+\qa{How would this run on many hosts?}
+{A daemon per node owns local sandbox state and reconciles from the kernel and
+disk. On k3s, a Go operator with a \code{Sandbox} custom resource places sandboxes
+on nodes, with the daemon deployed as a DaemonSet. Node-local state (bridges,
+leases, quotas) stays node-local; the operator only schedules, using per-node
+capacity it can read from the same cgroup metrics.}
+
+\qa{Is this safe for hostile code?}
+{It is defense in depth on a shared kernel: user namespace, seccomp, Landlock,
+network isolation and resource limits. A kernel bug reachable through an allowed
+syscall would still be an escape, and all sandboxes share one host ID range.
+That is why a microVM backend, a seccomp allowlist and per-sandbox ID ranges are
+on the roadmap.}
+
+\qa{What would you do differently?}
+{Start from \code{clone3} with \code{CLONE\us{}INTO\us{}CGROUP} and pidfds rather
+than PIDs; use idmapped mounts instead of rewriting image ownership, which would
+also give each sandbox its own ID range; begin with a seccomp allowlist; talk
+netlink instead of shelling out to \code{ip} and \code{nft}; and write the
+regression tests alongside each layer rather than after the reviews.}
+
+\end{document}

@@ -52,14 +52,15 @@ sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
    modules, `bpf`, `io_uring`, `keyctl`, `perf_event_open`, the mount API,
    `open_by_handle_at`, clock changes) and any `clone`/`unshare` that creates a
    namespace. `--read-only` adds a Landlock ruleset: read and execute anywhere,
-   write only to `/tmp`, `/root`, `/workspace`, `/dev` files and `--writable`
-   paths, even as root.
+   write only beneath `/tmp`, `/root`, `/workspace`, `/dev/shm` and
+   `--writable` paths, even as root. Existing `/dev` files (`/dev/null`,
+   `/dev/tty`, ...) stay writable, but nothing new can be created in `/dev`.
 6. **Networking** (done): every sandbox has its own network namespace.
    `--net none` (default) is loopback only. `--net full` gets a veth pair on
    the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
    that reject private and link-local ranges (the VM's LAN, the Mac, cloud
-   metadata). `--allow HOST[:PORT]` (repeatable) allows only those
-   destinations. Sandboxes can't reach the host or each other. DNS goes only
+   metadata). `--allow HOST[:PORT]` or `--allow IP[/PREFIX][:PORT]`
+   (repeatable) allows only those destinations. Sandboxes can't reach the host or each other. DNS goes only
    to `kiln dns`, a small forwarder on the bridge (10.88.0.1) run by the
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal
@@ -73,7 +74,7 @@ sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 9. **Disk limits** (done): `/var/lib/kiln/runs` is an XFS filesystem (in a
    sparse file on a loop device) mounted with `prjquota`. Each run directory
    gets its own project ID with PROJINHERIT and hard block and inode limits
-   (`--disk`, default 1G). Done with raw `FS_IOC_FSSETXATTR` ioctls and
+   (`--disk`, default 1G; one inode per 16 KiB of it, at least 128). Done with raw `FS_IOC_FSSETXATTR` ioctls and
    `quotactl_fd`.
 
 10. **Metrics** (done): `kiln metrics` serves every running sandbox's memory,
@@ -84,6 +85,8 @@ sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
     127.0.0.1:9841. `scripts/setup-monitoring.sh` installs Prometheus (scraping
     every 5 s), node_exporter and Grafana with the dashboard below provisioned
     from `monitoring/`. `kiln stats` prints the same numbers as a table.
+    Grafana's admin password is generated on install; read it with
+    `sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' /etc/grafana/kiln-admin.env`.
 
 ![kiln dashboard in Grafana](docs/kiln-dashboard.png)
 
@@ -251,8 +254,9 @@ what each fix teaches:
   wrote (plus `resolv.conf` when networked).
 - **Known limits, documented rather than fixed:** `--read-only` covers file
   contents and directory entries but not metadata (`chmod` on a file the
-  sandbox owns still works), and DNS to the host's resolver is allowed over TCP
-  and UDP, which on Lima means a port on the Mac.
+  sandbox owns still works), and DNS to the host's resolver was allowed over
+  TCP and UDP, which on Lima means a port on the Mac. The DNS forwarder
+  (below) has since closed that.
 
 ### DNS, disk I/O, and a loop-device OOM
 
@@ -317,3 +321,31 @@ what each fix teaches:
 - **Page cache counts as memory.** Writing 60 MB to disk shows ~60 MiB of
   `file` memory in `memory.stat` (and in `memory.current`), with almost no
   `anon` memory. It's reclaimable, so it doesn't cause OOM kills.
+
+### From the second review
+
+A separate security-focused model ("Daybreak") reviewed kiln after the
+metrics layer, including the host-side services. All five findings are fixed
+and each was verified with a regression script:
+
+- **The DNS forwarder could be made to start unlimited threads.** It spawned
+  one per query, so any networked sandbox could exhaust the host's tasks.
+  Now 16 workers take jobs from a queue of 256; when it's full, new datagrams
+  and TCP connections are dropped and clients retry, which DNS clients do
+  anyway. The `kiln-dns` unit also caps tasks (`TasksMax=64`) and memory.
+  Anything a sandbox can talk to is part of the wall.
+- **The metrics server handled one connection at a time.** One slow client
+  held up every scrape. It now has 4 workers and a queue of 32, also
+  dropping on overflow.
+- **A block quota alone doesn't limit inodes.** Empty files cost almost no
+  blocks, so a sandbox could use up the filesystem's inodes under a small
+  `--disk`. Each project now also gets an inode limit: one per 16 KiB of
+  `--disk`, at least 128.
+- **Query names went into the journal as-is.** They're bytes the sandbox
+  chose, so they could carry control characters into log lines. The forwarder
+  now logs them with control characters escaped.
+- **Grafana kept its default admin password.** `scripts/setup-monitoring.sh`
+  now generates one into `/etc/grafana/kiln-admin.env` (root-only), passes it
+  to Grafana through a systemd drop-in, and resets it on existing installs.
+  Read it with `sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p'
+  /etc/grafana/kiln-admin.env`.

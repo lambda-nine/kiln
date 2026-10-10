@@ -74,7 +74,8 @@ struct RunArgs {
     #[arg(long, default_value = "none")]
     net: String,
     /// Allow traffic to HOST[:PORT] or IP[/PREFIX][:PORT] (repeatable).
-    /// Everything else is rejected. DNS to the host's resolvers is allowed.
+    /// Everything else is rejected. DNS goes only to kiln dns on 10.88.0.1,
+    /// which resolves only the allowed hostnames.
     #[arg(long, value_name = "DEST")]
     allow: Vec<String>,
     /// Print resource usage when the sandbox exits.
