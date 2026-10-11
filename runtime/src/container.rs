@@ -224,10 +224,8 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         }
         userns::write_maps(pid)?;
         write(&to_child_tx, b"1").context("signal child")?;
-        if persistent {
-            if read(&to_parent_rx, &mut buf).context("wait for persistent init")? == 0 {
-                return Ok(());
-            }
+        if persistent && read(&to_parent_rx, &mut buf).context("wait for persistent init")? == 0 {
+            return Ok(());
         }
         if let Some(ready) = ready {
             fs::write(run_dir(id).join("init.pid"), pid.to_string())?;

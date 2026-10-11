@@ -214,7 +214,7 @@ fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<(
         iov_base: header.as_mut_ptr().cast(),
         iov_len: header.len(),
     };
-    let space = unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as u32) as usize };
+    let space = unsafe { libc::CMSG_SPACE(mem::size_of_val(fds) as u32) as usize };
     let mut control = vec![0u8; space];
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -227,7 +227,7 @@ fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<(
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len =
-                libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as u32) as usize;
+                libc::CMSG_LEN(mem::size_of_val(fds) as u32) as usize;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
         }
     }
