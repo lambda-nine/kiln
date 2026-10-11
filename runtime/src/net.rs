@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Pid;
 
-use crate::netlink::{self, Netlink};
+use crate::netlink::{self, Netlink, NftBatch};
 use crate::trace;
 
 const BRIDGE: &str = "kiln0";
@@ -279,7 +279,9 @@ impl Drop for Network {
     fn drop(&mut self) {
         let _ = fs::remove_file(dns_policy_path(self.ip));
         let host_if = self.host_if();
-        let _ = run("nft", &["-f", "-"], Some(&remove_policy(self.ip)));
+        if let Err(e) = remove_policy(self.ip) {
+            eprintln!("kiln: failed to remove the firewall policy for {}: {e:#}", self.ip);
+        }
         // Usually already gone: deleting the sandbox's namespace destroys its
         // end of the pair, which takes this end with it.
         if Path::new("/sys/class/net").join(&host_if).exists() {
@@ -403,16 +405,20 @@ fn policy(network: &Network, plan: &Plan) -> String {
 
 /// Removes everything `policy` added for `ip`, in one transaction. `destroy`
 /// (unlike `delete`) ignores objects that are already gone, so one missing
-/// piece can't abort the rest. One transaction instead of three matters:
-/// every nftables commit that deletes something makes nft wait for an RCU
-/// grace period when it closes its netlink socket (docs/benchmarks.md).
-fn remove_policy(ip: Ipv4Addr) -> String {
+/// piece can't abort the rest. Deletions need no rule bytecode, so they go
+/// straight over netlink instead of through an `nft` process, and the socket
+/// is closed in the background: closing it right after a deleting commit
+/// would wait 10-20 ms for nftables to free the old objects (netlink.rs).
+fn remove_policy(ip: Ipv4Addr) -> Result<()> {
     let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
-    format!(
-        "destroy element inet kiln egress {{ {ip} }}\n\
-         destroy element inet kiln connlimit {{ {ip} }}\n\
-         destroy chain inet kiln {chain}\n"
-    )
+    let mut batch = NftBatch::default();
+    batch.destroy_element("kiln", "egress", &ip.octets())?;
+    batch.destroy_element("kiln", "connlimit", &ip.octets())?;
+    batch.destroy_chain("kiln", &chain)?;
+    let mut nf = Netlink::open_netfilter()?;
+    nf.commit(batch)?;
+    nf.close_in_background();
+    Ok(())
 }
 
 fn set(items: impl Iterator<Item = String>) -> String {
@@ -606,7 +612,7 @@ pub fn remove_run(run_id: &str) {
         let Ok(owner) = fs::read_to_string(entry.path()) else { continue };
         if owner.trim() != run_id { continue; }
         let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
-        let _ = run("nft", &["-f", "-"], Some(&remove_policy(ip)));
+        let _ = remove_policy(ip);
         let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if(ip)));
         let _ = fs::remove_file(dns_policy_path(ip));
         let _ = fs::remove_file(entry.path());

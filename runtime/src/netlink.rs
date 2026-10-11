@@ -19,6 +19,10 @@
 //! message whose error field is 0 on success or a negative errno. Spawning
 //! `ip` costs about a millisecond (fork, exec, dynamic linking, parsing); a
 //! netlink round trip costs a few microseconds.
+//!
+//! nftables speaks the same protocol on NETLINK_NETFILTER. `NftBatch` covers
+//! only the deletions kiln does on teardown; adding rules means encoding
+//! nftables' expression bytecode, which is what `nft` is for.
 
 use std::ffi::CString;
 use std::net::Ipv4Addr;
@@ -63,6 +67,22 @@ const IFA_LOCAL: u16 = 2;
 
 const IFF_UP: u32 = libc::IFF_UP as u32;
 
+// <linux/netfilter/nfnetlink.h>, <linux/netfilter/nf_tables.h>
+const NFNL_SUBSYS_NFTABLES: u16 = 10;
+const NFNL_MSG_BATCH_BEGIN: u16 = 0x10;
+const NFNL_MSG_BATCH_END: u16 = 0x11;
+const NFT_MSG_DESTROYCHAIN: u16 = 27;
+const NFT_MSG_DESTROYSETELEM: u16 = 30;
+const NFPROTO_INET: u8 = 1;
+const NFTA_CHAIN_TABLE: u16 = 1;
+const NFTA_CHAIN_NAME: u16 = 3;
+const NFTA_SET_ELEM_LIST_TABLE: u16 = 1;
+const NFTA_SET_ELEM_LIST_SET: u16 = 2;
+const NFTA_SET_ELEM_LIST_ELEMENTS: u16 = 3;
+const NFTA_LIST_ELEM: u16 = 1;
+const NFTA_SET_ELEM_KEY: u16 = 1;
+const NFTA_DATA_VALUE: u16 = 1;
+
 /// An open NETLINK_ROUTE socket. It talks to the network namespace it was
 /// created in, for as long as it lives.
 pub struct Netlink {
@@ -71,9 +91,19 @@ pub struct Netlink {
 }
 
 impl Netlink {
+    /// A NETLINK_ROUTE socket: links, addresses, routes.
     pub fn open() -> Result<Self> {
+        Self::open_protocol(libc::NETLINK_ROUTE)
+    }
+
+    /// A NETLINK_NETFILTER socket, for `commit`.
+    pub fn open_netfilter() -> Result<Self> {
+        Self::open_protocol(libc::NETLINK_NETFILTER)
+    }
+
+    fn open_protocol(protocol: i32) -> Result<Self> {
         // SAFETY: plain socket(2); the fd is owned right away.
-        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, protocol) };
         Errno::result(fd).context("open netlink socket")?;
         // SAFETY: fd is a fresh descriptor nothing else owns.
         Ok(Netlink { socket: unsafe { OwnedFd::from_raw_fd(fd) }, seq: 0 })
@@ -166,20 +196,69 @@ impl Netlink {
         self.call(req).with_context(|| format!("add default route via {gateway}"))
     }
 
+    /// Commits an nftables transaction: all of its requests, or none.
+    pub fn commit(&mut self, batch: NftBatch) -> Result<()> {
+        let mut reqs = vec![Request::with_flags(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, &nfgenmsg(0, NFNL_SUBSYS_NFTABLES))];
+        reqs.extend(batch.reqs);
+        reqs.push(Request::with_flags(NFNL_MSG_BATCH_END, NLM_F_REQUEST, &nfgenmsg(0, NFNL_SUBSYS_NFTABLES)));
+        self.send(reqs).context("nftables transaction")
+    }
+
+    /// Closes the socket in a short-lived child process instead of here.
+    ///
+    /// When an nftables commit deletes something, the kernel frees it later
+    /// from a work queue, after an RCU grace period (so packets still using
+    /// it are done). Closing a NETLINK_NETFILTER socket waits for that work
+    /// to finish (netlink_release -> nft_rcv_nl_event -> flush_work): 10-20
+    /// ms on this VM. The commit has already happened by then, so the wait
+    /// protects nothing kiln needs; a child process holding the last
+    /// reference to the socket can sit through it while kiln moves on.
+    pub fn close_in_background(self) {
+        // SAFETY: the host side of kiln is single-threaded, so the child can
+        // run any code. If fork fails, `self` simply closes here.
+        if let Ok(nix::unistd::ForkResult::Child) = unsafe { nix::unistd::fork() } {
+            // Keep only the socket. An inherited stdout would hold a caller's
+            // pipe open (`out=$(kiln run ...)`) until the wait is over.
+            let fd = self.socket.as_raw_fd() as u32;
+            // SAFETY: closes descriptors this child never uses again.
+            unsafe {
+                libc::syscall(libc::SYS_close_range, 0, fd - 1, 0);
+                libc::syscall(libc::SYS_close_range, fd + 1, u32::MAX, 0);
+            }
+            drop(self);
+            // SAFETY: ends the child without running the parent's exit code.
+            unsafe { libc::_exit(0) }
+        }
+    }
+
     /// Sends one request and waits for the kernel's acknowledgement.
-    fn call(&mut self, mut req: Request) -> Result<()> {
-        self.seq += 1;
-        let len = req.buf.len() as u32;
-        req.buf[0..4].copy_from_slice(&len.to_ne_bytes());
-        req.buf[8..12].copy_from_slice(&self.seq.to_ne_bytes());
+    fn call(&mut self, req: Request) -> Result<()> {
+        self.send(vec![req])
+    }
+
+    /// Sends requests in one datagram, then waits for the acknowledgement of
+    /// each one that asked for it. Returns the first error.
+    fn send(&mut self, reqs: Vec<Request>) -> Result<()> {
+        let mut buf = Vec::new();
+        let mut unacked = Vec::new();
+        for mut req in reqs {
+            self.seq += 1;
+            let len = req.buf.len() as u32;
+            req.buf[0..4].copy_from_slice(&len.to_ne_bytes());
+            req.buf[8..12].copy_from_slice(&self.seq.to_ne_bytes());
+            if u16::from_ne_bytes([req.buf[6], req.buf[7]]) & NLM_F_ACK != 0 {
+                unacked.push(self.seq);
+            }
+            buf.extend_from_slice(&req.buf);
+        }
         let fd = self.socket.as_raw_fd();
         // No address: an unconnected netlink socket sends to the kernel.
         // SAFETY: sends from a live buffer of the given length.
-        let sent = unsafe { libc::send(fd, req.buf.as_ptr().cast(), req.buf.len(), 0) };
+        let sent = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), 0) };
         Errno::result(sent).context("netlink send")?;
 
         let mut reply = [0u8; 4096];
-        loop {
+        while !unacked.is_empty() {
             // SAFETY: receives into a live buffer of the given length.
             let n = unsafe { libc::recv(fd, reply.as_mut_ptr().cast(), reply.len(), 0) };
             let n = Errno::result(n).context("netlink recv")? as usize;
@@ -191,18 +270,63 @@ impl Netlink {
                 if msg_len < NLMSG_HDRLEN || msg_len > msg.len() {
                     bail!("malformed netlink reply");
                 }
-                if kind == NLMSG_ERROR && seq == self.seq {
+                if kind == NLMSG_ERROR && unacked.contains(&seq) {
                     // struct nlmsgerr: int error, then a copy of our header.
                     let error = i32::from_ne_bytes(msg.get(16..20).context("short netlink error")?.try_into()?);
-                    return match error {
-                        0 => Ok(()),
-                        e => Err(Errno::from_raw(-e).into()),
-                    };
+                    if error != 0 {
+                        return Err(Errno::from_raw(-error).into());
+                    }
+                    unacked.retain(|&s| s != seq);
                 }
                 msg = &msg[align(msg_len).min(msg.len())..];
             }
         }
+        Ok(())
     }
+}
+
+/// An nftables transaction on `inet` tables, committed by `Netlink::commit`.
+/// `destroy` (unlike `delete`) succeeds when the object is already gone.
+#[derive(Default)]
+pub struct NftBatch {
+    reqs: Vec<Request>,
+}
+
+impl NftBatch {
+    /// `nft destroy element inet <table> <set> { <key> }`
+    pub fn destroy_element(&mut self, table: &str, set: &str, key: &[u8]) -> Result<()> {
+        let mut req = Request::new(nft_type(NFT_MSG_DESTROYSETELEM), 0, &nfgenmsg(NFPROTO_INET, 0));
+        req.attr(NFTA_SET_ELEM_LIST_TABLE, &c_str(table)?);
+        req.attr(NFTA_SET_ELEM_LIST_SET, &c_str(set)?);
+        req.nested(NFTA_SET_ELEM_LIST_ELEMENTS, |r| {
+            r.nested(NFTA_LIST_ELEM, |r| {
+                r.nested(NFTA_SET_ELEM_KEY, |r| r.attr(NFTA_DATA_VALUE, key));
+            });
+        });
+        self.reqs.push(req);
+        Ok(())
+    }
+
+    /// `nft destroy chain inet <table> <chain>`
+    pub fn destroy_chain(&mut self, table: &str, chain: &str) -> Result<()> {
+        let mut req = Request::new(nft_type(NFT_MSG_DESTROYCHAIN), 0, &nfgenmsg(NFPROTO_INET, 0));
+        req.attr(NFTA_CHAIN_TABLE, &c_str(table)?);
+        req.attr(NFTA_CHAIN_NAME, &c_str(chain)?);
+        self.reqs.push(req);
+        Ok(())
+    }
+}
+
+/// nftables message types are (subsystem << 8) | message.
+fn nft_type(msg: u16) -> u16 {
+    (NFNL_SUBSYS_NFTABLES << 8) | msg
+}
+
+/// struct nfgenmsg: address family, version (0), and a resource ID in
+/// network byte order (the subsystem, for batch markers).
+fn nfgenmsg(family: u8, res_id: u16) -> [u8; 4] {
+    let id = res_id.to_be_bytes();
+    [family, 0, id[0], id[1]]
 }
 
 /// The interface index of `name` in this network namespace.
@@ -222,10 +346,15 @@ struct Request {
 }
 
 impl Request {
+    /// A request the kernel will acknowledge.
     fn new(kind: u16, flags: u16, family_header: &[u8]) -> Self {
+        Self::with_flags(kind, flags | NLM_F_REQUEST | NLM_F_ACK, family_header)
+    }
+
+    fn with_flags(kind: u16, flags: u16, family_header: &[u8]) -> Self {
         let mut req = Request { buf: vec![0; NLMSG_HDRLEN] };
         req.buf[4..6].copy_from_slice(&kind.to_ne_bytes());
-        req.buf[6..8].copy_from_slice(&(flags | NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        req.buf[6..8].copy_from_slice(&flags.to_ne_bytes());
         req.raw(family_header);
         req
     }
