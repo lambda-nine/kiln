@@ -85,7 +85,7 @@ before=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {pr
 sudo "$KILN" run --net full --memory 64M --pids 256 --disk 16M -- sh -c '
     i=0
     while [ "$i" -lt 320 ]; do
-        (printf x | nc -u -w 1 1.1.1 "$((10000 + i))" >/dev/null 2>&1) &
+        (printf x | nc -u -w 1 1.1.1.1 "$((10000 + i))" >/dev/null 2>&1) &
         i=$((i + 1))
         [ $((i % 70)) -eq 0 ] && wait
     done

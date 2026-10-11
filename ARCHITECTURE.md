@@ -74,7 +74,10 @@ reconcile.
 
 1. **Sandboxes live for an agent session, not one command.** Agents need state
    between tool calls (installed packages, files), so a sandbox is created once
-   and many commands run in it via `setns`, like `docker exec`.
+   and many commands run in it, like `docker exec`. `kiln exec` doesn't enter
+   from the host with `setns`: it hands the command and its stdio to the
+   sandbox's PID 1 over a control socket, so every command inherits the same
+   restrictions.
 2. **A daemon (`kilnd`) will own sandbox state.** Until the API daemon is added,
    the CLI provides the same lifecycle and `kiln gc` reconciliation: it scans
    persistent run directories and removes cgroups and network state whose shim
@@ -103,7 +106,7 @@ reconcile.
 | Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
-| Supervisor crash leaves orphans  | Handled: pdeathsig kills PID 1; `kiln gc` removes its cgroup, network state and run directory |
+| Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir). One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Handled manually by `kiln gc`; automatic daemon startup reconciliation remains open |
