@@ -58,7 +58,7 @@ for ((n = 1; n <= SESSIONS; n++)); do
             --runs "$runs" \
             --warmups "$warmups" \
             --gap-ms "$gap" \
-            --case "-$workload\$" \
+            --case="-$workload\$" \
             --seed "$((SEED + n * 100 + i))"
     done
 done
