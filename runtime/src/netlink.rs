@@ -222,7 +222,9 @@ impl Netlink {
             let fd = self.socket.as_raw_fd() as u32;
             // SAFETY: closes descriptors this child never uses again.
             unsafe {
-                libc::syscall(libc::SYS_close_range, 0, fd - 1, 0);
+                if fd > 0 {
+                    libc::syscall(libc::SYS_close_range, 0, fd - 1, 0);
+                }
                 libc::syscall(libc::SYS_close_range, fd + 1, u32::MAX, 0);
             }
             drop(self);

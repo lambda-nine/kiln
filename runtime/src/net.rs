@@ -322,10 +322,13 @@ impl Network {
         let host_if = self.host_if();
         let mut nl = Netlink::open()?;
         let bridge = netlink::index(BRIDGE)?;
-        if nl.add_veth(&host_if, bridge, "eth0", pid.as_raw()).is_err() {
+        if let Err(e) = nl.add_veth(&host_if, bridge, "eth0", pid.as_raw()) {
             // The previous sandbox on this IP may have exited moments ago,
             // with the kernel yet to remove its veth (see `drop`).
-            nl.delete_link(&host_if).ok();
+            if e.root_cause().downcast_ref() != Some(&nix::errno::Errno::EEXIST) {
+                return Err(e);
+            }
+            nl.delete_link(&host_if)?;
             nl.add_veth(&host_if, bridge, "eth0", pid.as_raw())?;
         }
         // Isolated before it's up, so it never forwards to another sandbox.
