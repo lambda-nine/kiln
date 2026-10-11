@@ -1,7 +1,8 @@
 #!/bin/sh
 # Prepares the other runtimes to start the exact Alpine tree kiln uses:
 #   - a Docker image "kiln-alpine" (docker import)
-#   - an OCI bundle for runc and crun in /var/lib/kiln-bench/bundle
+#   - OCI bundles for runc and crun in /var/lib/kiln-bench: "bundle" runs
+#     `true`, "idle" runs `sleep infinity` on the same root filesystem
 # Run inside the VM once kiln's image exists: sudo bench/setup.sh
 set -eu
 cd "$(dirname "$0")"
@@ -18,6 +19,9 @@ docker import "$BENCH/alpine.tar" kiln-alpine >/dev/null
 
 tar -xf "$BENCH/alpine.tar" -C "$BENCH/bundle/rootfs" --numeric-owner
 rm "$BENCH/alpine.tar"
-(cd "$BENCH/bundle" && runc spec && python3 -I "$OLDPWD/oci-config.py" config.json)
+(cd "$BENCH" && runc spec && mv config.json spec-template.json)
+python3 -I oci-config.py "$BENCH/spec-template.json" "$BENCH/bundle" -- true
+python3 -I oci-config.py "$BENCH/spec-template.json" "$BENCH/idle" \
+    --root "$BENCH/bundle/rootfs" -- sleep infinity
 
-echo "docker image kiln-alpine and OCI bundle $BENCH/bundle are ready"
+echo "docker image kiln-alpine and OCI bundles in $BENCH are ready"
