@@ -1,0 +1,826 @@
+{
+  "baseline": "kiln-none",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/memory/records.jsonl"
+  ],
+  "latency": {
+    "groups": [],
+    "ratios": []
+  },
+  "memory": {
+    "cases": [
+      {
+        "case": "crun-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 486.37868338557996,
+          "mean": 455.1437826541275,
+          "median": 471.82507836990595,
+          "min": 407.22758620689655,
+          "stdev": 42.12983819355687
+        }
+      },
+      {
+        "case": "docker-net",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 5753.2934169279,
+          "mean": 5204.862068965517,
+          "median": 5423.780564263323,
+          "min": 4437.512225705329,
+          "stdev": 684.6634329956313
+        }
+      },
+      {
+        "case": "docker-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 5316.480877742947,
+          "mean": 4985.803134796239,
+          "median": 5007.160501567399,
+          "min": 4633.76802507837,
+          "stdev": 341.85715238224816
+        }
+      },
+      {
+        "case": "kiln-net",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 952.3510971786834,
+          "mean": 712.2238244514107,
+          "median": 668.7147335423198,
+          "min": 515.6056426332289,
+          "stdev": 221.59970388141446
+        }
+      },
+      {
+        "case": "kiln-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 836.6257053291534,
+          "mean": 755.1274817136886,
+          "median": 748.7730407523511,
+          "min": 679.9836990595611,
+          "stdev": 78.51409887395444
+        }
+      },
+      {
+        "case": "nerdctl-net",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 13322.64764890282,
+          "mean": 12858.790595611286,
+          "median": 12711.957366771163,
+          "min": 12541.766771159871,
+          "stdev": 410.62602709139213
+        }
+      },
+      {
+        "case": "nerdctl-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 13325.023197492166,
+          "mean": 13194.343991640546,
+          "median": 13171.847648902823,
+          "min": 13086.161128526646,
+          "stdev": 121.0096528176657
+        }
+      },
+      {
+        "case": "podman-crun-net",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1904.4188087774298,
+          "mean": 1299.3648902821317,
+          "median": 1103.994357366771,
+          "min": 889.6815047021944,
+          "stdev": 534.8365945961376
+        }
+      },
+      {
+        "case": "podman-crun-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1382.9454545454546,
+          "mean": 1216.3226750261233,
+          "median": 1203.2100313479623,
+          "min": 1062.812539184953,
+          "stdev": 160.46877248385846
+        }
+      },
+      {
+        "case": "podman-runc-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1337.2934169278997,
+          "mean": 1322.6971786833856,
+          "median": 1326.5172413793102,
+          "min": 1304.2808777429468,
+          "stdev": 16.834535785405798
+        }
+      },
+      {
+        "case": "runc-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 548.6012539184953,
+          "mean": 465.5634273772205,
+          "median": 434.4846394984326,
+          "min": 413.60438871473355,
+          "stdev": 72.6667509643969
+        }
+      },
+      {
+        "case": "runsc-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 14241.76614420063,
+          "mean": 14020.233855799373,
+          "median": 13986.363636363636,
+          "min": 13832.571786833856,
+          "stdev": 206.68913698757993
+        }
+      },
+      {
+        "case": "youki-none",
+        "fits": 3,
+        "sessions": [
+          "boot-08-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1356.7617554858934,
+          "mean": 830.0171368861024,
+          "median": 662.9147335423197,
+          "min": 470.37492163009404,
+          "stdev": 466.22185138695323
+        }
+      }
+    ],
+    "excluded_points": 0,
+    "fits": [
+      {
+        "case": "crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -13701.611285266457,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 486.37868338557996
+      },
+      {
+        "case": "crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -4011.9278996865196,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 471.82507836990595
+      },
+      {
+        "case": "crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -2498.620689655172,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 407.22758620689655
+      },
+      {
+        "case": "docker-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 30687.24764890285,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 4437.512225705329
+      },
+      {
+        "case": "docker-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -14607.880877742951,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 5423.780564263323
+      },
+      {
+        "case": "docker-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -23527.056426332303,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 5753.2934169279
+      },
+      {
+        "case": "docker-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 21730.58307210033,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 4633.76802507837
+      },
+      {
+        "case": "docker-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -16990.592476489022,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 5316.480877742947
+      },
+      {
+        "case": "docker-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -1255.3385579937312,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 5007.160501567399
+      },
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 4533.554858934167,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 668.7147335423198
+      },
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -67.80877742946905,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 515.6056426332289
+      },
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -20336.990595611285,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 952.3510971786834
+      },
+      {
+        "case": "kiln-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -5034.351097178678,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 836.6257053291534
+      },
+      {
+        "case": "kiln-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -6763.80250783699,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 748.7730407523511
+      },
+      {
+        "case": "kiln-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -6124.9968652037605,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 679.9836990595611
+      },
+      {
+        "case": "nerdctl-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 7510.836990595679,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13322.64764890282
+      },
+      {
+        "case": "nerdctl-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 10088.777429467009,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 12711.957366771163
+      },
+      {
+        "case": "nerdctl-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -1604.5705329152406,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 12541.766771159871
+      },
+      {
+        "case": "nerdctl-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 21961.341692789865,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13325.023197492166
+      },
+      {
+        "case": "nerdctl-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 26767.238244514097,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13086.161128526646
+      },
+      {
+        "case": "nerdctl-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 17776.836990595562,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13171.847648902823
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -1466.191222570531,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1103.994357366771
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 14404.984326018806,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 889.6815047021944
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -4398.6959247649065,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1904.4188087774298
+      },
+      {
+        "case": "podman-crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 10965.536050156734,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1062.812539184953
+      },
+      {
+        "case": "podman-crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 15447.818181818184,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1382.9454545454546
+      },
+      {
+        "case": "podman-crun-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 7905.228840125397,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1203.2100313479623
+      },
+      {
+        "case": "podman-runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 28430.86206896552,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1326.5172413793102
+      },
+      {
+        "case": "podman-runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 4788.9435736677115,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1337.2934169278997
+      },
+      {
+        "case": "podman-runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -665.5924764890297,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1304.2808777429468
+      },
+      {
+        "case": "runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 11747.03761755486,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 413.60438871473355
+      },
+      {
+        "case": "runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 14012.868338557993,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 434.4846394984326
+      },
+      {
+        "case": "runc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -3887.8463949843244,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 548.6012539184953
+      },
+      {
+        "case": "runsc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -17142.14733542333,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 14241.76614420063
+      },
+      {
+        "case": "runsc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -7755.45454545453,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13986.363636363636
+      },
+      {
+        "case": "runsc-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 8454.04388714733,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 13832.571786833856
+      },
+      {
+        "case": "youki-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 4318.554858934171,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 662.9147335423197
+      },
+      {
+        "case": "youki-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 22916.927899686525,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 470.37492163009404
+      },
+      {
+        "case": "youki-none",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -7208.184952978059,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "dfd42852",
+        "session": "boot-08-memory",
+        "slope_kib_per_sandbox": 1356.7617554858934
+      }
+    ]
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

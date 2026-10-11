@@ -1,0 +1,695 @@
+{
+  "argv": [
+    "bench/v2.py",
+    "latency",
+    "--config",
+    "bench/v2-config.json",
+    "--out",
+    "bench/results/v2/macbook-air-2026-10-11/boot-03-latency",
+    "--session",
+    "boot-03",
+    "--runs",
+    "100",
+    "--warmups",
+    "10",
+    "--gap-ms",
+    "100",
+    "--seed",
+    "20261014"
+  ],
+  "artifacts": {
+    "lima_config": {
+      "bytes": 777,
+      "path": "lima.yaml",
+      "realpath": "/Users/stephenestrada/Projects/kiln/lima.yaml",
+      "sha256": "c153529da462e24ac5050b819452c4ec61bd20cbc243b9f9ea7235de5ad40865"
+    },
+    "rootfs_tar": {
+      "bytes": 9482240,
+      "path": "/var/lib/kiln-bench/alpine-rootfs.tar",
+      "realpath": "/var/lib/kiln-bench/alpine-rootfs.tar",
+      "sha256": "5f647b1718ebe07ea94c8a8fece9a0a56e0c45b4662282259cd7dd3bfa3cb2c6"
+    }
+  },
+  "boot_id": "0162e3ff-f12b-4641-abbf-d30bd53dd30b",
+  "case_specs": {
+    "crun-none": {
+      "argv": [
+        "crun",
+        "run",
+        "--bundle",
+        "{bundle}",
+        "{id}"
+      ],
+      "capabilities": {
+        "daemon": "none",
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "network": "none (new network namespace, loopback only)",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "seccomp": false,
+        "user_namespace": false,
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "tier": "low-level",
+      "workload": [
+        "true"
+      ]
+    },
+    "docker-net": {
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "dockerd + containerd",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "bridge (docker0, NAT)",
+        "rootfs": "overlayfs (image kiln-alpine)",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "docker-none": {
+      "argv": [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--network",
+        "none",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "dockerd + containerd",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "none",
+        "rootfs": "overlayfs (image kiln-alpine)",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "kiln-net": {
+      "argv": [
+        "{kiln}",
+        "run",
+        "--net",
+        "full",
+        "--",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "kiln-dns for name resolution",
+        "limits": "512M memory, 1 CPU, 128 PIDs (kiln defaults)",
+        "network": "full (veth, NAT, kiln-dns)",
+        "rootfs": "overlayfs over the shared image, XFS quota",
+        "seccomp": true,
+        "user_namespace": true
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "kiln-none": {
+      "argv": [
+        "{kiln}",
+        "run",
+        "--",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "none",
+        "limits": "512M memory, 1 CPU, 128 PIDs (kiln defaults)",
+        "network": "none",
+        "rootfs": "overlayfs over the shared image, XFS quota",
+        "seccomp": true,
+        "user_namespace": true
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "nerdctl-net": {
+      "argv": [
+        "nerdctl",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{nerdctl_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "containerd",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "CNI bridge",
+        "oci_runtime": "runc",
+        "rootfs": "containerd overlayfs snapshot",
+        "seccomp": "nerdctl/containerd default (not independently verified)",
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "nerdctl-none": {
+      "argv": [
+        "nerdctl",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--net",
+        "none",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{nerdctl_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "containerd",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "none",
+        "oci_runtime": "runc",
+        "rootfs": "containerd overlayfs snapshot",
+        "seccomp": "nerdctl/containerd default (not independently verified)",
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "podman-crun-net": {
+      "argv": [
+        "podman",
+        "--runtime",
+        "crun",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{podman_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "none (conmon is per-container)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "Podman bridge (netavark)",
+        "oci_runtime": "crun",
+        "rootfs": "Podman overlayfs image",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "podman-crun-none": {
+      "argv": [
+        "podman",
+        "--runtime",
+        "crun",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--network",
+        "none",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{podman_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "none (conmon is per-container)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "none",
+        "oci_runtime": "crun",
+        "rootfs": "Podman overlayfs image",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "podman-runc-none": {
+      "argv": [
+        "podman",
+        "--runtime",
+        "runc",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--network",
+        "none",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{podman_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "none (conmon is per-container)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "none",
+        "oci_runtime": "runc",
+        "rootfs": "Podman overlayfs image",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "runc-none": {
+      "argv": [
+        "runc",
+        "run",
+        "--bundle",
+        "{bundle}",
+        "{id}"
+      ],
+      "capabilities": {
+        "daemon": "none",
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "network": "none (new network namespace, loopback only)",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "seccomp": false,
+        "user_namespace": false,
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "tier": "low-level",
+      "workload": [
+        "true"
+      ]
+    },
+    "runsc-none": {
+      "argv": [
+        "runsc",
+        "run",
+        "-bundle",
+        "{bundle}",
+        "{id}"
+      ],
+      "capabilities": {
+        "daemon": "none",
+        "isolation_note": "gVisor has a stronger userspace-kernel boundary and is not a like-for-like shared-kernel comparison",
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "network": "none (bundle's network namespace)",
+        "rootfs": "OCI bundle mediated by gVisor's userspace kernel",
+        "seccomp": "gVisor syscall interception boundary",
+        "user_namespace": false,
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "tier": "strong-isolation",
+      "workload": [
+        "true"
+      ]
+    },
+    "youki-none": {
+      "argv": [
+        "youki",
+        "run",
+        "--bundle",
+        "{bundle}",
+        "{id}"
+      ],
+      "capabilities": {
+        "daemon": "none",
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "network": "none (new network namespace, loopback only)",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "seccomp": false,
+        "user_namespace": false,
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "tier": "low-level",
+      "workload": [
+        "true"
+      ]
+    }
+  },
+  "cases": [
+    "kiln-none",
+    "kiln-net",
+    "docker-none",
+    "docker-net",
+    "podman-crun-none",
+    "podman-crun-net",
+    "podman-runc-none",
+    "nerdctl-none",
+    "nerdctl-net",
+    "runc-none",
+    "crun-none",
+    "youki-none",
+    "runsc-none"
+  ],
+  "cgroup_mode": "v2 (unified)",
+  "config_path": "bench/v2-config.json",
+  "config_sha256": "bd41657fac45b1623225ae216092332d7be91655931b59c7398bc0c585490cb1",
+  "cpu": {
+    "count": 4,
+    "governors": null,
+    "model": "implementer 0x61 part 0x000"
+  },
+  "created_utc": "2026-10-11T20:01:54.107431+00:00",
+  "euid": 0,
+  "executables": {
+    "/usr/local/bin/kiln": {
+      "name": "/usr/local/bin/kiln",
+      "realpath": "/usr/local/bin/kiln",
+      "sha256": "7679bdeef5cec04b27ce471b325cb010007b9fdd5f84e41c6a6076df4e60dfef"
+    },
+    "crun": {
+      "name": "crun",
+      "realpath": "/usr/bin/crun",
+      "sha256": "2ac674525a9b20b1e0c97989c254c1054924f1e208da108aebe44d1e67b43689"
+    },
+    "docker": {
+      "name": "docker",
+      "realpath": "/usr/bin/docker",
+      "sha256": "7e467a03338a013f15bb617cf60f03c66343c222ba70a554b1e85afe0a99029d"
+    },
+    "nerdctl": {
+      "name": "nerdctl",
+      "realpath": "/usr/local/bin/nerdctl",
+      "sha256": "53f834da59464ecb57333babb28319b2e3df092825ba9dfac856d0c4a769bd2d"
+    },
+    "podman": {
+      "name": "podman",
+      "realpath": "/usr/bin/podman",
+      "sha256": "f93ee492920150e229b9b41729bfe675073a4df0569ee5d570a8106b5a64506a"
+    },
+    "runc": {
+      "name": "runc",
+      "realpath": "/usr/sbin/runc",
+      "sha256": "4dc400fbfdb9d64049cde25d751bf8520edb70a85afb67f595dcd5e35116c42b"
+    },
+    "runsc": {
+      "name": "runsc",
+      "realpath": "/usr/local/bin/runsc",
+      "sha256": "3e7eabcfdddc7f8e619b4494915338c86db8a4d1190c54da46721ebb140a7ce6"
+    },
+    "youki": {
+      "name": "youki",
+      "realpath": "/usr/local/bin/youki",
+      "sha256": "eaa09afcada8d221011bee297c3c5bede9d02845c7ec610f4efe9abfde100f3a"
+    }
+  },
+  "git": {
+    "commit": "a10cc62abf36bc2c78a200fd6cef7d6c04d15186",
+    "dirty": false,
+    "dirty_paths": []
+  },
+  "hostname": "lima-kiln",
+  "memory": {
+    "MemAvailable": 3240592,
+    "MemTotal": 3999144,
+    "SwapFree": 0,
+    "SwapTotal": 0
+  },
+  "mode": "latency",
+  "os_release": {
+    "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+    "HOME_URL": "https://www.ubuntu.com/",
+    "ID": "ubuntu",
+    "ID_LIKE": "debian",
+    "LOGO": "ubuntu-logo",
+    "NAME": "Ubuntu",
+    "PRETTY_NAME": "Ubuntu 24.04.5 LTS",
+    "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+    "SUPPORT_URL": "https://help.ubuntu.com/",
+    "UBUNTU_CODENAME": "noble",
+    "VERSION": "24.04.5 LTS (Noble Numbat)",
+    "VERSION_CODENAME": "noble",
+    "VERSION_ID": "24.04"
+  },
+  "params": {
+    "gap_ms": [
+      100.0
+    ],
+    "runs": 100,
+    "warmups": 10
+  },
+  "python": {
+    "executable": "/usr/bin/python3",
+    "implementation": "CPython",
+    "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+  },
+  "root": true,
+  "schema": "kiln-bench-v2/1",
+  "seed": 20261014,
+  "segments": [
+    {
+      "argv": [
+        "bench/v2.py",
+        "latency",
+        "--config",
+        "bench/v2-config.json",
+        "--out",
+        "bench/results/v2/macbook-air-2026-10-11/boot-03-latency",
+        "--session",
+        "boot-03",
+        "--runs",
+        "100",
+        "--warmups",
+        "10",
+        "--gap-ms",
+        "100",
+        "--seed",
+        "20261014"
+      ],
+      "run_id": "be733661",
+      "started_utc": "2026-10-11T20:01:54.107431+00:00"
+    }
+  ],
+  "session": "boot-03",
+  "uname": {
+    "machine": "aarch64",
+    "node": "lima-kiln",
+    "processor": "aarch64",
+    "release": "6.8.0-146-generic",
+    "system": "Linux",
+    "version": "#146-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep  3 16:20:48 UTC 2026"
+  },
+  "vars": {
+    "bundle": "/var/lib/kiln-bench/bundle",
+    "idle_bundle": "/var/lib/kiln-bench/idle",
+    "image": "kiln-alpine",
+    "kiln": "/usr/local/bin/kiln",
+    "nerdctl_image": "kiln-alpine:latest",
+    "podman_image": "localhost/kiln-alpine:latest"
+  },
+  "versions": {
+    "crun-none": {
+      "argv": [
+        "crun",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "crun version 1.14.1\ncommit: de537a7965bfbe9992e2cfae0baeb56a08128171\nrundir: /run/crun\nspec: 1.0.0\n+SYSTEMD +SELINUX +APPARMOR +CAP +SECCOMP +EBPF +WASM:wasmedge +YAJL\n",
+      "timed_out": false
+    },
+    "docker-net": {
+      "argv": [
+        "docker",
+        "version",
+        "--format",
+        "client {{.Client.Version}} server {{.Server.Version}}"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "client 29.1.3 server 29.1.3\n",
+      "timed_out": false
+    },
+    "docker-none": {
+      "argv": [
+        "docker",
+        "version",
+        "--format",
+        "client {{.Client.Version}} server {{.Server.Version}}"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "client 29.1.3 server 29.1.3\n",
+      "timed_out": false
+    },
+    "kiln-net": null,
+    "kiln-none": null,
+    "nerdctl-net": {
+      "argv": [
+        "nerdctl",
+        "version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "time=\"2026-10-11T16:01:54-04:00\" level=warning msg=\"unable to determine buildctl version\" error=\"exec: \\\"buildctl\\\": executable file not found in $PATH\"\n",
+      "stdout": "Client:\n Version:\tv2.4.1\n OS/Arch:\tlinux/arm64\n Git commit:\t9039d5272eb8646d35322b9f4413bdf18ce7231a\n buildctl:\n  Version:\t\n\nServer:\n containerd:\n  Version:\t2.2.1\n  GitCommit:\t\n runc:\n  Version:\t1.3.4-0ubuntu1~24.04.1\n",
+      "timed_out": false
+    },
+    "nerdctl-none": {
+      "argv": [
+        "nerdctl",
+        "version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "time=\"2026-10-11T16:01:53-04:00\" level=warning msg=\"unable to determine buildctl version\" error=\"exec: \\\"buildctl\\\": executable file not found in $PATH\"\n",
+      "stdout": "Client:\n Version:\tv2.4.1\n OS/Arch:\tlinux/arm64\n Git commit:\t9039d5272eb8646d35322b9f4413bdf18ce7231a\n buildctl:\n  Version:\t\n\nServer:\n containerd:\n  Version:\t2.2.1\n  GitCommit:\t\n runc:\n  Version:\t1.3.4-0ubuntu1~24.04.1\n",
+      "timed_out": false
+    },
+    "podman-crun-net": {
+      "argv": [
+        "podman",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "podman version 4.9.3\n",
+      "timed_out": false
+    },
+    "podman-crun-none": {
+      "argv": [
+        "podman",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "podman version 4.9.3\n",
+      "timed_out": false
+    },
+    "podman-runc-none": {
+      "argv": [
+        "podman",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "podman version 4.9.3\n",
+      "timed_out": false
+    },
+    "runc-none": {
+      "argv": [
+        "runc",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "runc version 1.3.4-0ubuntu1~24.04.1\nspec: 1.2.1\ngo: go1.24.4\nlibseccomp: 2.5.5\n",
+      "timed_out": false
+    },
+    "runsc-none": {
+      "argv": [
+        "runsc",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "runsc version release-20261005.0\nspec: 1.2.1\n",
+      "timed_out": false
+    },
+    "youki-none": {
+      "argv": [
+        "youki",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "youki version: 0.7.0\ncommit: 0.7.0-94ba653efbb180ce04650f6ae01a8e6bc8f96d92\nspec: 1.1.0\nrustc: 1.96.0\n",
+      "timed_out": false
+    }
+  }
+}

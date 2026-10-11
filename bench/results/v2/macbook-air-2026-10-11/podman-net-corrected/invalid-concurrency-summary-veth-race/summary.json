@@ -1,0 +1,299 @@
+{
+  "baseline": "kiln-net",
+  "concurrency": [
+    {
+      "batch_wall_ms_p50": 8.787428,
+      "batches": 3,
+      "case": "kiln-net",
+      "completions_per_s": {
+        "max": 169.15897035641288,
+        "mean": 105.75011563368047,
+        "min": 34.29243560309249,
+        "p50": 113.79894094153602,
+        "p95": 163.6229674149252,
+        "p99": 168.05176976811535
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 29.16095,
+        "mean": 14.619992333333334,
+        "min": 5.911599,
+        "p50": 8.787428,
+        "p95": 27.1235978,
+        "p99": 28.753479560000002
+      },
+      "invocations": 3,
+      "level": 1,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 33.12401,
+      "batches": 3,
+      "case": "kiln-net",
+      "completions_per_s": {
+        "max": 141.9848538367094,
+        "mean": 113.93623586257081,
+        "min": 79.06552769084304,
+        "p50": 120.75832606015997,
+        "p95": 139.86220105905446,
+        "p99": 141.5603232811784
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 50.590948,
+        "mean": 25.50366766666667,
+        "min": 8.804138,
+        "p50": 21.3972145,
+        "p95": 47.958344399999994,
+        "p99": 50.064427280000004
+      },
+      "invocations": 12,
+      "level": 4,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 127.634138,
+      "batches": 3,
+      "case": "kiln-net",
+      "completions_per_s": {
+        "max": 129.31491753127025,
+        "mean": 118.23551396485108,
+        "min": 100.03331309392654,
+        "p50": 125.35831126935648,
+        "p95": 128.91925690507887,
+        "p99": 129.23578540603197
+      },
+      "failures": 1,
+      "invocation_ms": {
+        "max": 146.215983,
+        "mean": 85.56733812765957,
+        "min": 11.924068,
+        "p50": 107.415351,
+        "p95": 141.48844780000002,
+        "p99": 144.84175554
+      },
+      "invocations": 48,
+      "level": 16,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 278.550794,
+      "batches": 3,
+      "case": "kiln-net",
+      "completions_per_s": {
+        "max": 156.8780622413908,
+        "mean": 123.72760354410902,
+        "min": 99.42444401097458,
+        "p50": 114.88030437996167,
+        "p95": 152.6782864552479,
+        "p99": 156.03810708416222
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 320.425236,
+        "mean": 150.65216696875,
+        "min": 21.639521,
+        "p50": 134.57450649999998,
+        "p95": 300.45305425,
+        "p99": 314.26936995
+      },
+      "invocations": 96,
+      "level": 32,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 546.108366,
+      "batches": 3,
+      "case": "kiln-net",
+      "completions_per_s": {
+        "max": 125.343357318418,
+        "mean": 112.09462171558039,
+        "min": 93.74765017486617,
+        "p50": 117.192857653457,
+        "p95": 124.5283073519219,
+        "p99": 125.18034732511877
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 676.84421,
+        "mean": 286.2355385625,
+        "min": 23.297288,
+        "p50": 293.478923,
+        "p95": 509.1776136999999,
+        "p99": 550.7765215300004
+      },
+      "invocations": 192,
+      "level": 64,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 180.841805,
+      "batches": 3,
+      "case": "podman-crun-net",
+      "completions_per_s": {
+        "max": 5.542637668657961,
+        "mean": 5.309880728913366,
+        "min": 4.857309655768634,
+        "p50": 5.529694862313502,
+        "p95": 5.541343388023515,
+        "p99": 5.542378812531072
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 205.875283,
+        "mean": 189.0455343333333,
+        "min": 180.419515,
+        "p50": 180.841805,
+        "p95": 203.3719352,
+        "p99": 205.37461344
+      },
+      "invocations": 3,
+      "level": 1,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 300.587799,
+      "batches": 3,
+      "case": "podman-crun-net",
+      "completions_per_s": {
+        "max": 14.424736704018777,
+        "mean": 13.674503125224172,
+        "min": 13.291512652094532,
+        "p50": 13.30726001955921,
+        "p95": 14.31298903557282,
+        "p99": 14.402387170329586
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 300.547594,
+        "mean": 236.13840208333332,
+        "min": 177.300331,
+        "p50": 227.5206685,
+        "p95": 300.4790948,
+        "p99": 300.53389416
+      },
+      "invocations": 12,
+      "level": 4,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 1272.053803,
+      "batches": 3,
+      "case": "podman-crun-net",
+      "completions_per_s": {
+        "max": 12.739430733282669,
+        "mean": 11.755772016216829,
+        "min": 9.949800990423586,
+        "p50": 12.578084324944234,
+        "p95": 12.723296092448825,
+        "p99": 12.7362038051159
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 1598.330946,
+        "mean": 943.2377307916666,
+        "min": 459.913051,
+        "p50": 904.2648355,
+        "p95": 1359.549654,
+        "p99": 1489.9178639600002
+      },
+      "invocations": 48,
+      "level": 16,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 2515.66928,
+      "batches": 3,
+      "case": "podman-crun-net",
+      "completions_per_s": {
+        "max": 13.151398221910492,
+        "mean": 12.53380614643895,
+        "min": 11.729747225083619,
+        "p50": 12.720272992322743,
+        "p95": 13.108285698951716,
+        "p99": 13.142775717318736
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 2713.713532,
+        "mean": 1820.7632399895836,
+        "min": 760.198987,
+        "p50": 1866.599009,
+        "p95": 2507.4113899999998,
+        "p99": 2712.0168681
+      },
+      "invocations": 96,
+      "level": 32,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    },
+    {
+      "batch_wall_ms_p50": 6570.717418,
+      "batches": 3,
+      "case": "podman-crun-net",
+      "completions_per_s": {
+        "max": 10.550172382390395,
+        "mean": 9.999623978536702,
+        "min": 9.708515045409854,
+        "p50": 9.74018450780986,
+        "p95": 10.469173594932341,
+        "p99": 10.533972624898784
+      },
+      "failures": 0,
+      "invocation_ms": {
+        "max": 6590.91592,
+        "mean": 4755.730614385417,
+        "min": 1031.612475,
+        "p50": 4979.165094,
+        "p95": 6342.7629987,
+        "p99": 6571.4419299
+      },
+      "invocations": 192,
+      "level": 64,
+      "sessions": [
+        "podman-net-concurrency"
+      ],
+      "timeouts": 0
+    }
+  ],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/concurrency/records.jsonl"
+  ],
+  "latency": {
+    "groups": [],
+    "ratios": []
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

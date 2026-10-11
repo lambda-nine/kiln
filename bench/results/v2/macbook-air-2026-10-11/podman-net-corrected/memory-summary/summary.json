@@ -1,0 +1,144 @@
+{
+  "baseline": "kiln-net",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/memory/records.jsonl"
+  ],
+  "latency": {
+    "groups": [],
+    "ratios": []
+  },
+  "memory": {
+    "cases": [
+      {
+        "case": "kiln-net",
+        "fits": 3,
+        "sessions": [
+          "podman-net-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1444.1166144200624,
+          "mean": 1031.8376175548588,
+          "median": 1101.2294670846393,
+          "min": 550.1667711598747,
+          "stdev": 450.9966764313251
+        }
+      },
+      {
+        "case": "podman-crun-net",
+        "fits": 3,
+        "sessions": [
+          "podman-net-memory"
+        ],
+        "slope_kib_per_sandbox": {
+          "max": 1843.82131661442,
+          "mean": 1409.6451410658308,
+          "median": 1470.6990595611285,
+          "min": 914.4150470219436,
+          "stdev": 467.70149584128296
+        }
+      }
+    ],
+    "excluded_points": 0,
+    "fits": [
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 22609.429467084636,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 550.1667711598747
+      },
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -5207.8902821316515,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 1101.2294670846393
+      },
+      {
+        "case": "kiln-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -5450.714733542314,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 1444.1166144200624
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 2442.611285266452,
+        "points": 5,
+        "repeat": 0,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 1843.82131661442
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": -1391.8652037617503,
+        "points": 5,
+        "repeat": 1,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 1470.6990595611285
+      },
+      {
+        "case": "podman-crun-net",
+        "counts": [
+          0,
+          10,
+          25,
+          50,
+          100
+        ],
+        "intercept_kib": 22073.843260188085,
+        "points": 5,
+        "repeat": 2,
+        "run_id": "2d3b5196",
+        "session": "podman-net-memory",
+        "slope_kib_per_sandbox": 914.4150470219436
+      }
+    ]
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

@@ -1,0 +1,268 @@
+{
+  "baseline": "kiln-fs",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-01-fs/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-02-fs/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-03-fs/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "docker-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 178.384263,
+          "mean": 128.424748125,
+          "min": 108.059214,
+          "p50": 120.51081049999999,
+          "p95": 172.5399631,
+          "p99": 178.32162159
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "docker-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 271.069521,
+          "mean": 136.70061370000002,
+          "min": 107.753197,
+          "p50": 124.09463500000001,
+          "p95": 217.94494235,
+          "p99": 251.78838158999997
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "docker-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 210.479242,
+          "mean": 136.87420735,
+          "min": 105.917611,
+          "p50": 122.6316125,
+          "p95": 204.93448615,
+          "p99": 208.65517339
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "kiln-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 39.741616,
+          "mean": 36.896133475,
+          "min": 28.978962,
+          "p50": 37.234491500000004,
+          "p95": 39.1459855,
+          "p99": 39.68531131
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "kiln-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 42.970302,
+          "mean": 35.204483425,
+          "min": 29.219495,
+          "p50": 35.5043455,
+          "p95": 41.43887585,
+          "p99": 42.66877779
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "kiln-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 45.291569,
+          "mean": 38.533308575,
+          "min": 29.052585,
+          "p50": 39.080201,
+          "p95": 43.7409232,
+          "p99": 44.91572093
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "nerdctl-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 234.213281,
+          "mean": 144.192353175,
+          "min": 132.741294,
+          "p50": 140.70685650000001,
+          "p95": 152.84223049999989,
+          "p99": 216.67127404999997
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "nerdctl-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 335.772835,
+          "mean": 157.52962825,
+          "min": 135.080878,
+          "p50": 145.36945400000002,
+          "p95": 195.77798199999975,
+          "p99": 315.11700682
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "nerdctl-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 200.250589,
+          "mean": 144.003567525,
+          "min": 129.310446,
+          "p50": 140.386461,
+          "p95": 179.33367684999993,
+          "p99": 198.78311806
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "podman-crun-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 117.463403,
+          "mean": 99.87109025,
+          "min": 85.247757,
+          "p50": 100.837724,
+          "p95": 114.0996584,
+          "p99": 116.95827227
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "podman-crun-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 168.445176,
+          "mean": 101.13724825,
+          "min": 88.138801,
+          "p50": 98.2014615,
+          "p95": 120.1246798,
+          "p99": 149.85394386
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "podman-crun-fs",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 128.315924,
+          "mean": 97.80780725,
+          "min": 86.174352,
+          "p50": 96.1473995,
+          "p95": 123.46835409999998,
+          "p99": 128.04734738
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-fs",
+        "case": "docker-fs",
+        "ci95": {
+          "high": 3.4951956796387083,
+          "low": 3.137947332973031,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 3.286491966689916,
+        "max": 3.4951956796387083,
+        "median": 3.2365370291145235,
+        "min": 3.1379473329730314,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 3.2365370291145235,
+          "workload-boot-02": 3.4951956796387083,
+          "workload-boot-03": 3.1379473329730314
+        }
+      },
+      {
+        "baseline": "kiln-fs",
+        "case": "nerdctl-fs",
+        "ci95": {
+          "high": 4.094413006430439,
+          "low": 3.592265582257369,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 3.816307020836475,
+        "max": 4.094413006430439,
+        "median": 3.7789385817179753,
+        "min": 3.5922655822573684,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 3.7789385817179753,
+          "workload-boot-02": 4.094413006430439,
+          "workload-boot-03": 3.5922655822573684
+        }
+      },
+      {
+        "baseline": "kiln-fs",
+        "case": "podman-crun-fs",
+        "ci95": {
+          "high": 2.765899782605484,
+          "low": 2.4602585718533025,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 2.641384350492123,
+        "max": 2.765899782605484,
+        "median": 2.708180505164143,
+        "min": 2.4602585718533025,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 2.708180505164143,
+          "workload-boot-02": 2.765899782605484,
+          "workload-boot-03": 2.4602585718533025
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

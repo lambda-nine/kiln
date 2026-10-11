@@ -1,0 +1,268 @@
+{
+  "baseline": "kiln-node",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-01-node/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-02-node/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-03-node/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "docker-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 260.522766,
+          "mean": 127.54266397500001,
+          "min": 99.832357,
+          "p50": 120.3138985,
+          "p95": 175.00982729999998,
+          "p99": 230.87954498999994
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "docker-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 316.645168,
+          "mean": 140.521626475,
+          "min": 97.735176,
+          "p50": 120.892476,
+          "p95": 219.45047689999987,
+          "p99": 297.28506724
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "docker-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 284.709595,
+          "mean": 125.472813575,
+          "min": 96.297217,
+          "p50": 116.4727345,
+          "p95": 183.34463689999993,
+          "p99": 253.19230932999994
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "kiln-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 39.485754,
+          "mean": 32.326856075,
+          "min": 23.11184,
+          "p50": 32.775437999999994,
+          "p95": 36.4981855,
+          "p99": 38.95562076
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "kiln-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 40.553788,
+          "mean": 29.411915649999997,
+          "min": 24.01588,
+          "p50": 28.1330375,
+          "p95": 35.871866649999994,
+          "p99": 39.544766349999996
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "kiln-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 50.577444,
+          "mean": 32.841964624999996,
+          "min": 25.28456,
+          "p50": 33.2310985,
+          "p95": 36.7535339,
+          "p99": 45.28040315999999
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "nerdctl-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 198.432897,
+          "mean": 137.45789495,
+          "min": 121.857719,
+          "p50": 134.0077635,
+          "p95": 167.3886465499999,
+          "p99": 198.34776819
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "nerdctl-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 236.234799,
+          "mean": 142.534959575,
+          "min": 122.839273,
+          "p50": 134.9528395,
+          "p95": 179.32026029999983,
+          "p99": 233.87550882
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "nerdctl-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 273.630396,
+          "mean": 139.211984,
+          "min": 124.360773,
+          "p50": 133.10073749999998,
+          "p95": 151.70256599999985,
+          "p99": 245.27728913999997
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "podman-crun-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 154.428584,
+          "mean": 98.6193767,
+          "min": 81.550202,
+          "p50": 95.107643,
+          "p95": 122.08728724999999,
+          "p99": 143.05689965
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "podman-crun-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 123.610892,
+          "mean": 94.342449625,
+          "min": 79.468351,
+          "p50": 91.850706,
+          "p95": 114.07308065,
+          "p99": 121.5364742
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "podman-crun-node",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 157.89194,
+          "mean": 97.983881575,
+          "min": 83.815249,
+          "p50": 96.50320500000001,
+          "p95": 110.13362219999999,
+          "p99": 140.96007167
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-node",
+        "case": "docker-node",
+        "ci95": {
+          "high": 4.297171110655933,
+          "low": 3.5049318186096072,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 3.8095748025023424,
+        "max": 4.297171110655933,
+        "median": 3.6708555504277323,
+        "min": 3.5049318186096072,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 3.6708555504277323,
+          "workload-boot-02": 4.297171110655933,
+          "workload-boot-03": 3.5049318186096072
+        }
+      },
+      {
+        "baseline": "kiln-node",
+        "case": "nerdctl-node",
+        "ci95": {
+          "high": 4.796952319848151,
+          "low": 4.005306580521255,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 4.282797498069514,
+        "max": 4.796952319848151,
+        "median": 4.088664307094844,
+        "min": 4.005306580521254,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 4.088664307094844,
+          "workload-boot-02": 4.796952319848151,
+          "workload-boot-03": 4.005306580521254
+        }
+      },
+      {
+        "baseline": "kiln-node",
+        "case": "podman-crun-node",
+        "ci95": {
+          "high": 3.264869852748747,
+          "low": 2.901796247543664,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 3.0188621056028375,
+        "max": 3.2648698527487476,
+        "median": 2.904002857443909,
+        "min": 2.901796247543664,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 2.901796247543664,
+          "workload-boot-02": 3.2648698527487476,
+          "workload-boot-03": 2.904002857443909
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

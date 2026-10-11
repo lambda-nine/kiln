@@ -1,0 +1,245 @@
+{
+  "baseline": "kiln-net",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/gap-sweep/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 32.841421,
+          "mean": 10.165271299999999,
+          "min": 4.901158,
+          "p50": 5.649850499999999,
+          "p95": 25.28713600000001,
+          "p99": 31.330564
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 14.616208,
+          "mean": 8.1489364,
+          "min": 5.34391,
+          "p50": 6.8710825,
+          "p95": 13.477604500000002,
+          "p99": 14.388487300000001
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 11.356436,
+          "mean": 9.3621262,
+          "min": 8.09078,
+          "p50": 8.951858999999999,
+          "p95": 10.962961850000001,
+          "p99": 11.27774117
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 35.421051,
+          "mean": 24.7647997,
+          "min": 10.594763,
+          "p50": 25.2425365,
+          "p95": 32.7315909,
+          "p99": 34.88315898
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 35.768522,
+          "mean": 21.6485389,
+          "min": 8.2882,
+          "p50": 23.379716000000002,
+          "p95": 33.54505535,
+          "p99": 35.32382867
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 200.528929,
+          "mean": 179.1772771,
+          "min": 162.222804,
+          "p50": 176.68969199999998,
+          "p95": 197.91579205,
+          "p99": 200.00630161
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 209.30206,
+          "mean": 180.03149760000002,
+          "min": 162.459791,
+          "p50": 176.024411,
+          "p95": 205.70536030000002,
+          "p99": 208.58272006
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 210.98025,
+          "mean": 197.1999236,
+          "min": 165.11057,
+          "p50": 198.18523299999998,
+          "p95": 210.60924255,
+          "p99": 210.90604851
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 228.86836,
+          "mean": 206.8691628,
+          "min": 183.518163,
+          "p50": 207.94167,
+          "p95": 227.5376479,
+          "p99": 228.60221758
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 231.392328,
+          "mean": 205.5663242,
+          "min": 170.874494,
+          "p50": 205.9308485,
+          "p95": 228.5921058,
+          "p99": 230.83228356
+        },
+        "n": 10,
+        "session": "podman-net-gap"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 31.273339356501562,
+        "max": 31.273339356501555,
+        "median": 31.273339356501555,
+        "min": 31.273339356501555,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "podman-net-gap": 31.273339356501555
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 25.618148377639184,
+        "max": 25.618148377639184,
+        "median": 25.618148377639184,
+        "min": 25.618148377639184,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "podman-net-gap": 25.618148377639184
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 22.139002971338133,
+        "max": 22.139002971338133,
+        "median": 22.139002971338133,
+        "min": 22.139002971338133,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "podman-net-gap": 22.139002971338133
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 8.237748611356864,
+        "max": 8.237748611356865,
+        "median": 8.237748611356865,
+        "min": 8.237748611356865,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "podman-net-gap": 8.237748611356865
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 8.808098802397769,
+        "max": 8.80809880239777,
+        "median": 8.80809880239777,
+        "min": 8.80809880239777,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "podman-net-gap": 8.80809880239777
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

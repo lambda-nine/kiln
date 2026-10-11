@@ -1,0 +1,197 @@
+{
+  "baseline": "kiln-net",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-01-latency/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-02-latency/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-03-latency/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-04-latency/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-05-latency/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 23.116812,
+          "mean": 10.21730629,
+          "min": 5.40275,
+          "p50": 9.485858,
+          "p95": 15.5434628,
+          "p99": 20.383501200000016
+        },
+        "n": 100,
+        "session": "podman-net-boot-01"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 25.847557,
+          "mean": 9.71223837,
+          "min": 5.696384,
+          "p50": 8.94833,
+          "p95": 14.483468949999999,
+          "p99": 16.516849570000048
+        },
+        "n": 100,
+        "session": "podman-net-boot-02"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 100.055314,
+          "mean": 11.246547060000001,
+          "min": 5.867966,
+          "p50": 9.5003405,
+          "p95": 16.4107056,
+          "p99": 43.82527816000029
+        },
+        "n": 100,
+        "session": "podman-net-boot-03"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 21.529488,
+          "mean": 10.3124927,
+          "min": 5.901758,
+          "p50": 9.2382865,
+          "p95": 16.180512749999995,
+          "p99": 18.582536190000017
+        },
+        "n": 100,
+        "session": "podman-net-boot-04"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 16.886705,
+          "mean": 9.942924920000001,
+          "min": 5.289699,
+          "p50": 9.1725555,
+          "p95": 14.223985799999998,
+          "p99": 16.80424889
+        },
+        "n": 100,
+        "session": "podman-net-boot-05"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 234.569292,
+          "mean": 190.14478931999997,
+          "min": 156.996101,
+          "p50": 187.864699,
+          "p95": 219.18427975,
+          "p99": 226.73413401000005
+        },
+        "n": 100,
+        "session": "podman-net-boot-01"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 227.328891,
+          "mean": 189.07963257,
+          "min": 141.222307,
+          "p50": 186.80400600000002,
+          "p95": 218.60332055,
+          "p99": 224.65636224000002
+        },
+        "n": 100,
+        "session": "podman-net-boot-02"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 798.433496,
+          "mean": 210.21422893,
+          "min": 140.07082,
+          "p50": 192.14021300000002,
+          "p95": 243.1945828499999,
+          "p99": 751.3460517500002
+        },
+        "n": 100,
+        "session": "podman-net-boot-03"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 253.569453,
+          "mean": 193.92314326,
+          "min": 166.714755,
+          "p50": 191.63267150000001,
+          "p95": 230.28786359999998,
+          "p99": 250.70433657
+        },
+        "n": 100,
+        "session": "podman-net-boot-04"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 229.246443,
+          "mean": 190.1732131,
+          "min": 143.80108,
+          "p50": 188.88823200000002,
+          "p95": 219.70548795,
+          "p99": 227.91953214
+        },
+        "n": 100,
+        "session": "podman-net-boot-05"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": {
+          "high": 20.765951679260326,
+          "low": 20.073013744595233,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261031",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "gap_ms": 100.0,
+        "geomean": 20.444519437799784,
+        "max": 20.875851248221736,
+        "median": 20.592759782156676,
+        "min": 19.804713395456687,
+        "paired_sessions": 5,
+        "session_median_ratios": {
+          "podman-net-boot-01": 19.804713395456687,
+          "podman-net-boot-02": 20.875851248221736,
+          "podman-net-boot-03": 20.224560688114284,
+          "podman-net-boot-04": 20.743313329804185,
+          "podman-net-boot-05": 20.592759782156676
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

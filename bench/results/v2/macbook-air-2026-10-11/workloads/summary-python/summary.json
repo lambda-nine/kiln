@@ -1,0 +1,268 @@
+{
+  "baseline": "kiln-python",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-01-python/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-02-python/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-03-python/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "docker-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 243.741185,
+          "mean": 128.512253775,
+          "min": 96.100251,
+          "p50": 113.46738500000001,
+          "p95": 208.82173239999997,
+          "p99": 233.50822304
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "docker-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 155.900778,
+          "mean": 112.32528649999999,
+          "min": 95.1151,
+          "p50": 109.1264645,
+          "p95": 143.14904794999998,
+          "p99": 152.84512566
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "docker-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 188.396573,
+          "mean": 116.7241339,
+          "min": 89.215193,
+          "p50": 109.0706055,
+          "p95": 166.86895949999996,
+          "p99": 186.39484457
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "kiln-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 32.772442,
+          "mean": 23.11488285,
+          "min": 16.911086,
+          "p50": 23.471107,
+          "p95": 29.14305409999999,
+          "p99": 32.26976749
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "kiln-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 33.585447,
+          "mean": 23.2732777,
+          "min": 17.805246,
+          "p50": 23.462541,
+          "p95": 25.3662886,
+          "p99": 30.435888119999994
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "kiln-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 32.711912,
+          "mean": 23.630008475,
+          "min": 17.396639,
+          "p50": 24.1439745,
+          "p95": 26.65725014999999,
+          "p99": 32.12273354
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "nerdctl-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 256.401163,
+          "mean": 137.13778052499998,
+          "min": 114.214761,
+          "p50": 127.2283195,
+          "p95": 215.42586654999988,
+          "p99": 253.64816274999998
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "nerdctl-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 307.926828,
+          "mean": 136.57696045,
+          "min": 120.228593,
+          "p50": 128.9111755,
+          "p95": 166.25970005,
+          "p99": 253.60277990999992
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "nerdctl-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 187.403892,
+          "mean": 130.22468065,
+          "min": 118.064216,
+          "p50": 126.51995450000001,
+          "p95": 151.77704534999998,
+          "p99": 174.19853958
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "podman-crun-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 111.928033,
+          "mean": 89.45429762500001,
+          "min": 69.719157,
+          "p50": 86.057767,
+          "p95": 108.74339984999999,
+          "p99": 111.39573994
+        },
+        "n": 40,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "podman-crun-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 126.048646,
+          "mean": 90.514500825,
+          "min": 70.541199,
+          "p50": 87.211039,
+          "p95": 114.84763929999998,
+          "p99": 124.12173946
+        },
+        "n": 40,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "podman-crun-python",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 114.316479,
+          "mean": 90.33609725,
+          "min": 74.855833,
+          "p50": 86.69676949999999,
+          "p95": 109.50340485,
+          "p99": 112.47061212
+        },
+        "n": 40,
+        "session": "workload-boot-03"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-python",
+        "case": "docker-python",
+        "ci95": {
+          "high": 4.834343135157621,
+          "low": 4.517508312477715,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 4.665846975249021,
+        "max": 4.834343135157622,
+        "median": 4.651093182959168,
+        "min": 4.517508312477716,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 4.834343135157622,
+          "workload-boot-02": 4.651093182959168,
+          "workload-boot-03": 4.517508312477716
+        }
+      },
+      {
+        "baseline": "kiln-python",
+        "case": "nerdctl-python",
+        "ci95": {
+          "high": 5.494339913993118,
+          "low": 5.240228964787882,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 5.384003517686988,
+        "max": 5.494339913993118,
+        "median": 5.420635656426431,
+        "min": 5.240228964787882,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 5.420635656426431,
+          "workload-boot-02": 5.494339913993118,
+          "workload-boot-03": 5.240228964787882
+        }
+      },
+      {
+        "baseline": "kiln-python",
+        "case": "podman-crun-python",
+        "ci95": {
+          "high": 3.7170329931442634,
+          "low": 3.590824265491168,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 100.0,
+        "geomean": 3.657764065301944,
+        "max": 3.7170329931442634,
+        "median": 3.6665406109733127,
+        "min": 3.590824265491168,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 3.6665406109733127,
+          "workload-boot-02": 3.7170329931442634,
+          "workload-boot-03": 3.590824265491168
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

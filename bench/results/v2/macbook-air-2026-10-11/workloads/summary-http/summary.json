@@ -1,0 +1,268 @@
+{
+  "baseline": "kiln-http",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-01-http/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-02-http/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-03-http/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "docker-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 371.846967,
+          "mean": 249.38801013333335,
+          "min": 196.667608,
+          "p50": 245.936144,
+          "p95": 300.82421940000006,
+          "p99": 357.64241747999995
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "docker-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 264.134613,
+          "mean": 239.55729033333333,
+          "min": 200.140627,
+          "p50": 243.486462,
+          "p95": 260.7729141,
+          "p99": 263.46227322
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "docker-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 319.635785,
+          "mean": 245.3818022,
+          "min": 212.558485,
+          "p50": 237.497204,
+          "p95": 291.45177110000003,
+          "p99": 313.99898221999996
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "kiln-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 160.099862,
+          "mean": 105.32987460000001,
+          "min": 70.237382,
+          "p50": 112.693961,
+          "p95": 133.30853100000002,
+          "p99": 154.74159579999997
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "kiln-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 121.748765,
+          "mean": 99.75999406666666,
+          "min": 71.648521,
+          "p50": 108.501271,
+          "p95": 120.10100070000001,
+          "p99": 121.41921214
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "kiln-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 122.897459,
+          "mean": 114.66213813333334,
+          "min": 95.980454,
+          "p50": 116.375899,
+          "p95": 122.56987930000001,
+          "p99": 122.83194306
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "nerdctl-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 1286.290504,
+          "mean": 356.05669066666667,
+          "min": 243.561211,
+          "p50": 292.680134,
+          "p95": 635.0833502000007,
+          "p99": 1156.0490732399994
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "nerdctl-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 307.278614,
+          "mean": 288.9537756666667,
+          "min": 258.254466,
+          "p50": 292.789674,
+          "p95": 307.256536,
+          "p99": 307.2741984
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "nerdctl-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 319.576136,
+          "mean": 282.4074076,
+          "min": 246.95502,
+          "p50": 290.754132,
+          "p95": 305.70155570000003,
+          "p99": 316.80121994
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "podman-crun-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 327.57896,
+          "mean": 283.4604346666667,
+          "min": 252.925727,
+          "p50": 284.221193,
+          "p95": 308.27350950000005,
+          "p99": 323.7178699
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "podman-crun-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 315.99943,
+          "mean": 281.48353413333336,
+          "min": 250.96919,
+          "p50": 283.191241,
+          "p95": 306.6877024,
+          "p99": 314.13708448
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "podman-crun-http",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 306.210418,
+          "mean": 276.6668641333333,
+          "min": 236.451037,
+          "p50": 277.310459,
+          "p95": 302.9386215,
+          "p99": 305.5560587
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-http",
+        "case": "docker-http",
+        "ci95": {
+          "high": 2.2440885692481887,
+          "low": 2.0407765356983405,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 2.154033172106217,
+        "max": 2.2440885692481887,
+        "median": 2.1823364962741882,
+        "min": 2.040776535698341,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 2.1823364962741882,
+          "workload-boot-02": 2.2440885692481887,
+          "workload-boot-03": 2.040776535698341
+        }
+      },
+      {
+        "baseline": "kiln-http",
+        "case": "nerdctl-http",
+        "ci95": {
+          "high": 2.6984907301224146,
+          "low": 2.4984050348775395,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 2.596722012123293,
+        "max": 2.6984907301224146,
+        "median": 2.5971234962625904,
+        "min": 2.4984050348775395,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 2.5971234962625904,
+          "workload-boot-02": 2.6984907301224146,
+          "workload-boot-03": 2.4984050348775395
+        }
+      },
+      {
+        "baseline": "kiln-http",
+        "case": "podman-crun-http",
+        "ci95": {
+          "high": 2.610026946135958,
+          "low": 2.38288564370188,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 2.503233345081828,
+        "max": 2.610026946135958,
+        "median": 2.5220623223989795,
+        "min": 2.38288564370188,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 2.5220623223989795,
+          "workload-boot-02": 2.610026946135958,
+          "workload-boot-03": 2.38288564370188
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

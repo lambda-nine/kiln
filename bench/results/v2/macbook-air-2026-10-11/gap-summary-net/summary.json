@@ -1,0 +1,1895 @@
+{
+  "baseline": "kiln-net",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/gap-sweep/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "crun-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 4.547772,
+          "mean": 2.8556689,
+          "min": 2.21752,
+          "p50": 2.58174,
+          "p95": 4.263035400000001,
+          "p99": 4.49082468
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "crun-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 3.195319,
+          "mean": 2.646313,
+          "min": 2.290263,
+          "p50": 2.567205,
+          "p95": 3.18578935,
+          "p99": 3.19341307
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "crun-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 14.371785,
+          "mean": 5.4717162,
+          "min": 3.051594,
+          "p50": 4.604376,
+          "p95": 10.788394500000006,
+          "p99": 13.6551069
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "crun-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 15.758515,
+          "mean": 11.4314927,
+          "min": 3.412286,
+          "p50": 12.4999035,
+          "p95": 15.648636699999999,
+          "p99": 15.736539339999998
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "crun-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 18.837848,
+          "mean": 14.136419100000001,
+          "min": 3.147008,
+          "p50": 14.801164,
+          "p95": 18.116704100000003,
+          "p99": 18.693619220000002
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 291.664407,
+          "mean": 182.4147959,
+          "min": 115.28151,
+          "p50": 168.97073699999999,
+          "p95": 265.9150515,
+          "p99": 286.5145359
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 428.758329,
+          "mean": 215.41980990000002,
+          "min": 140.539544,
+          "p50": 173.8260285,
+          "p95": 382.69177995000007,
+          "p99": 419.54501919
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 340.148282,
+          "mean": 209.7994038,
+          "min": 137.070589,
+          "p50": 199.9938545,
+          "p95": 303.99554930000005,
+          "p99": 332.91773546
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 209.276066,
+          "mean": 179.6841472,
+          "min": 149.405446,
+          "p50": 181.049933,
+          "p95": 201.56078225,
+          "p99": 207.73300924999998
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 337.200984,
+          "mean": 204.4225502,
+          "min": 177.431216,
+          "p50": 191.29649,
+          "p95": 274.7739136500001,
+          "p99": 324.71556993
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 546.844514,
+          "mean": 187.54518579999998,
+          "min": 78.078195,
+          "p50": 141.53700849999998,
+          "p95": 423.9162050000002,
+          "p99": 522.2588522000001
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 209.943018,
+          "mean": 122.24512259999999,
+          "min": 72.381104,
+          "p50": 89.8673565,
+          "p95": 197.01152415,
+          "p99": 207.35671923
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 217.38255,
+          "mean": 116.6598264,
+          "min": 76.313667,
+          "p50": 106.2124545,
+          "p95": 184.58115810000004,
+          "p99": 210.82227162000004
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 148.294175,
+          "mean": 123.9569477,
+          "min": 111.4125,
+          "p50": 119.152784,
+          "p95": 142.61367965,
+          "p99": 147.15807593
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "docker-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 285.030066,
+          "mean": 160.3554881,
+          "min": 122.680555,
+          "p50": 140.89692200000002,
+          "p95": 258.53850435000004,
+          "p99": 279.73175367
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 34.910188,
+          "mean": 10.0931962,
+          "min": 4.840962,
+          "p50": 6.475045,
+          "p95": 26.06652880000001,
+          "p99": 33.14145616
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 14.656067,
+          "mean": 6.6013327,
+          "min": 4.888894,
+          "p50": 5.338976499999999,
+          "p95": 11.646994850000006,
+          "p99": 14.054252570000001
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 23.099525,
+          "mean": 12.8497603,
+          "min": 6.516527,
+          "p50": 11.014752000000001,
+          "p95": 21.85099595,
+          "p99": 22.84981919
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 29.369119,
+          "mean": 25.1670515,
+          "min": 21.246265,
+          "p50": 25.278149,
+          "p95": 28.79126725,
+          "p99": 29.253548650000003
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 28.754798,
+          "mean": 25.0729803,
+          "min": 20.013687,
+          "p50": 25.5324165,
+          "p95": 28.534746650000002,
+          "p99": 28.71078773
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 7.066432,
+          "mean": 3.1549716,
+          "min": 2.345388,
+          "p50": 2.7845185,
+          "p95": 5.300938900000003,
+          "p99": 6.71333338
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 6.122985,
+          "mean": 3.063332,
+          "min": 2.292758,
+          "p50": 2.7001325,
+          "p95": 4.952769000000002,
+          "p99": 5.8889418000000004
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 15.061862,
+          "mean": 7.485019800000001,
+          "min": 2.942067,
+          "p50": 5.342738000000001,
+          "p95": 14.9891303,
+          "p99": 15.047315659999999
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 16.499367,
+          "mean": 14.232225,
+          "min": 8.716199,
+          "p50": 14.928504499999999,
+          "p95": 16.41463785,
+          "p99": 16.48242117
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "kiln-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 16.663694,
+          "mean": 14.5671246,
+          "min": 12.261201,
+          "p50": 14.882888999999999,
+          "p95": 16.21350365,
+          "p99": 16.57365593
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 331.902928,
+          "mean": 232.9205018,
+          "min": 184.776156,
+          "p50": 207.852093,
+          "p95": 315.04045510000003,
+          "p99": 328.53043342
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 482.046587,
+          "mean": 244.6312145,
+          "min": 176.593091,
+          "p50": 209.7187835,
+          "p95": 417.78414620000007,
+          "p99": 469.19409884000004
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 309.747487,
+          "mean": 220.79424690000002,
+          "min": 187.24008,
+          "p50": 212.3223855,
+          "p95": 284.564479,
+          "p99": 304.7108854
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 290.589485,
+          "mean": 234.17100829999998,
+          "min": 215.771224,
+          "p50": 230.0341425,
+          "p95": 266.89914995000004,
+          "p99": 285.85141799
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 242.366332,
+          "mean": 230.62207560000002,
+          "min": 220.204298,
+          "p50": 230.749053,
+          "p95": 239.2549744,
+          "p99": 241.74406048
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 204.468657,
+          "mean": 125.7632196,
+          "min": 95.690363,
+          "p50": 109.398871,
+          "p95": 194.14676760000003,
+          "p99": 202.40427912
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 246.259347,
+          "mean": 143.0373799,
+          "min": 97.159251,
+          "p50": 110.47906850000001,
+          "p95": 237.78569265000002,
+          "p99": 244.56461613
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 149.039787,
+          "mean": 128.00179880000002,
+          "min": 105.396844,
+          "p50": 129.327249,
+          "p95": 146.0540523,
+          "p99": 148.44264006
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 174.928102,
+          "mean": 144.6434635,
+          "min": 134.4578,
+          "p50": 141.59181999999998,
+          "p95": 162.3608062,
+          "p99": 172.41464284
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "nerdctl-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 153.527124,
+          "mean": 146.1374151,
+          "min": 137.984922,
+          "p50": 147.487676,
+          "p95": 152.5165041,
+          "p99": 153.32500001999998
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 178.030328,
+          "mean": 162.6871984,
+          "min": 145.556809,
+          "p50": 162.1328175,
+          "p95": 176.42116355,
+          "p99": 177.70849511
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 172.992818,
+          "mean": 152.154814,
+          "min": 136.523738,
+          "p50": 153.49708199999998,
+          "p95": 167.52340775000002,
+          "p99": 171.89893595
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 197.638943,
+          "mean": 175.3158692,
+          "min": 153.451606,
+          "p50": 173.5154275,
+          "p95": 195.74178845,
+          "p99": 197.25951209000002
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 212.546031,
+          "mean": 193.2418323,
+          "min": 141.14009,
+          "p50": 199.2719035,
+          "p95": 211.17366239999998,
+          "p99": 212.27155728
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-net",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 226.629664,
+          "mean": 204.1784402,
+          "min": 179.362374,
+          "p50": 205.8338765,
+          "p95": 224.57566645,
+          "p99": 226.21886449
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 92.181005,
+          "mean": 67.23979010000001,
+          "min": 55.249363,
+          "p50": 62.342462499999996,
+          "p95": 90.05414525,
+          "p99": 91.75563305
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 79.615518,
+          "mean": 63.593297099999994,
+          "min": 58.932986,
+          "p50": 62.369038,
+          "p95": 73.03323795000001,
+          "p99": 78.29906199
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 104.063997,
+          "mean": 83.404263,
+          "min": 64.132296,
+          "p50": 84.9814815,
+          "p95": 100.0256466,
+          "p99": 103.25632692
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 122.239633,
+          "mean": 109.81367270000001,
+          "min": 97.432245,
+          "p50": 107.110482,
+          "p95": 121.01915515,
+          "p99": 121.99553743
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-crun-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 121.042089,
+          "mean": 107.05625970000001,
+          "min": 86.403516,
+          "p50": 109.2685315,
+          "p95": 118.19088495000001,
+          "p99": 120.47184819
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-runc-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 187.82745,
+          "mean": 180.98913090000002,
+          "min": 168.396656,
+          "p50": 180.27435,
+          "p95": 187.40182065,
+          "p99": 187.74232413
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-runc-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 215.031213,
+          "mean": 185.51069320000002,
+          "min": 176.714098,
+          "p50": 182.3193205,
+          "p95": 206.26961265000003,
+          "p99": 213.27889293
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-runc-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 227.486654,
+          "mean": 193.5548265,
+          "min": 183.037019,
+          "p50": 187.5826945,
+          "p95": 215.73432125000002,
+          "p99": 225.13618745
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-runc-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 238.094872,
+          "mean": 233.2845468,
+          "min": 224.723895,
+          "p50": 233.7778205,
+          "p95": 237.71800105,
+          "p99": 238.01949781000002
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "podman-runc-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 246.130892,
+          "mean": 229.7150361,
+          "min": 178.500188,
+          "p50": 233.55832650000002,
+          "p95": 245.5561529,
+          "p99": 246.01594418
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runc-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 26.246919,
+          "mean": 15.606184199999998,
+          "min": 9.803506,
+          "p50": 13.6538005,
+          "p95": 24.415120650000002,
+          "p99": 25.880559329999997
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runc-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 24.863689,
+          "mean": 15.6580069,
+          "min": 10.649329,
+          "p50": 14.922366,
+          "p95": 22.080007450000004,
+          "p99": 24.306952690000003
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runc-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 45.911288,
+          "mean": 25.5658171,
+          "min": 15.287925,
+          "p50": 22.027493,
+          "p95": 43.15502045,
+          "p99": 45.36003449
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runc-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 43.053451,
+          "mean": 33.2938112,
+          "min": 15.235834,
+          "p50": 36.643733499999996,
+          "p95": 42.3123568,
+          "p99": 42.905232160000004
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runc-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 44.509207,
+          "mean": 32.7531561,
+          "min": 18.761829,
+          "p50": 34.810728999999995,
+          "p95": 42.06279910000001,
+          "p99": 44.01992542000001
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runsc-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 48.656036,
+          "mean": 31.446099300000004,
+          "min": 27.734125,
+          "p50": 29.5295385,
+          "p95": 41.16997640000001,
+          "p99": 47.15882408
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runsc-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 51.872268,
+          "mean": 34.518670300000004,
+          "min": 27.065402,
+          "p50": 30.421613999999998,
+          "p95": 50.1883536,
+          "p99": 51.53548512
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runsc-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 77.964431,
+          "mean": 40.5365238,
+          "min": 30.312605,
+          "p50": 35.705997999999994,
+          "p95": 64.76852975000003,
+          "p99": 75.32525075000001
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runsc-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 86.68894,
+          "mean": 67.0855947,
+          "min": 56.856948,
+          "p50": 64.10785849999999,
+          "p95": 82.79450455000001,
+          "p99": 85.91005291
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "runsc-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 74.440974,
+          "mean": 64.27938689999999,
+          "min": 37.926451,
+          "p50": 67.4494205,
+          "p95": 74.21104425,
+          "p99": 74.39498805
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "youki-none",
+        "failures": 0,
+        "gap_ms": 0.0,
+        "ms": {
+          "max": 26.107251,
+          "mean": 12.2826706,
+          "min": 8.412027,
+          "p50": 10.4114795,
+          "p95": 20.61618045000001,
+          "p99": 25.009036890000004
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "youki-none",
+        "failures": 0,
+        "gap_ms": 10.0,
+        "ms": {
+          "max": 14.597504,
+          "mean": 12.5816255,
+          "min": 10.634668,
+          "p50": 12.353249,
+          "p95": 14.469182,
+          "p99": 14.5718396
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "youki-none",
+        "failures": 0,
+        "gap_ms": 100.0,
+        "ms": {
+          "max": 28.618046,
+          "mean": 18.411803900000002,
+          "min": 10.920702,
+          "p50": 15.659077,
+          "p95": 27.98314685,
+          "p99": 28.49106617
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "youki-none",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 34.300955,
+          "mean": 30.332713599999998,
+          "min": 21.311645,
+          "p50": 31.112938,
+          "p95": 33.668147,
+          "p99": 34.1743934
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      },
+      {
+        "case": "youki-none",
+        "failures": 0,
+        "gap_ms": 5000.0,
+        "ms": {
+          "max": 34.19139,
+          "mean": 29.6316402,
+          "min": 22.728096,
+          "p50": 30.957341,
+          "p95": 33.3891084,
+          "p99": 34.03093368
+        },
+        "n": 10,
+        "session": "boot-06-gap-sweep"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-net",
+        "case": "crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 0.3987215532865023,
+        "max": 0.3987215532865023,
+        "median": 0.3987215532865023,
+        "min": 0.3987215532865023,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.3987215532865023
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 0.4808421614142711,
+        "max": 0.4808421614142711,
+        "median": 0.4808421614142711,
+        "min": 0.4808421614142711,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.4808421614142711
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 0.4180190348361906,
+        "max": 0.4180190348361906,
+        "median": 0.4180190348361906,
+        "min": 0.4180190348361906,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.4180190348361906
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 0.49449441491938356,
+        "max": 0.49449441491938356,
+        "median": 0.49449441491938356,
+        "min": 0.49449441491938356,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.49449441491938356
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 0.5797008677184943,
+        "max": 0.5797008677184943,
+        "median": 0.5797008677184943,
+        "min": 0.5797008677184943,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.5797008677184943
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 26.095685358171256,
+        "max": 26.095685358171256,
+        "median": 26.095685358171256,
+        "min": 26.095685358171256,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 26.095685358171256
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 32.55793100044551,
+        "max": 32.5579310004455,
+        "median": 32.5579310004455,
+        "min": 32.5579310004455,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 32.5579310004455
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 18.15690943382111,
+        "max": 18.156909433821113,
+        "median": 18.156909433821113,
+        "min": 18.156909433821113,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 18.156909433821113
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 7.162309748233545,
+        "max": 7.162309748233544,
+        "median": 7.162309748233544,
+        "min": 7.162309748233544,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 7.162309748233544
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 7.492298662760729,
+        "max": 7.492298662760731,
+        "median": 7.492298662760731,
+        "min": 7.492298662760731,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 7.492298662760731
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 21.85884553698082,
+        "max": 21.858845536980823,
+        "median": 21.858845536980823,
+        "min": 21.858845536980823,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 21.858845536980823
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 16.83231917203607,
+        "max": 16.832319172036065,
+        "median": 16.832319172036065,
+        "min": 16.832319172036065,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 16.832319172036065
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 9.642745882975847,
+        "max": 9.642745882975849,
+        "median": 9.642745882975849,
+        "min": 9.642745882975849,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.642745882975849
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 4.713667286319105,
+        "max": 4.713667286319105,
+        "median": 4.713667286319105,
+        "min": 4.713667286319105,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 4.713667286319105
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "docker-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 5.5183543633639225,
+        "max": 5.5183543633639225,
+        "median": 5.5183543633639225,
+        "min": 5.5183543633639225,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 5.5183543633639225
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "kiln-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 0.4300384784970606,
+        "max": 0.4300384784970606,
+        "median": 0.4300384784970606,
+        "min": 0.4300384784970606,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.4300384784970606
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "kiln-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 0.5057397237092166,
+        "max": 0.5057397237092166,
+        "median": 0.5057397237092166,
+        "min": 0.5057397237092166,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.5057397237092166
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "kiln-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 0.4850529544378303,
+        "max": 0.4850529544378303,
+        "median": 0.4850529544378303,
+        "min": 0.4850529544378303,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.4850529544378303
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "kiln-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 0.5905695270646597,
+        "max": 0.5905695270646597,
+        "median": 0.5905695270646597,
+        "min": 0.5905695270646597,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.5905695270646597
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "kiln-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 0.5829017006674632,
+        "max": 0.5829017006674632,
+        "median": 0.5829017006674632,
+        "min": 0.5829017006674632,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 0.5829017006674632
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 32.1004862514469,
+        "max": 32.1004862514469,
+        "median": 32.1004862514469,
+        "min": 32.1004862514469,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 32.1004862514469
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 39.28070923331467,
+        "max": 39.28070923331467,
+        "median": 39.28070923331467,
+        "min": 39.28070923331467,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 39.28070923331467
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 19.27618393042349,
+        "max": 19.27618393042349,
+        "median": 19.27618393042349,
+        "min": 19.27618393042349,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 19.27618393042349
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 9.10011814947368,
+        "max": 9.100118149473682,
+        "median": 9.100118149473682,
+        "min": 9.100118149473682,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.100118149473682
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 9.0374936896396,
+        "max": 9.0374936896396,
+        "median": 9.0374936896396,
+        "min": 9.0374936896396,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.0374936896396
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 16.895461112625476,
+        "max": 16.895461112625473,
+        "median": 16.895461112625473,
+        "min": 16.895461112625473,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 16.895461112625473
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 20.6929302835478,
+        "max": 20.692930283547796,
+        "median": 20.692930283547796,
+        "min": 20.692930283547796,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 20.692930283547796
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 11.741276517165339,
+        "max": 11.74127651716534,
+        "median": 11.74127651716534,
+        "min": 11.74127651716534,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 11.74127651716534
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 5.601352377502008,
+        "max": 5.601352377502008,
+        "median": 5.601352377502008,
+        "min": 5.601352377502008,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 5.601352377502008
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "nerdctl-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 5.776487157022524,
+        "max": 5.776487157022524,
+        "median": 5.776487157022524,
+        "min": 5.776487157022524,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 5.776487157022524
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 25.039643353829973,
+        "max": 25.039643353829973,
+        "median": 25.039643353829973,
+        "min": 25.039643353829973,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 25.039643353829973
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 28.75028238090203,
+        "max": 28.750282380902032,
+        "median": 28.750282380902032,
+        "min": 28.750282380902032,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 28.750282380902032
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 15.753003562858243,
+        "max": 15.753003562858243,
+        "median": 15.753003562858243,
+        "min": 15.753003562858243,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 15.753003562858243
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 7.883168324547814,
+        "max": 7.883168324547815,
+        "median": 7.883168324547815,
+        "min": 7.883168324547815,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 7.883168324547815
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-net",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 8.061668448029588,
+        "max": 8.061668448029586,
+        "median": 8.061668448029586,
+        "min": 8.061668448029586,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 8.061668448029586
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 9.628112623155513,
+        "max": 9.628112623155515,
+        "median": 9.628112623155515,
+        "min": 9.628112623155515,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.628112623155515
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 11.681834149298094,
+        "max": 11.681834149298092,
+        "median": 11.681834149298092,
+        "min": 11.681834149298092,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 11.681834149298092
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 7.715242385847635,
+        "max": 7.715242385847633,
+        "median": 7.715242385847633,
+        "min": 7.715242385847633,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 7.715242385847633
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 4.237275522032883,
+        "max": 4.237275522032883,
+        "median": 4.237275522032883,
+        "min": 4.237275522032883,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 4.237275522032883
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-crun-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 4.2796000723237455,
+        "max": 4.2796000723237455,
+        "median": 4.2796000723237455,
+        "min": 4.2796000723237455,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 4.2796000723237455
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 27.84140496320875,
+        "max": 27.841404963208753,
+        "median": 27.841404963208753,
+        "min": 27.841404963208753,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 27.841404963208753
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 34.1487400253588,
+        "max": 34.1487400253588,
+        "median": 34.1487400253588,
+        "min": 34.1487400253588,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 34.1487400253588
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 17.030133270363237,
+        "max": 17.030133270363233,
+        "median": 17.030133270363233,
+        "min": 17.030133270363233,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 17.030133270363233
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 9.248217521781363,
+        "max": 9.248217521781362,
+        "median": 9.248217521781362,
+        "min": 9.248217521781362,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.248217521781362
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "podman-runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 9.147521406757566,
+        "max": 9.147521406757564,
+        "median": 9.147521406757564,
+        "min": 9.147521406757564,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 9.147521406757564
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 2.1086804029933384,
+        "max": 2.1086804029933384,
+        "median": 2.1086804029933384,
+        "min": 2.1086804029933384,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 2.1086804029933384
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 2.794986267499024,
+        "max": 2.794986267499024,
+        "median": 2.794986267499024,
+        "min": 2.794986267499024,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 2.794986267499024
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 1.9998174266656206,
+        "max": 1.9998174266656206,
+        "median": 1.9998174266656206,
+        "min": 1.9998174266656206,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.9998174266656206
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 1.4496209156770141,
+        "max": 1.4496209156770141,
+        "median": 1.4496209156770141,
+        "min": 1.4496209156770141,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.4496209156770141
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 1.3633934335984217,
+        "max": 1.3633934335984217,
+        "median": 1.3633934335984217,
+        "min": 1.3633934335984217,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.3633934335984217
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runsc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 4.5605147917890925,
+        "max": 4.5605147917890925,
+        "median": 4.5605147917890925,
+        "min": 4.5605147917890925,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 4.5605147917890925
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runsc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 5.698023581860681,
+        "max": 5.698023581860681,
+        "median": 5.698023581860681,
+        "min": 5.698023581860681,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 5.698023581860681
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runsc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 3.2416524675271843,
+        "max": 3.2416524675271843,
+        "median": 3.2416524675271843,
+        "min": 3.2416524675271843,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 3.2416524675271843
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runsc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 2.536097817130518,
+        "max": 2.536097817130518,
+        "median": 2.536097817130518,
+        "min": 2.536097817130518,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 2.536097817130518
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "runsc-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 2.641717069749352,
+        "max": 2.641717069749352,
+        "median": 2.641717069749352,
+        "min": 2.641717069749352,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 2.641717069749352
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "youki-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 0.0,
+        "geomean": 1.607939327062592,
+        "max": 1.607939327062592,
+        "median": 1.607939327062592,
+        "min": 1.607939327062592,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.607939327062592
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "youki-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 10.0,
+        "geomean": 2.313785985010423,
+        "max": 2.313785985010423,
+        "median": 2.313785985010423,
+        "min": 2.313785985010423,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 2.313785985010423
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "youki-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 100.0,
+        "geomean": 1.4216458981554916,
+        "max": 1.4216458981554916,
+        "median": 1.4216458981554916,
+        "min": 1.4216458981554916,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.4216458981554916
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "youki-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 1000.0,
+        "geomean": 1.2308234277755068,
+        "max": 1.2308234277755068,
+        "median": 1.2308234277755068,
+        "min": 1.2308234277755068,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.2308234277755068
+        }
+      },
+      {
+        "baseline": "kiln-net",
+        "case": "youki-none",
+        "ci95": null,
+        "ci_note": "no CI: needs at least 2 paired sessions (separate boots)",
+        "gap_ms": 5000.0,
+        "geomean": 1.2124720353046097,
+        "max": 1.2124720353046097,
+        "median": 1.2124720353046097,
+        "min": 1.2124720353046097,
+        "paired_sessions": 1,
+        "session_median_ratios": {
+          "boot-06-gap-sweep": 1.2124720353046097
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}

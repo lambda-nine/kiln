@@ -1,0 +1,224 @@
+{
+  "argv": [
+    "bench/v2.py",
+    "latency",
+    "--config",
+    "bench/v2-config.json",
+    "--out",
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-04-latency",
+    "--session",
+    "podman-net-boot-04",
+    "--runs",
+    "100",
+    "--warmups",
+    "10",
+    "--gap-ms",
+    "100",
+    "--case",
+    "^(kiln-net|podman-crun-net)$",
+    "--seed",
+    "20261035"
+  ],
+  "artifacts": {
+    "lima_config": {
+      "bytes": 777,
+      "path": "lima.yaml",
+      "realpath": "/Users/stephenestrada/Projects/kiln/lima.yaml",
+      "sha256": "c153529da462e24ac5050b819452c4ec61bd20cbc243b9f9ea7235de5ad40865"
+    },
+    "rootfs_tar": {
+      "bytes": 9482240,
+      "path": "/var/lib/kiln-bench/alpine-rootfs.tar",
+      "realpath": "/var/lib/kiln-bench/alpine-rootfs.tar",
+      "sha256": "5f647b1718ebe07ea94c8a8fece9a0a56e0c45b4662282259cd7dd3bfa3cb2c6"
+    }
+  },
+  "boot_id": "84544caf-a2ee-46e0-984a-fca12ceb01f1",
+  "case_specs": {
+    "kiln-net": {
+      "argv": [
+        "{kiln}",
+        "run",
+        "--net",
+        "full",
+        "--",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "kiln-dns for name resolution",
+        "limits": "512M memory, 1 CPU, 128 PIDs (kiln defaults)",
+        "network": "full (veth, NAT, kiln-dns)",
+        "rootfs": "overlayfs over the shared image, XFS quota",
+        "seccomp": true,
+        "user_namespace": true
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    },
+    "podman-crun-net": {
+      "argv": [
+        "podman",
+        "--runtime",
+        "crun",
+        "run",
+        "--rm",
+        "--name",
+        "{id}",
+        "--network",
+        "kiln-bench",
+        "--memory",
+        "512m",
+        "--memory-swap",
+        "512m",
+        "--cpus",
+        "1",
+        "--pids-limit",
+        "128",
+        "{podman_image}",
+        "{workload}"
+      ],
+      "capabilities": {
+        "daemon": "none (conmon is per-container)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs",
+        "network": "dedicated Podman bridge (netavark, 10.89.0.0/24)",
+        "oci_runtime": "crun",
+        "rootfs": "Podman overlayfs image",
+        "seccomp": true,
+        "user_namespace": false
+      },
+      "tier": "end-user-stack",
+      "workload": [
+        "true"
+      ]
+    }
+  },
+  "cases": [
+    "kiln-net",
+    "podman-crun-net"
+  ],
+  "cgroup_mode": "v2 (unified)",
+  "config_path": "bench/v2-config.json",
+  "config_sha256": "3c5f2f46887ac6ae7b7c82c2304e20c86c14151e68642efe82adf58d53eda171",
+  "cpu": {
+    "count": 4,
+    "governors": null,
+    "model": "implementer 0x61 part 0x000"
+  },
+  "created_utc": "2026-10-11T22:13:08.746147+00:00",
+  "euid": 0,
+  "executables": {
+    "/usr/local/bin/kiln": {
+      "name": "/usr/local/bin/kiln",
+      "realpath": "/usr/local/bin/kiln",
+      "sha256": "7679bdeef5cec04b27ce471b325cb010007b9fdd5f84e41c6a6076df4e60dfef"
+    },
+    "podman": {
+      "name": "podman",
+      "realpath": "/usr/bin/podman",
+      "sha256": "f93ee492920150e229b9b41729bfe675073a4df0569ee5d570a8106b5a64506a"
+    }
+  },
+  "git": {
+    "commit": "1403e71eea5659874bb6abca35cb4ac474c6f707",
+    "dirty": false,
+    "dirty_paths": []
+  },
+  "hostname": "lima-kiln",
+  "memory": {
+    "MemAvailable": 3160272,
+    "MemTotal": 3999148,
+    "SwapFree": 0,
+    "SwapTotal": 0
+  },
+  "mode": "latency",
+  "os_release": {
+    "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+    "HOME_URL": "https://www.ubuntu.com/",
+    "ID": "ubuntu",
+    "ID_LIKE": "debian",
+    "LOGO": "ubuntu-logo",
+    "NAME": "Ubuntu",
+    "PRETTY_NAME": "Ubuntu 24.04.5 LTS",
+    "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+    "SUPPORT_URL": "https://help.ubuntu.com/",
+    "UBUNTU_CODENAME": "noble",
+    "VERSION": "24.04.5 LTS (Noble Numbat)",
+    "VERSION_CODENAME": "noble",
+    "VERSION_ID": "24.04"
+  },
+  "params": {
+    "gap_ms": [
+      100.0
+    ],
+    "runs": 100,
+    "warmups": 10
+  },
+  "python": {
+    "executable": "/usr/bin/python3",
+    "implementation": "CPython",
+    "version": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+  },
+  "root": true,
+  "schema": "kiln-bench-v2/1",
+  "seed": 20261035,
+  "segments": [
+    {
+      "argv": [
+        "bench/v2.py",
+        "latency",
+        "--config",
+        "bench/v2-config.json",
+        "--out",
+        "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/podman-net-boot-04-latency",
+        "--session",
+        "podman-net-boot-04",
+        "--runs",
+        "100",
+        "--warmups",
+        "10",
+        "--gap-ms",
+        "100",
+        "--case",
+        "^(kiln-net|podman-crun-net)$",
+        "--seed",
+        "20261035"
+      ],
+      "run_id": "01e2cd27",
+      "started_utc": "2026-10-11T22:13:08.746147+00:00"
+    }
+  ],
+  "session": "podman-net-boot-04",
+  "uname": {
+    "machine": "aarch64",
+    "node": "lima-kiln",
+    "processor": "aarch64",
+    "release": "6.8.0-146-generic",
+    "system": "Linux",
+    "version": "#146-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep  3 16:20:48 UTC 2026"
+  },
+  "vars": {
+    "bundle": "/var/lib/kiln-bench/bundle",
+    "idle_bundle": "/var/lib/kiln-bench/idle",
+    "image": "kiln-alpine",
+    "kiln": "/usr/local/bin/kiln",
+    "nerdctl_image": "kiln-alpine:latest",
+    "podman_image": "localhost/kiln-alpine:latest"
+  },
+  "versions": {
+    "kiln-net": null,
+    "podman-crun-net": {
+      "argv": [
+        "podman",
+        "--version"
+      ],
+      "error": null,
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "podman version 4.9.3\n",
+      "timed_out": false
+    }
+  }
+}
