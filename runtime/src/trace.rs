@@ -12,6 +12,7 @@
 //! start time and prints its own marks ("init: ..."). Instant reads
 //! CLOCK_MONOTONIC, which is system-wide, so both timelines line up.
 
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -31,5 +32,7 @@ pub fn mark(phase: &str) {
     let since_last = now - last.unwrap_or(*start);
     *last = Some(now);
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-    eprintln!("kiln-trace {:7.2} ms {:+6.2}  {phase}", ms(now - *start), ms(since_last));
+    // Ignore write errors: eprintln! would panic if stderr is a closed pipe
+    // (`kiln run ... 2>&1 | head`), and a panic here would skip cleanup.
+    let _ = writeln!(std::io::stderr(), "kiln-trace {:7.2} ms {:+6.2}  {phase}", ms(now - *start), ms(since_last));
 }
