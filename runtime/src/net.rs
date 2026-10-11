@@ -278,12 +278,8 @@ pub fn dns_policy_path(ip: Ipv4Addr) -> PathBuf {
 impl Drop for Network {
     fn drop(&mut self) {
         let _ = fs::remove_file(dns_policy_path(self.ip));
-        let chain = self.chain();
         let host_if = self.host_if();
-        // Each step on its own so one failure doesn't skip the rest.
-        let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {} }}", self.ip)], None);
-        let _ = run("nft", &["destroy", "element", "inet", "kiln", "connlimit", &format!("{{ {} }}", self.ip)], None);
-        let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
+        let _ = run("nft", &["-f", "-"], Some(&remove_policy(self.ip)));
         // Usually already gone: deleting the sandbox's namespace destroys its
         // end of the pair, which takes this end with it.
         if Path::new("/sys/class/net").join(&host_if).exists() {
@@ -382,6 +378,20 @@ fn policy(network: &Network, plan: &Plan) -> String {
     nft += &format!("destroy element inet kiln connlimit {{ {} }}\n", network.ip);
     nft += &format!("add element inet kiln egress {{ {} : jump {chain} }}\n", network.ip);
     nft
+}
+
+/// Removes everything `policy` added for `ip`, in one transaction. `destroy`
+/// (unlike `delete`) ignores objects that are already gone, so one missing
+/// piece can't abort the rest. One transaction instead of three matters:
+/// every nftables commit that deletes something makes nft wait for an RCU
+/// grace period when it closes its netlink socket (docs/benchmarks.md).
+fn remove_policy(ip: Ipv4Addr) -> String {
+    let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
+    format!(
+        "destroy element inet kiln egress {{ {ip} }}\n\
+         destroy element inet kiln connlimit {{ {ip} }}\n\
+         destroy chain inet kiln {chain}\n"
+    )
 }
 
 fn set(items: impl Iterator<Item = String>) -> String {
@@ -566,10 +576,7 @@ pub fn remove_run(run_id: &str) {
         let Ok(owner) = fs::read_to_string(entry.path()) else { continue };
         if owner.trim() != run_id { continue; }
         let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
-        let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
-        let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {ip} }}")], None);
-        let _ = run("nft", &["destroy", "element", "inet", "kiln", "connlimit", &format!("{{ {ip} }}")], None);
-        let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
+        let _ = run("nft", &["-f", "-"], Some(&remove_policy(ip)));
         let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if(ip)));
         let _ = fs::remove_file(dns_policy_path(ip));
         let _ = fs::remove_file(entry.path());
