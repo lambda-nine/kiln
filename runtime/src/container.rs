@@ -252,7 +252,7 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         // Plug its network namespace into the bridge from the outside before
         // it runs anything, then let it go.
         if let Some(network) = &network {
-            network.plug(pid, &cfg.net)?;
+            network.plug(pid)?;
         }
         write(&to_child_tx, b"1").context("signal child")?;
 

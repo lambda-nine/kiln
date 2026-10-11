@@ -295,24 +295,28 @@ pub fn prepare(run_id: &str, plan: &Plan) -> Result<Option<Network>> {
     if matches!(plan.mode, Mode::None) {
         return Ok(None);
     }
-    ensure_bridge()?;
-    trace::mark("host: net: bridge and base ruleset");
-    let forwarder = SocketAddr::from((GATEWAY, 53));
-    if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
-        eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
-    }
     let network = lease(run_id)?;
     let policy_file = dns_policy_path(network.ip);
     fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
     fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
-    trace::mark("host: net: DNS check and lease");
+    trace::mark("host: net: lease");
+    {
+        let _lock = network_lock()?;
+        ensure_bridge_link()?;
+        network.apply_policy(plan).context("apply egress policy")?;
+    }
+    trace::mark("host: net: bridge, egress policy, base ruleset");
+    let forwarder = SocketAddr::from((GATEWAY, 53));
+    if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
+        eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
+    }
     Ok(Some(network))
 }
 
 impl Network {
     /// Plugs the network namespace of `pid` (a freshly cloned sandbox that is
-    /// still waiting on its parent) into the bridge and applies its policy.
-    pub fn plug(&self, pid: Pid, plan: &Plan) -> Result<()> {
+    /// still waiting on its parent) into the bridge.
+    pub fn plug(&self, pid: Pid) -> Result<()> {
         let host_if = self.host_if();
         let mut nl = Netlink::open()?;
         let bridge = netlink::index(BRIDGE)?;
@@ -321,10 +325,27 @@ impl Network {
         nl.isolate_bridge_port(&host_if)?;
         nl.set_up(&host_if)?;
         trace::mark("host: net: veth pair");
-
-        run("nft", &["-f", "-"], Some(&policy(self, plan))).context("apply egress policy")?;
-        trace::mark("host: net: egress policy");
         Ok(())
+    }
+
+    /// Adds this sandbox's chain and map entry, and checks the shared base
+    /// ruleset, with one nft process in the common case. Starting nft costs
+    /// a few milliseconds on a cold start (exec and a dozen shared
+    /// libraries), so the policy batch ends with `list table`: the listing
+    /// shows the base objects (which the policy doesn't touch), and only if
+    /// they have drifted does a second nft repair them, still before the
+    /// sandbox runs. If the batch fails, something it refers to (the table,
+    /// the map, the private set) is missing: repair first, then retry.
+    /// Called with the network lock held.
+    fn apply_policy(&self, plan: &Plan) -> Result<()> {
+        let batch = format!("{}list table inet kiln\n", policy(self, plan));
+        match run("nft", &["-s", "-f", "-"], Some(&batch)) {
+            Ok(listing) => repair_base(&listing).context("reconcile base ruleset"),
+            Err(_) => {
+                reconcile_ruleset().context("reconcile base ruleset")?;
+                run("nft", &["-f", "-"], Some(&policy(self, plan))).map(drop)
+            }
+        }
     }
 }
 
@@ -408,7 +429,12 @@ fn network_lock() -> Result<Flock<File>> {
 /// lock so two sandboxes starting at once cannot repair the same objects.
 pub fn ensure_bridge() -> Result<()> {
     let _lock = network_lock()?;
+    ensure_bridge_link()?;
+    reconcile_ruleset().context("reconcile base ruleset")
+}
 
+/// The bridge and IP forwarding. Called with the network lock held.
+fn ensure_bridge_link() -> Result<()> {
     if !Path::new("/sys/class/net").join(BRIDGE).exists() {
         let mut nl = Netlink::open()?;
         nl.add_bridge(BRIDGE)?;
@@ -416,26 +442,30 @@ pub fn ensure_bridge() -> Result<()> {
         nl.set_up(BRIDGE)?;
     }
     // Without this the kernel drops packets instead of routing them out.
-    fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
-    reconcile_ruleset().context("reconcile base ruleset")?;
-    Ok(())
+    fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")
 }
 
 /// Repairs base objects in one nft transaction while preserving active
 /// per-sandbox chains and `egress` map elements. Hook chains are replaced only
 /// when their stateless listing differs, so their counters survive normal runs.
 ///
-/// Everything is checked from one `nft -s list table` (reading costs about
-/// as much as starting `nft`), and nothing is committed when the ruleset is
-/// already canonical, which is every run but the first after boot. Skipping
+/// Everything is checked from one `nft -s list table` (sandbox starts get
+/// that listing from their policy batch instead), and nothing is committed
+/// when the ruleset is already canonical, which is every run but the first
+/// after boot. Skipping
 /// the commit matters more than it looks: rewriting the private set deletes
 /// its old elements, and in nf_tables a commit that deletes anything makes
 /// the next close of an nftables netlink socket wait for an RCU grace period
 /// (about 10 ms here; see docs/benchmarks.md).
 fn reconcile_ruleset() -> Result<()> {
-    let listing = Command::new("nft").args(["-s", "list", "table", "inet", "kiln"]).output()?;
-    let blocks = if listing.status.success() { top_level_blocks(&String::from_utf8_lossy(&listing.stdout)) } else { HashMap::new() };
+    // A missing table lists as an error: repair everything.
+    repair_base(&run("nft", &["-s", "list", "table", "inet", "kiln"], None).unwrap_or_default())
+}
 
+/// Commits whatever `listing` (of `nft -s list table inet kiln`) shows is
+/// missing or different from the canonical base ruleset, if anything.
+fn repair_base(listing: &str) -> Result<()> {
+    let blocks = top_level_blocks(listing);
     let mut nft = String::new();
     if !private_set_matches(blocks.get("set private")) {
         nft += "add set inet kiln private { type ipv4_addr; flags interval; }\n\
@@ -470,7 +500,7 @@ fn reconcile_ruleset() -> Result<()> {
     if nft.is_empty() {
         return Ok(());
     }
-    run("nft", &["-f", "-"], Some(&format!("add table inet kiln\n{nft}")))
+    run("nft", &["-f", "-"], Some(&format!("add table inet kiln\n{nft}"))).map(drop)
 }
 
 /// Splits an `nft list table` listing into its top-level objects, keyed by
@@ -620,11 +650,12 @@ fn process_start_time(pid: u32) -> Option<String> {
     Some(stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.to_string())
 }
 
-fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<()> {
+/// Runs `cmd` and returns its standard output.
+fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
     let mut child = Command::new(cmd)
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("run {cmd}"))?;
@@ -635,5 +666,5 @@ fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<()> {
     if !out.status.success() {
         bail!("{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
