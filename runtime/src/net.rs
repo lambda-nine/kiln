@@ -278,15 +278,15 @@ pub fn dns_policy_path(ip: Ipv4Addr) -> PathBuf {
 impl Drop for Network {
     fn drop(&mut self) {
         let _ = fs::remove_file(dns_policy_path(self.ip));
-        let host_if = self.host_if();
         if let Err(e) = remove_policy(self.ip) {
             eprintln!("kiln: failed to remove the firewall policy for {}: {e:#}", self.ip);
         }
-        // Usually already gone: deleting the sandbox's namespace destroys its
-        // end of the pair, which takes this end with it.
-        if Path::new("/sys/class/net").join(&host_if).exists() {
-            let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if));
-        }
+        // The veth isn't deleted here. The sandbox has exited, so its network
+        // namespace is being destroyed, and that destroys both ends of the
+        // pair. The kernel does it from a work queue, batched with other
+        // dying namespaces; deleting the host end ourselves would be the same
+        // unregistration done synchronously, with its RCU waits (10-15 ms).
+        // `plug` copes with a host end that's still there.
         let _ = fs::remove_file(&self.lease);
     }
 }
@@ -322,7 +322,12 @@ impl Network {
         let host_if = self.host_if();
         let mut nl = Netlink::open()?;
         let bridge = netlink::index(BRIDGE)?;
-        nl.add_veth(&host_if, bridge, "eth0", pid.as_raw())?;
+        if nl.add_veth(&host_if, bridge, "eth0", pid.as_raw()).is_err() {
+            // The previous sandbox on this IP may have exited moments ago,
+            // with the kernel yet to remove its veth (see `drop`).
+            nl.delete_link(&host_if).ok();
+            nl.add_veth(&host_if, bridge, "eth0", pid.as_raw())?;
+        }
         // Isolated before it's up, so it never forwards to another sandbox.
         nl.isolate_bridge_port(&host_if)?;
         nl.set_up(&host_if)?;
