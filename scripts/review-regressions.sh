@@ -94,6 +94,13 @@ sudo "$KILN" run --net full --memory 64M --pids 256 --disk 16M -- sh -c '
 after=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
 echo "Conntrack-limit rejects: before=$before after=$after"
 [ "$after" -gt "$before" ] || { echo "FAIL: conntrack limit did not reject excess flows"; exit 1; }
+# The next sandbox usually reuses the same IP while the previous flows are
+# still in conntrack. It must start with a fresh count, not inherit the limit.
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c '
+    printf x | nc -u -w 1 1.1.1.1 53 >/dev/null 2>&1 || true
+'
+fresh=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
+[ "$fresh" -eq "$after" ] || { echo "FAIL: next sandbox inherited the previous sandbox's conntrack count"; exit 1; }
 echo "PASS"
 
 echo "8. Cleanup"

@@ -277,6 +277,7 @@ impl Drop for Network {
         let host_if = self.host_if();
         // Each step on its own so one failure doesn't skip the rest.
         let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {} }}", self.ip)], None);
+        let _ = run("nft", &["destroy", "element", "inet", "kiln", "connlimit", &format!("{{ {} }}", self.ip)], None);
         let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
         // Usually already gone: deleting the sandbox's namespace destroys its
         // end of the pair, which takes this end with it.
@@ -369,6 +370,10 @@ fn policy(network: &Network, plan: &Plan) -> String {
             nft += &rule(&format!("{reject} comment \"not allowed\""));
         }
     }
+    // The connlimit element for this IP counts live conntrack entries, and
+    // those outlive a sandbox. Start from a fresh element so a previous
+    // sandbox on the same IP can't leave this one over its limit.
+    nft += &format!("destroy element inet kiln connlimit {{ {} }}\n", network.ip);
     nft += &format!("add element inet kiln egress {{ {} : jump {chain} }}\n", network.ip);
     nft
 }
