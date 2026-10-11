@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::sched::{CloneFlags, clone, unshare};
+use nix::errno::Errno;
+use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{SigSet, Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
@@ -24,7 +25,6 @@ use crate::quota;
 use crate::trace;
 use crate::userns;
 
-const STACK_SIZE: usize = 1024 * 1024;
 const KILN_ROOT: &str = "/var/lib/kiln";
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
@@ -178,9 +178,10 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     trace::mark("host: cgroup");
     let persistent = listener.is_some();
 
-    // Two one-byte handshakes over a pair of pipes. Parent → child: "you're in
-    // your cgroup" and later "your ID maps are written". Child → parent: "I've
-    // created my user namespace". O_CLOEXEC keeps them out of the command.
+    // Two one-byte handshakes over a pair of pipes. Parent → child: "your
+    // network is plugged in" and later "your ID maps are written". Child →
+    // parent: "I've created my user namespace". O_CLOEXEC keeps them out of
+    // the command.
     let (to_child_rx, to_child_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     let (to_parent_rx, to_parent_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
 
@@ -206,19 +207,37 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_NEWIPC;
 
-    let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx, listener.as_ref()) {
-        Ok(code) => code as isize,
-        Err(e) => {
-            eprintln!("kiln: {e:#}");
-            1
+    // clone3 with CLONE_INTO_CGROUP starts the child directly inside its
+    // cgroup, so its limits apply from its first instruction. The older way,
+    // writing its PID to cgroup.procs after clone, migrates a running
+    // process: the kernel takes cgroup_threadgroup_rwsem for writing, which
+    // waits for an RCU grace period (5-15 ms on this VM when the system was
+    // idle). Being born in the cgroup skips the migration entirely.
+    let cgroup_dir = cgroup.open_dir()?;
+    let args = CloneArgs {
+        flags: flags.bits() as u64 | CLONE_INTO_CGROUP,
+        exit_signal: Signal::SIGCHLD as u64,
+        cgroup: cgroup_dir.as_raw_fd() as u64,
+        ..Default::default()
+    };
+    // SAFETY: without CLONE_VM this behaves like fork(): the child gets a
+    // copy-on-write copy of our memory, stack included, and we're
+    // single-threaded, so nothing can be mid-update when it's copied.
+    let ret = unsafe { libc::syscall(libc::SYS_clone3, &args as *const CloneArgs, size_of::<CloneArgs>()) };
+    let pid = match Errno::result(ret).context("clone3 (are you root?)")? {
+        0 => {
+            // In the child. _exit, not exit: the parent's atexit handlers and
+            // buffered output belong to the parent.
+            let code = init(cfg, layers, &to_child_rx, &to_parent_tx, listener.as_ref()).unwrap_or_else(|e| {
+                eprintln!("kiln: {e:#}");
+                1
+            });
+            // SAFETY: ends this process immediately; nothing is shared.
+            unsafe { libc::_exit(code) }
         }
-    });
-
-    // SAFETY: we're single-threaded and the child gets its own copy of the
-    // address space (no CLONE_VM), so it can't race with the parent.
-    let pid = unsafe { clone(child, &mut stack, flags, Some(Signal::SIGCHLD as i32)) }
-        .context("clone (are you root?)")?;
+        child => Pid::from_raw(child as i32),
+    };
+    drop(cgroup_dir);
 
     // Our copy of the child's write end must go, or we'd never see EOF if the
     // child dies before writing.
@@ -227,12 +246,8 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
 
     let mut network = None;
     let setup = (|| -> Result<()> {
-        // Move the child into its cgroup before it runs anything, then let it
-        // go. Doing this from the parent avoids a race where the command
-        // starts before its limits apply.
-        cgroup.add(pid)?;
-        trace::mark("host: join cgroup");
-        // Plug its network namespace in from the outside, same reasoning.
+        // Plug its network namespace in from the outside before it runs
+        // anything, then let it go.
         network = net::setup(pid, id, &cfg.net)?;
         trace::mark("host: network");
         write(&to_child_tx, b"1").context("signal child")?;
@@ -327,13 +342,15 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     if let Some(listener) = listener { keep.push(listener.as_raw_fd()); }
     close_fds_except(&keep)?;
 
-    // Wait for the parent to put us in our cgroup.
+    // Wait for the parent to plug in our network.
     wait_for_parent(from_parent)?;
     trace::mark("init: released by parent");
 
     // A cgroup namespace makes our current cgroup look like the root, so the
     // sandbox sees /sys/fs/cgroup as just its own limits and nothing above.
-    // It has to happen after the move, or the host's cgroup would be the root.
+    // It's unshared here, not passed to clone3: clone3 creates namespaces
+    // before it places the child in its cgroup, so the host's cgroup would
+    // become the root.
     unshare(CloneFlags::CLONE_NEWCGROUP).context("unshare cgroup namespace")?;
 
     sethostname(&cfg.hostname).context("sethostname")?;
@@ -451,6 +468,29 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         .context("argument contains a NUL byte")?;
     init::run(&argv)
 }
+
+/// `struct clone_args` from <linux/sched.h> (version 2, 88 bytes: the
+/// version with the `cgroup` field).
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+const _: () = assert!(size_of::<CloneArgs>() == 88);
+
+/// From <linux/sched.h>: start the child in the cgroup `clone_args.cgroup`
+/// (an open directory). Linux 5.7+.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 /// Closes every file descriptor except stdin, stdout, stderr and `keep`.
 /// Anything else was inherited from whoever started kiln (an open host file,

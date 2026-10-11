@@ -14,8 +14,8 @@ sudo kiln run [--memory --cpus --pids --disk --net --allow --read-only] -- <cmd>
  2. run dir /var/lib/kiln/runs/<id>, XFS
     project quota, then upper/ work/ merged/
  3. cgroup /sys/fs/cgroup/kiln/<id> + limits
- 4. clone(NEWUTS|NEWPID|NEWNS|NEWNET|NEWIPC) ►  close inherited fds, wait
- 5. child PID → cgroup.procs
+ 4. clone3(NEWUTS|NEWPID|NEWNS|NEWNET|NEWIPC ►  close inherited fds, wait
+ 5.   | INTO_CGROUP): born in its cgroup
  6. veth + IP + nft chain (unless --net none);
     nsenter: lo up, eth0 address and route
  7. byte on the pipe ──────────────────────►  cgroup ns → hostname → private

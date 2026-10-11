@@ -135,11 +135,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 - **No mount cleanup needed.** The overlay is mounted inside the sandbox's
   mount namespace, so the kernel tears it down when the last process exits. The
   host never sees it (`findmnt -t overlay` stays empty during a run).
-- **Getting into a cgroup before the command runs.** The parent creates the
-  cgroup, clones the child, writes the child's PID to `cgroup.procs`, and only
-  then writes a byte to a pipe the child is blocked on. Without that handshake
-  the command could start before its limits apply. (`clone3` with
-  `CLONE_INTO_CGROUP` is the newer way to do this in one syscall.)
+- **Getting into a cgroup before the command runs.** kiln creates the cgroup
+  first and starts the child inside it with `clone3(CLONE_INTO_CGROUP)`, so
+  its limits apply from its first instruction. The older way is to clone,
+  write the child's PID to `cgroup.procs`, and only then let it continue
+  through a pipe. That move is slow: the kernel takes
+  `cgroup_threadgroup_rwsem` for writing, which waits for an RCU grace period
+  (5-15 ms on this VM unless another process was moved just before). It was
+  the largest part of a `--net none` cold start.
 - **Controllers are enabled top-down.** A cgroup can only use `memory`, `cpu`
   or `pids` if its parent lists them in `cgroup.subtree_control`, and a cgroup
   that hands controllers to children can't hold processes itself ("no internal

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
-use nix::unistd::Pid;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PARENT: &str = "kiln";
@@ -72,9 +71,9 @@ impl Cgroup {
         Ok(())
     }
 
-    /// Moves a process into this cgroup. Its future children start here too.
-    pub fn add(&self, pid: Pid) -> Result<()> {
-        self.write("cgroup.procs", &pid.to_string())
+    /// The cgroup's directory, opened for clone3's CLONE_INTO_CGROUP.
+    pub fn open_dir(&self) -> Result<fs::File> {
+        fs::File::open(&self.path).with_context(|| format!("open {}", self.path.display()))
     }
 
     /// Reads one numeric file, like `memory.peak`. 0 if it's missing.
