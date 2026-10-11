@@ -551,14 +551,31 @@ fn nft_has_map_entry(ip: Ipv4Addr) -> bool {
 }
 
 fn supervisor_alive(run_id: &str) -> bool {
+    let run_dir = crate::container::run_dir(run_id);
+    if run_dir.join("shim.pid").exists() {
+        let Ok(pid) = fs::read_to_string(run_dir.join("shim.pid")) else { return false };
+        let Ok(pid) = pid.trim().parse::<u32>() else { return false };
+        let Ok(expected_start) = fs::read_to_string(run_dir.join("shim.start")) else { return false };
+        return kiln_process(pid) && process_start_time(pid).is_some_and(|s| s == expected_start.trim());
+    }
+
     let Some((_, pid)) = run_id.rsplit_once('-') else { return false };
     let Ok(pid) = pid.parse::<u32>() else { return false };
+    kiln_process(pid)
+}
+
+fn kiln_process(pid: u32) -> bool {
     let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
     cmdline
         .split(|&b| b == 0)
         .next()
         .and_then(|arg0| Path::new(std::str::from_utf8(arg0).ok()?).file_name())
         .is_some_and(|name| name == "kiln")
+}
+
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?.to_string())
 }
 
 fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<()> {

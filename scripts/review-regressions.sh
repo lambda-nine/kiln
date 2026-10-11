@@ -67,7 +67,24 @@ echo "Address after stale lease: $assigned"
 [ ! -e "/run/kiln/net/dns/$stale" ] || { echo "FAIL: stale DNS policy remains"; exit 1; }
 echo "PASS"
 
-echo "5. Base nftables reconciliation"
+echo "5. Persistent shim protects an in-progress lease"
+persistent=$(sudo "$KILN" create --memory 64M --pids 16 --disk 16M)
+create_pid=${persistent##*-}
+fake="review-shim-$create_pid"
+sudo install -d "/var/lib/kiln/runs/$fake"
+sudo cp "/var/lib/kiln/runs/$persistent/shim.pid" "/var/lib/kiln/runs/$fake/shim.pid"
+sudo cp "/var/lib/kiln/runs/$persistent/shim.start" "/var/lib/kiln/runs/$fake/shim.start"
+printf '%s' "$fake" | sudo tee "/run/kiln/net/leases/$stale" >/dev/null
+assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c \
+    'ip -4 -o addr show dev eth0 | sed "s/.* inet //; s/ .*//"')
+[ "$assigned" = "10.88.0.3/16" ] || { echo "FAIL: live persistent shim did not protect lease"; exit 1; }
+[ "$(cat "/run/kiln/net/leases/$stale")" = "$fake" ]
+sudo rm -rf "/var/lib/kiln/runs/$fake"
+sudo rm -f "/run/kiln/net/leases/$stale"
+sudo "$KILN" rm "$persistent"
+echo "PASS"
+
+echo "6. Base nftables reconciliation"
 sudo nft add rule inet kiln forward counter accept comment '"review stale rule"'
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true
 if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
@@ -76,11 +93,11 @@ if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
 fi
 echo "PASS"
 
-echo "6. Alpine release signature"
+echo "7. Alpine release signature"
 scripts/fetch-alpine.sh --verify-only
 echo "PASS"
 
-echo "7. Per-sandbox conntrack limit"
+echo "8. Per-sandbox conntrack limit"
 before=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
 sudo "$KILN" run --net full --memory 64M --pids 256 --disk 16M -- sh -c '
     i=0
@@ -103,7 +120,7 @@ fresh=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {pri
 [ "$fresh" -eq "$after" ] || { echo "FAIL: next sandbox inherited the previous sandbox's conntrack count"; exit 1; }
 echo "PASS"
 
-echo "8. Persistent sandbox lifecycle"
+echo "9. Persistent sandbox lifecycle"
 persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 16M)
 sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
 [ "$(cat "/sys/fs/cgroup/kiln/$persistent/pids.max")" = 16 ]
@@ -133,7 +150,7 @@ sudo "$KILN" gc
 [ ! -e "/run/kiln/net/leases/$ip" ]
 echo "PASS"
 
-echo "9. Cleanup"
+echo "10. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

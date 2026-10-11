@@ -119,6 +119,7 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<(
     let socket = run_dir.join("control.sock");
     let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     fs::write(run_dir.join("shim.pid"), std::process::id().to_string())?;
+    fs::write(run_dir.join("shim.start"), process_start_time(std::process::id())?)?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     let _ = fs::remove_dir_all(&run_dir);
     result.map(|_| ())
@@ -137,6 +138,16 @@ pub fn validate_image(cfg: &Config) -> Result<()> {
 }
 
 pub fn new_id() -> String { run_id() }
+
+fn process_start_time(pid: u32) -> Result<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).context("read shim start time")?;
+    // The command name is parenthesized and may contain spaces. The fields
+    // after its final ')' begin at field 3; starttime is field 22.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .map(str::to_string)
+        .context("parse shim start time")
+}
 
 fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     // The quota goes on the run dir while it's still empty, so upper/ and
