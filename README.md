@@ -23,6 +23,12 @@ sudo target/debug/kiln run --memory 64M --cpus 0.5 --pids 32 --disk 100M --stats
 sudo target/debug/kiln run --read-only --writable /data -- sh  # Landlock
 sudo target/debug/kiln run --net full -- wget -qO- http://example.com
 sudo target/debug/kiln run --allow example.com:80 --stats -- sh
+id=$(sudo target/debug/kiln create --memory 512M --pids 128 --disk 1G)
+sudo target/debug/kiln exec "$id" -- sh -c 'echo hello >/workspace/message'
+sudo target/debug/kiln exec "$id" -- cat /workspace/message
+sudo target/debug/kiln ls
+sudo target/debug/kiln rm "$id"
+sudo target/debug/kiln gc                 # clean state from crashed shims
 sudo kiln stats                          # running sandboxes, like docker stats
 sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 ```
@@ -92,6 +98,15 @@ directory and atomically exchanges it with the installed image.
     from `monitoring/`. `kiln stats` prints the same numbers as a table.
     Grafana's admin password is generated on install; read it with
     `sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' /etc/grafana/kiln-admin.env`.
+
+11. **Persistent sandboxes** (done): `kiln create` starts a detached host shim
+    and a locked-down PID 1, prints the sandbox ID, and returns. `kiln exec`
+    passes the caller's standard streams to PID 1 and runs each command with
+    the sandbox's existing namespaces, cgroup limits, seccomp filter and
+    Landlock policy. The overlay and `/workspace` survive between commands.
+    `kiln ls` lists live and stale shims, `kiln rm` stops one and waits for its
+    resources to be removed, and `kiln gc` removes cgroups, network state and
+    run directories left by crashed shims. One-shot `kiln run` is unchanged.
 
 ![kiln dashboard in Grafana](docs/kiln-dashboard.png)
 

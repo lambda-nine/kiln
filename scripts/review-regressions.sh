@@ -103,7 +103,37 @@ fresh=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {pri
 [ "$fresh" -eq "$after" ] || { echo "FAIL: next sandbox inherited the previous sandbox's conntrack count"; exit 1; }
 echo "PASS"
 
-echo "8. Cleanup"
+echo "8. Persistent sandbox lifecycle"
+persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 16M)
+sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
+[ "$(cat "/sys/fs/cgroup/kiln/$persistent/pids.max")" = 16 ]
+sudo "$KILN" exec "$persistent" -- sh -c 'echo persistent >/workspace/review-state'
+[ "$(sudo "$KILN" exec "$persistent" -- cat /workspace/review-state)" = persistent ]
+if sudo "$KILN" exec "$persistent" -- touch /etc/review-write 2>/dev/null; then
+    echo "FAIL: persistent exec did not inherit Landlock"
+    exit 1
+fi
+set +e
+sudo "$KILN" exec "$persistent" -- sh -c 'exit 37'
+code=$?
+set -e
+[ "$code" -eq 37 ] || { echo "FAIL: exec returned $code, expected 37"; exit 1; }
+sudo "$KILN" rm "$persistent"
+[ ! -e "/var/lib/kiln/runs/$persistent" ]
+
+stale=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 16M)
+shim=$(cat "/var/lib/kiln/runs/$stale/shim.pid")
+ip=$(awk -v id="$stale" '$0 == id { sub(".*/", "", FILENAME); print FILENAME }' /run/kiln/net/leases/*)
+sudo kill -9 "$shim"
+i=0
+while kill -0 "$shim" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+sudo "$KILN" gc
+[ ! -e "/var/lib/kiln/runs/$stale" ]
+[ ! -e "/sys/fs/cgroup/kiln/$stale" ]
+[ ! -e "/run/kiln/net/leases/$ip" ]
+echo "PASS"
+
+echo "9. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]
