@@ -59,6 +59,19 @@ default and writes a separate paired summary for each workload. DNS and HTTP
 contact `example.com`, so their results are exploratory and include public
 network and resolver variance; they are not a pure runtime benchmark.
 
+If Podman's network was created before `bench/setup.sh` began assigning it the
+dedicated `10.89.0.0/24` subnet, discard that networked Podman data and rerun
+the paired comparison from the macOS host:
+
+```sh
+bench/run-v2-podman-net.sh \
+    bench/results/v2/macbook-air-2026-10-11/podman-net-corrected
+```
+
+The script uses fresh boots for replicated latency, an idle-gap sweep,
+concurrency and memory. It intentionally selects only `kiln-net` and
+`podman-crun-net`; the all-runtime campaign remains valid for the other cases.
+
 `--case REGEX` selects cases by `re.search` on their names. `--var NAME=VALUE`
 overrides a config variable (`kiln`, `bundle`, `idle_bundle`, `image`).
 Failed invocations never stop a run: each one is recorded with its exit code,
