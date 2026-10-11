@@ -87,6 +87,7 @@ class Config:
     raw: bytes
     sha256: str
     variables: dict[str, str]
+    artifacts: dict[str, str]
     cases: dict[str, Case]
     output_limit: int
     settle_s: float
@@ -133,6 +134,11 @@ def load_config(path: Path, overrides: dict[str, str] | None = None) -> Config:
         raise HarnessError(f"{path}: needs a non-empty \"cases\" object")
     variables = {str(k): str(v) for k, v in (data.get("vars") or {}).items()}
     variables.update(overrides or {})
+    raw_artifacts = data.get("artifacts") or {}
+    if not isinstance(raw_artifacts, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw_artifacts.items()
+    ):
+        raise HarnessError(f"{path}: artifacts must be an object of name-to-path strings")
     defaults = data.get("defaults") or {}
     workload = _argv(data.get("workload", ["true"]), "workload")
     assert workload is not None
@@ -177,6 +183,7 @@ def load_config(path: Path, overrides: dict[str, str] | None = None) -> Config:
         raw=raw,
         sha256=hashlib.sha256(raw).hexdigest(),
         variables=variables,
+        artifacts=dict(raw_artifacts),
         cases=cases,
         output_limit=int(defaults.get("output_limit_bytes", DEFAULT_OUTPUT_LIMIT)),
         settle_s=float((data.get("memory") or {}).get("settle_s", DEFAULT_SETTLE_S)),
@@ -435,8 +442,19 @@ def executable_info(name: str, env: dict[str, str]) -> dict[str, Any]:
         return {"name": name, "realpath": real, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def artifact_info(path: str) -> dict[str, Any]:
+    real = os.path.realpath(path)
+    try:
+        stat = os.stat(real)
+        if not os.path.isfile(real):
+            return {"path": path, "realpath": real, "error": "not a regular file"}
+        return {"path": path, "realpath": real, "bytes": stat.st_size, "sha256": _sha256_file(real)}
+    except OSError as exc:
+        return {"path": path, "realpath": real, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def git_info() -> dict[str, Any]:
-    repo = Path(__file__).resolve().parent
+    repo = Path(__file__).resolve().parent.parent
 
     # safe.directory: under sudo, git otherwise refuses a repo owned by the user.
     def git(*args: str) -> str | None:
@@ -541,6 +559,7 @@ def build_manifest(run: Run) -> dict[str, Any]:
         "argv": sys.argv,
         "config_path": str(cfg.path),
         "vars": cfg.variables,
+        "artifacts": {name: artifact_info(path) for name, path in cfg.artifacts.items()},
         "case_specs": {
             n: {"tier": cfg.cases[n].tier, "capabilities": cfg.cases[n].capabilities,
                 "argv": cfg.cases[n].argv, "workload": cfg.cases[n].workload}
@@ -596,9 +615,12 @@ def open_run(run: Run) -> None:
     else:
         if run.out.exists():
             raise HarnessError(f"{run.out} already exists; pick a new --out or pass --resume")
+        # Capture git state before the output directory itself can make a clean
+        # checkout appear dirty in the manifest.
+        manifest = build_manifest(run)
         run.out.mkdir(parents=True)
         (run.out / CONFIG_COPY).write_bytes(run.config.raw)
-        _write_json(manifest_path, build_manifest(run))
+        _write_json(manifest_path, manifest)
     run.writer = RecordWriter(run.out / RECORDS)
 
 

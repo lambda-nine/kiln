@@ -118,6 +118,7 @@ in `count 0`, not in the slope.
 ```json
 {
   "vars": {"kiln": "/usr/local/bin/kiln"},
+  "artifacts": {"rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar"},
   "workload": ["true"],
   "defaults": {"timeout_s": 120, "output_limit_bytes": 4096, "env": {}},
   "memory": {"settle_s": 2},
@@ -159,7 +160,9 @@ Placeholders in any argv:
 Other braces (Docker's `{{.Client.Version}}` templates) pass through untouched;
 an unknown `{name}` is an error when the config loads.
 
-`tier` and `capabilities` are free-form metadata copied into the manifest:
+`artifacts` names regular files whose path, size and SHA-256 are copied into
+the manifest. The shipped config records the exact rootfs tar imported by the
+other runtimes. `tier` and `capabilities` are free-form metadata copied into the manifest:
 `end-user-stack` for kiln and Docker (a complete CLI with images or rootfs
 management, networking and cleanup), `low-level` for runc and crun (an OCI
 runtime handed a prepared bundle).
@@ -248,7 +251,8 @@ with a new run ID (and therefore new `{id}`s). The manifest gains an entry in
 `config_path`, `config_sha256`, `git` (commit, dirty, dirty paths), `hostname`,
 `uname`, `boot_id`, `os_release`, `python`, `cpu` (count, model, scaling
 governors where available), `memory` (MemTotal, MemAvailable, SwapTotal,
-SwapFree in kB), `cgroup_mode`, `euid`, `root`, `executables` (for every
+SwapFree in kB), `cgroup_mode`, `euid`, `root`, `artifacts` (path, size and
+SHA-256), `executables` (for every
 command: resolved realpath and SHA-256), `versions` (each case's version
 command: argv, exit code, stdout, stderr; `null` for kiln, which has no
 `--version` and is identified by its binary's SHA-256 and the git commit), and

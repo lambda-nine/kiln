@@ -202,8 +202,16 @@ class LatencyRunTest(Tmp):
                         "--proc-root", str(fake_proc(self.tmp)), *extra)
 
     def test_records_failures_ids_and_manifest(self) -> None:
+        artifact = self.tmp / "rootfs.tar"
+        artifact.write_bytes(b"rootfs fixture")
+        config = self.config()
+        data = json.loads(config.read_text())
+        data["artifacts"] = {"rootfs_tar": str(artifact)}
+        config.write_text(json.dumps(data))
         out = self.tmp / "run"
-        code, err = self.latency(out)
+        code, err = run_main("latency", "--config", str(config), "--out", str(out), "--session", "s1",
+                             "--runs", "3", "--warmups", "1", "--gap-ms", "0,1", "--seed", "7",
+                             "--proc-root", str(fake_proc(self.tmp)))
         self.assertEqual(code, 0, err)
         recs = v2.read_records(out / v2.RECORDS)
         self.assertEqual(len(recs), (3 + 1) * 2 * 3)
@@ -233,6 +241,8 @@ class LatencyRunTest(Tmp):
             self.assertIn(key, manifest)
         self.assertEqual(manifest["seed"], 7)
         self.assertEqual(manifest["versions"]["ok"]["stdout"].strip(), "ok 1.0")
+        self.assertEqual(manifest["artifacts"]["rootfs_tar"]["bytes"], len(b"rootfs fixture"))
+        self.assertEqual(len(manifest["artifacts"]["rootfs_tar"]["sha256"]), 64)
         self.assertIsNone(manifest["versions"]["fail"])
         exe = manifest["executables"][PY]
         self.assertEqual(len(exe["sha256"]), 64)

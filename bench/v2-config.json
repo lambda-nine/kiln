@@ -7,6 +7,9 @@
     "idle_bundle": "/var/lib/kiln-bench/idle",
     "image": "kiln-alpine"
   },
+  "artifacts": {
+    "rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar"
+  },
   "workload": ["true"],
   "defaults": {
     "timeout_s": 120,
