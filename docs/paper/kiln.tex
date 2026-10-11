@@ -73,8 +73,10 @@ ruleset, a per-sandbox network namespace on a bridge with an nftables egress
 policy, a policy-enforcing DNS forwarder, and a stateless Prometheus exporter.
 Each layer was written directly against the kernel's files, system calls and
 netlink (with the \code{nft} tool for firewall rules), with no container
-libraries. A cold start takes 13\,ms, on par with crun and about 6$\times$
-faster than Docker on the same VM. This paper describes each layer and the
+libraries. On one uncontended ARM Lima VM, kiln's median one-shot \code{true}
+lifecycle was 13.2\,ms without networking and 22.2\,ms with networking---approximately
+equal to bare crun without networking, while the tested Docker CLI stack took
+about 6.4$\times$ as long. This paper describes each layer and the
 design decision behind it, where start-up time went, what two independent
 reviews found, and what is still missing.
 \end{abstract}
@@ -94,7 +96,7 @@ resource use unpredictable.
 itself against the kernel interface: \code{clone}, \code{mount}, cgroupfs
 files, \code{ioctl}s, raw BPF, \code{nft} rules. (2)~Every limit has a
 measurable failure mode that was triggered on purpose (an OOM kill, a fork bomb,
-a full disk, a rejected packet). (3)~No daemon and no database: all state lives in
+a full disk, a rejected packet). (3)~No mandatory shared daemon and no database: all state lives in
 the kernel and a few directories, so the system can be inspected with
 \code{cat}, \code{nft list} and \code{findmnt}. (4)~Defaults are closed: no
 network unless asked, limits on by default.
@@ -157,7 +159,7 @@ sandboxes. All state is kernel objects plus the four directories at the bottom.}
 \label{fig:arch}
 \end{figure}
 
-\textbf{No daemon, no database.} A run's identity is its \emph{run ID}, the start
+\textbf{No shared daemon, no database.} A run's identity is its \emph{run ID}, the start
 time in nanoseconds (hex) plus kiln's PID: unique, sortable, and used to name both
 its cgroup (\code{/sys/fs/cgroup/kiln/<id>}) and its run directory
 (\code{/var/lib/kiln/runs/<id>}). IP leases and DNS policies are files named
@@ -482,8 +484,8 @@ own code.
 reach are the listening socket (whose path is not visible inside) and the
 descriptors a caller chose to pass. Requests are size-bounded and parsed
 strictly, and run one at a time. Files persist in the upper layer. Running
-\code{true} this way takes 3.5\,ms (p50), against 9.7 to 53.7\,ms for the
-other runtimes' \code{exec} (\S\ref{sec:perf}). \code{kiln rm} sends a stop request; PID 1 acknowledges and exits, the
+\code{true} this way takes 3.5\,ms (p50, one client, uncontended), against 9.7
+to 53.7\,ms for the other runtimes' \code{exec} (\S\ref{sec:perf}). \code{kiln rm} sends a stop request; PID 1 acknowledges and exits, the
 kernel kills the rest of the PID namespace, and the shim's normal cleanup runs.
 
 % ---------------------------------------------------------------------------
@@ -779,10 +781,16 @@ not sandboxes.
 
 For an agent, a sandbox start sits on the critical path of every tool call, so
 start latency was measured and then optimized. \textbf{Method:} hyperfine times
-\code{true} end to end, 10 warm-up and 100 timed runs, each preceded by 100\,ms
-of idle (``cold''), on the same Alpine tree and limits for every runtime; an
-M2 MacBook Air running a Lima VM (4 vCPU, 4\,GiB, Ubuntu 24.04, Linux 6.8,
-aarch64). \code{KILN\us{}TRACE=1} prints each phase of a start on one
+a one-shot \code{true} from a single client on an otherwise idle VM: runtime
+setup, the command and teardown, until the CLI exits, with the image already
+local and warm. 10 warm-up and 100 timed runs, each preceded by 100\,ms of idle;
+``cold'' here means only that gap, not cold caches, an image pull or
+time-to-ready. Every runtime starts the same rootfs contents (Alpine 3.24.2)
+with the same CPU, memory and PID limits. All cross-runtime numbers come from
+one fixed-order session on one ARM64 Lima VM (4 vCPU, 4\,GiB, Ubuntu 24.04, Linux
+6.8) on an M2 MacBook Air under normal host use; p99 from 100 serially
+correlated samples is exploratory, and there are no repeated-session confidence
+intervals. \code{KILN\us{}TRACE=1} prints each phase of a start on one
 \code{CLOCK\us{}MONOTONIC} timeline for the host side and the sandbox's init.
 
 \textbf{Where the time went.} Before this work a cold start took 28.9\,ms
@@ -819,33 +827,53 @@ one \code{nft} process (about 6\,ms) and the veth.
 
 \begin{table}[t]
 \centering\small
-\caption{kiln against other runtimes on the same VM and root filesystem
-(\code{docs/benchmarks.md}). Times are p50 of 100 runs in ms; memory is the
-growth of host memory per extra idle sandbox over two runs of 50.}
+\caption{kiln against Docker 29.1.3, runc 1.3.4 and crun 1.14.1, end-user
+stacks as configured, on one VM with the same rootfs contents
+(\code{docs/benchmarks.md}). Times are p50 of 100 runs of \code{true} in ms;
+memory is the growth of host memory per extra idle sandbox in two batches of 50.}
 \label{tab:perf}
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
  & kiln & crun & runc & Docker \\
 \midrule
-Cold start, no network (\code{run -- true}) & \textbf{13.2} & 13.4 & 34.2 & 84.0 \\
-Cold start, network (kiln \code{--net full}, Docker bridge) & \textbf{22.2} & --- & --- & 141.8 \\
+Cold one-shot, no network (\code{run -- true}) & \textbf{13.2} & 13.4 & 34.2 & 84.0 \\
+Cold one-shot, network (kiln \code{--net full}, Docker bridge) & \textbf{22.2} & --- & --- & 141.8 \\
 \quad kiln before this work & 28.9 / 87.9 & & & \\
 Warm start: \code{exec true} in a running sandbox & \textbf{3.5} & 9.7 & 24.1 & 53.7 \\
 Host memory per idle sandbox (KiB) & 370--379 & 239--411 & 598--760 & 5328--5600 \\
-Daemons required & none & none & none & ${\approx}$160\,MiB \\
-Steady state (CPU- and I/O-bound workloads) & \multicolumn{4}{c}{same within noise: same kernel} \\
+Shared daemons to start, no network & none & none & none & ${\approx}$160\,MiB \\
+Steady state, CPU-bound (7 runs) & \multicolumn{4}{c}{no difference observed} \\
+Steady state, I/O-bound & \multicolumn{4}{c}{inconclusive: storage differs} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:perf} compares the result. The runtimes do not do identical work:
-kiln also creates a user namespace and an XFS-quota'd overlay and installs
-seccomp, which the bare runc and crun configurations did not; Docker adds its
-daemon path (CLI $\rightarrow$ dockerd $\rightarrow$ containerd $\rightarrow$ shim
-$\rightarrow$ runc). Warm start favours kiln for the reason in
-\S\ref{sec:persistent}: the others start a host process that \code{setns}es into
-the container (runc then joins the cgroup through \code{cgroup.procs}), while
-kiln's PID 1 forks a child that inherits everything.
+Table~\ref{tab:perf} compares the result. These are end-user stacks as
+configured, and they do different work on different storage paths: kiln also
+creates a user namespace and an overlay on a quota'd XFS loop device and
+installs seccomp, which the bare runc and crun configurations (direct ext4) did
+not; Docker adds its daemon path (CLI $\rightarrow$ dockerd $\rightarrow$
+containerd $\rightarrow$ shim $\rightarrow$ runc) and an ext4-backed overlay
+snapshot. That does not invalidate the product-level comparison, but it prevents
+attributing a difference to any one component. Warm start favours kiln for the
+reason in \S\ref{sec:persistent}: the others start a host process that
+\code{setns}es into the container (runc then joins the cgroup through
+\code{cgroup.procs}), while kiln's PID 1 forks a child that inherits everything.
+
+\textbf{What the numbers do not show.} \code{true} is an overhead
+microbenchmark, not evidence of faster agent workloads. Memory limits matched,
+but Docker did not receive \code{--memory-swap 512m} and swap state was not
+captured, so strict no-swap equivalence was not established. An idle kiln
+sandbox grew host memory by 370--379\,KiB in two batches of 50; kiln-dns is a small
+fixed service for DNS in networked sandboxes, and persistent sandboxes keep a
+per-sandbox shim and PID~1. No CPU difference was observed in the seven-run
+steady-state test; the I/O result is inconclusive because each runtime wrote to
+different storage. Podman, containerd on its own and youki were not measured,
+nor were gVisor, Firecracker and Kata, which belong in a separate isolation
+tier. \textbf{Next measurements:} randomized independent sessions across boots,
+concurrency up to saturation, realistic Python, Node and DNS + HTTP workloads,
+memory slopes, matched storage where possible, and a reproducibility manifest
+with raw traces for every run.
 
 % ---------------------------------------------------------------------------
 \section{Independent review: what it found and taught}
@@ -983,8 +1011,10 @@ does the actual namespace, cgroup and mount setup from an OCI bundle. kiln cover
 roughly runc's job plus the parts of Docker that matter for sandboxing (image
 storage with overlayfs, bridge networking with NAT, disk quotas, an egress
 policy, metrics) in one binary. It has no OCI image or runtime-spec support and
-no image distribution. On the same VM it starts \code{true} in 13\,ms cold
-against Docker's 84\,ms (p50), because there is no daemon path in between.}
+no image distribution. On one uncontended VM, its one-shot \code{true}
+lifecycle takes 13\,ms (p50) against 84\,ms for the Docker CLI stack as
+configured; part of that gap is the daemon path, though the two also differ in
+storage and isolation.}
 
 \qa{And with gVisor and Firecracker?}
 {All three answer ``how much of the host kernel does untrusted code reach?''
@@ -1108,7 +1138,8 @@ automatic reconcile is daemon work. Catchable signals (Ctrl-C, \code{kill}) are
 consumed by \code{sigwait} and lead to a normal cleanup.}
 
 \qa{How fast does a sandbox start?}
-{Running \code{true} takes 13.2\,ms cold (p50) without a network, the same as
+{A one-shot \code{true} (setup, command and teardown, warm local image, 100\,ms
+idle before each run) takes 13.2\,ms (p50) without a network, the same as bare
 crun (13.4), and 22.2\,ms with one; runc takes 34.2 and Docker 84.0 and 141.8.
 It took 28.9 and 87.9\,ms before the work in \S\ref{sec:perf}: RCU grace periods
 (a cgroup migration, nftables socket closes, a veth deletion) and spawning

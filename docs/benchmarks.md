@@ -2,25 +2,57 @@
 
 kiln is built for short-lived, untrusted agent workloads: many sandboxes,
 each started on demand and often used for a single command. That makes four
-things matter, and this file measures each against Docker, runc and crun on
-the same VM and the same root filesystem:
+things matter, and this file measures each against Docker 29.1.3, runc 1.3.4
+and crun 1.14.1, compared as end-user stacks as configured, on one VM with
+the same rootfs contents:
 
 | | kiln | crun | runc | Docker |
 |---|---:|---:|---:|---:|
-| **Cold start**, no network (p50) | **13.2 ms** | 13.4 ms | 34.2 ms | 84.0 ms |
-| **Cold start**, with network (p50) | **22.2 ms** | | | 141.8 ms |
+| **Cold one-shot `true`**, no network (p50) | **13.2 ms** | 13.4 ms | 34.2 ms | 84.0 ms |
+| **Cold one-shot `true`**, with network (p50) | **22.2 ms** | | | 141.8 ms |
 | **Warm start**: run `true` in an existing sandbox (p50) | **3.5 ms** | 9.7 ms | 24.1 ms | 53.7 ms |
-| **Memory per extra idle sandbox** | **~0.4 MiB** | 0.2-0.4 MiB | 0.6-0.7 MiB | 5.2-5.5 MiB |
-| **Daemons that must run** | none | none | none | dockerd + containerd, ~160 MiB |
-| **Steady state** (CPU-bound / I/O-bound) | same | same | same | same |
+| **Memory per extra idle sandbox** (two batches of 50) | **370-379 KiB** | 239-411 KiB | 598-760 KiB | 5328-5600 KiB |
+| **Shared daemons needed** | none without a network; `kiln-dns` for DNS with one | none | none | dockerd + containerd, ~160 MiB |
+| **Steady state**, CPU-bound (median of 7 runs) | 2.93 s | 2.93 s | 2.93 s | 2.94 s |
+| **Steady state**, I/O-bound (median of 7 runs, storage differs) | 1.87 s | 2.01 s | 1.66 s | 1.71 s |
 
-Steady-state speed is the same everywhere, as it should be: once a sandbox is
-running, its code runs on the same kernel whichever runtime set it up. What a
-runtime controls is the cost around the code: starting, idling, tearing
-down. kiln also isolates more by default than the others did here: a user
-namespace and a per-sandbox disk quota, which none of them used, and a
-seccomp filter, which the bare runc and crun configs didn't have (see
-[what each one sets up](#method)).
+On one uncontended ARM Lima VM, kiln's median one-shot `true` lifecycle was
+13.2 ms without networking and 22.2 ms with networking—approximately equal to
+bare crun without networking, while the tested Docker CLI stack took about
+6.4× as long.
+
+**What these numbers are.** Each start time is the run-to-completion latency
+of one one-shot command, `true`, from a single client with nothing else
+running in the VM: the runtime's setup, the command and the teardown, until
+the CLI exits. The image is already local and warm (no pull, no unpack),
+10 warmup runs precede the 100 timed ones, and each timed run follows 100 ms
+of idle. That idle gap is all "cold" means here: not cold caches, not an
+image pull, and not time-to-ready. `true` is an overhead microbenchmark: it
+shows what a runtime adds around a command, not that an agent's work gets
+done faster.
+
+**What they compare.** End-user stacks as configured, not components.
+Docker, bare runc/crun and kiln do different work and use different storage
+paths (see [what each one sets up](#method)): Docker goes through a CLI, two
+daemons, a shim and runc and starts from an overlay snapshot; bare runc and
+crun run one process on the unpacked tree with no overlay and no seccomp;
+kiln runs one process that also creates a user namespace, a seccomp filter
+and an overlay on a quota'd XFS loop device. That doesn't invalidate the
+product-level comparison, which is what a user of each tool gets, but it
+does prevent attributing a difference to any one component. Podman,
+containerd on its own and youki were not measured, nor were the
+stronger-isolation runtimes (gVisor, Firecracker, Kata), which belong in a
+separate isolation tier; see [Next measurements](#next-measurements).
+
+Once a sandbox is running, its code runs on the same kernel whichever
+runtime set it up. In the seven-run CPU microbenchmark no difference was
+observed; the I/O result is inconclusive and not configuration-equivalent,
+because each runtime wrote to different storage (see
+[Steady state](#steady-state)). What a runtime controls is the cost around
+the code: starting, idling, tearing down. kiln also isolates more by default
+than the others did here: a user namespace and a per-sandbox disk quota,
+which none of them used, and a seccomp filter, which the bare runc and crun
+configs didn't have.
 
 Most of this file is about cold start: where kiln's time went and what was
 changed to make it fast (28.9 → 13.2 ms without a network, 87.9 → 22.2 ms
@@ -33,7 +65,9 @@ with one).
 Every number is the wall time of one command, measured with
 [hyperfine](https://github.com/sharkdp/hyperfine) without a shell (`-N`): 10
 warmup runs, then 100 timed runs, reported as mean, p50, p95 and p99 in
-milliseconds.
+milliseconds. Each case is one series of 100 runs from one session, so p95
+and p99 describe that series; the p99 of 100 serially correlated samples is
+exploratory, and with no repeated sessions there are no confidence intervals.
 
 **Cold vs. back to back.** By default every run is preceded by 100 ms of idle
 (`--prepare "sleep 0.1"`). Without the pause, runs follow each other within
@@ -41,16 +75,21 @@ microseconds and some kernel paths are still warm from the previous run (see
 [RCU grace periods](#1-rcu-grace-periods) below). Before this work, kiln took
 2.7 ms back to back but 28.9 ms after a pause, so a back-to-back benchmark
 would have said kiln was already fast. Both are reported; the cold number is
-the one an agent sees when it starts a sandbox after thinking for a while.
+closer to what an agent sees when it starts a sandbox after thinking for a
+while.
 
-**Same root filesystem.** Every runtime starts the Alpine 3.24.2 minirootfs
+**Same rootfs contents.** Every runtime starts the Alpine 3.24.2 minirootfs
 that kiln uses (`/var/lib/kiln/images/alpine`). `bench/setup.sh` packs it with
 its owners shifted back from kiln's sandbox ID range and imports it into Docker
-(`docker import`) and into an OCI bundle for runc and crun.
+(`docker import`) and into an OCI bundle for runc and crun. The files are the
+same; the storage under them is not (table below).
 
-**Same limits.** kiln's defaults: 512 MiB of memory with no swap, 1 CPU and
+**Limits.** kiln's defaults: 512 MiB of memory with no swap, 1 CPU and
 128 PIDs. Docker gets `--memory 512m --cpus 1 --pids-limit 128`, and the OCI
-bundle the same values in `linux.resources`.
+bundle the same values in `linux.resources`. Docker was not given
+`--memory-swap 512m`, so its swap limit was Docker's default, and the VM's
+swap state was not captured: the memory limits match, but strict no-swap
+equivalence was not established.
 
 | case | command |
 |---|---|
@@ -62,14 +101,14 @@ bundle the same values in `linux.resources`.
 | crun-none | `crun run --bundle /var/lib/kiln-bench/bundle kiln-bench` |
 
 **What each one sets up.** They don't do the same amount of work, so the
-comparison isn't perfectly like for like:
+comparison is between end-user stacks as configured, not like for like:
 
 | | kiln | docker run --rm | runc / crun (bare `spec`) |
 |---|---|---|---|
-| Path to the kernel | one process, no daemon | CLI → dockerd → containerd → shim → runc | one process |
-| Root filesystem | overlayfs on XFS with a per-run project quota (`--disk 1G`) | overlayfs snapshot (containerd) | the unpacked tree, read-only, no overlay |
+| Path to the kernel | one process, no shared daemon | CLI → dockerd → containerd → shim → runc | one process |
+| Root filesystem | overlayfs on XFS (loop device) with a per-run project quota (`--disk 1G`) | overlayfs snapshot (containerd) on ext4 | the unpacked tree on ext4, read-only, no overlay |
 | Namespaces | PID, mount, UTS, IPC, network, cgroup, **user** | PID, mount, UTS, IPC, network, cgroup | PID, mount, UTS, IPC, network, cgroup |
-| cgroup limits | memory, swap, CPU, PIDs, OOM group kill | memory, swap, CPU, PIDs (systemd driver) | memory, swap, CPU, PIDs |
+| cgroup limits | memory, swap, CPU, PIDs, OOM group kill | memory, CPU, PIDs; swap at Docker's default (systemd driver) | memory, swap, CPU, PIDs |
 | Syscall filter | seccomp denylist + `no_new_privs` | default seccomp profile | none |
 | PID 1 | kiln-init (forwards signals, reaps) | the command | the command |
 | Network (`*-net` cases) | veth on a bridge, nftables chain per sandbox, DNS policy file | veth on docker0, iptables NAT | loopback only |
@@ -80,8 +119,9 @@ comparison isn't perfectly like for like:
 hyperfine 1.18.0, rustc 1.99.0, kiln release build. The VM's vCPUs sleep when
 idle, so every cold run also pays for waking them; that's part of what the
 cold numbers measure. The Mac was otherwise in normal use, so results from
-different sessions differ by a few milliseconds. Tables that compare builds
-were measured in one session.
+different sessions differ by a few milliseconds. The cross-runtime numbers
+come from one session, with the cases run in a fixed order rather than
+randomized. Tables that compare builds were measured in one session.
 
 **Docker and kiln networking.** Docker sets the iptables FORWARD policy to DROP
 by default, which would drop kiln's forwarded sandbox traffic.
@@ -125,6 +165,12 @@ one session. A separate run of the baseline build against all runtimes
 (`bench/results/baseline`; p50 kiln 29.6 and 88.0 ms, crun 12.9, runc 33.2,
 Docker 86.7 and 140.4) agrees within 1 ms for kiln and 3 ms for the others.
 
+A few cold runs of the fastest runtimes finished in under 6 ms (13 of 100
+for kiln-none, 8 for crun-none): the 100 ms pause did not always let the VM
+go fully idle. They are included in every percentile. Excluding them moves
+kiln-none's p50 from 13.24 to 13.46 ms (crun-none's from 13.41 to 13.67 ms),
+so the p50 is not materially changed.
+
 ### Back to back (no pause)
 
 | case | before: p50 | p95 | now: p50 | p95 |
@@ -147,7 +193,7 @@ removing the previous sandbox's veth, so it deletes it itself (see change 8).
 For an agent session, a sandbox is created once and each tool call runs in
 it. Latency to run `true` in an idle sandbox that's already running (a
 `kiln create` sandbox; for the others a container running `sleep infinity`),
-100 runs with 100 ms idle before each (`bench/warm.sh`,
+from a single client, 100 runs with 100 ms idle before each (`bench/warm.sh`,
 `bench/results/warm`):
 
 | command | mean | p50 | p95 | p99 |
@@ -208,9 +254,10 @@ idle sandboxes are started, with the page cache dropped before each reading:
 | runc | 598 KiB | 760 KiB |
 | Docker | 5328 KiB | 5600 KiB |
 
-This is a coarse, host-wide measurement, good to about ±200 KiB; the point is
-the order of magnitude: kiln, runc and crun cost a few hundred KiB per idle
-sandbox, Docker about 5.5 MiB.
+This is a coarse, host-wide measurement from two batches of 50, good to about
+±200 KiB; kiln measured 370-379 KiB per sandbox. The point is the order of
+magnitude: kiln, runc and crun cost a few hundred KiB per idle sandbox, Docker
+about 5.5 MiB.
 
 Fixed costs, whatever the number of sandboxes (KiB, run 1):
 
@@ -221,13 +268,16 @@ Fixed costs, whatever the number of sandboxes (KiB, run 1):
 | kiln-dns | DNS for kiln sandboxes with a network | 3036 | 1109 |
 | kiln-metrics | Prometheus metrics (optional) | 3952 | 2025 |
 
-kiln needs no daemon to start a sandbox. `kiln-dns` is only needed for name
-lookups from networked sandboxes, and `kiln-metrics` only for monitoring.
+kiln has no mandatory shared daemon for non-networked starts. `kiln-dns` is a
+small fixed service for DNS in networked sandboxes, and `kiln-metrics` is only
+for monitoring. Persistent sandboxes still have their own per-sandbox shim and
+PID 1 (the first table above).
 
 ### Steady state
 
-Once running, a sandbox's code should take the same time in every runtime.
-Two single-threaded workloads, each under the same 1-CPU limit, timed inside
+Once running, a sandbox's code runs on the same kernel whichever runtime set
+it up, so no runtime difference is expected; this checks for one. Two
+single-threaded workloads, each under the same 1-CPU limit, timed inside
 the sandbox with busybox `time -p` so startup isn't counted, 7 runs each,
 interleaved (`bench/steady.sh`, `bench/results/steady`):
 
@@ -245,13 +295,13 @@ interleaved (`bench/steady.sh`, `bench/results/steady`):
 | I/O | runc | 1.66 | 1.38 | 1.77 |
 | I/O | crun | 2.01 | 1.74 | 2.90 |
 
-CPU time is identical. I/O overlaps across all four: the ranges are wide
-because the VM's disk is a file on the Mac's SSD, and no runtime is
-consistently faster. Where the writes land differs: kiln's overlay upper
-layer is on XFS in a loop device (direct I/O, for the per-sandbox disk
-quota), Docker's on an overlayfs snapshot on the ext4 root disk, runc's and
-crun's straight into the unpacked directory on ext4, with no overlay. That's
-a choice of storage, not of runtime.
+CPU: no difference was observed in these seven runs. I/O: inconclusive. The
+ranges overlap and are wide, because the VM's disk is a file on the Mac's
+SSD, and the configurations aren't equivalent: kiln's overlay upper layer is
+on XFS in a loop device (direct I/O, for the per-sandbox disk quota),
+Docker's on an ext4-backed overlayfs snapshot, runc's and crun's straight
+into the unpacked directory on ext4, with no overlay. This result can't
+separate the runtime from the storage under it.
 
 ### Each change
 
@@ -407,3 +457,26 @@ for a decision rather than done:
 4. **Pre-created network plumbing.** With a pool, veth pairs and nftables
    chains could be set up per pooled sandbox ahead of time, so even a
    networked start would be just an exec.
+
+## Next measurements
+
+What the numbers above don't yet show, and how to measure it:
+
+- **Independent sessions.** Repeat the cross-runtime runs in randomized
+  order across several boots, and report confidence intervals for p50 and
+  p95 across sessions rather than percentiles of one series.
+- **Concurrency and saturation.** Start and exec from many clients at once,
+  up to the point where the host saturates, and report latency and
+  throughput against load.
+- **Realistic workloads.** Python and Node start-up, a package install, and
+  DNS + HTTP from a networked sandbox, timed end to end, so runtime overhead
+  can be compared with the work around it.
+- **Memory slopes.** Fit memory against the number of idle sandboxes over a
+  range of counts instead of two batches of 50.
+- **Matched storage where possible**, so the I/O comparison measures the
+  runtime: the same filesystem and overlay arrangement under each runtime.
+- **Other runtimes.** Podman, containerd on its own and youki; gVisor,
+  Firecracker and Kata as a separate, stronger-isolation tier.
+- **Reproducibility.** A manifest per run (kernel, versions, VM and host
+  settings, swap state, every runtime's flags) and the raw per-run traces
+  next to the summaries.
