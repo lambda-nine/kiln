@@ -3,7 +3,9 @@ per number the text quotes, read with \\V{name}) and .dat tables for charts.
 Every number in kiln-whitepaper.tex comes from here, so a rerun of the
 benchmarks updates the paper.
 
-usage (from docs/whitepaper): python3 -I gen-data.py ../../bench/results data
+usage (from docs/whitepaper):
+    python3 -I gen-data.py ../../bench/results data \
+        ../../bench/results/v2/macbook-air-2026-10-11
 """
 import json
 import os
@@ -11,7 +13,11 @@ import re
 import statistics
 import sys
 
+if len(sys.argv) not in (3, 4):
+    raise SystemExit(f"usage: {sys.argv[0]} LEGACY_RESULTS OUT [V2_RESULTS]")
+
 results, out = sys.argv[1:3]
+v2_results = sys.argv[3] if len(sys.argv) == 4 else None
 os.makedirs(out, exist_ok=True)
 values = {}
 
@@ -153,8 +159,179 @@ values["ratio/warm-crun-over-kiln"] = ratio("warm/exec-crun/p50", "warm/exec-kil
 values["ratio/warm-runc-over-kiln"] = ratio("warm/exec-runc/p50", "warm/exec-kiln/p50")
 values["ratio/idle-docker-over-kiln"] = ratio("idle-run1/fifty/docker/per", "idle-run1/fifty/kiln/per")
 
+
+# Benchmark harness v2. These imports deliberately preserve the replication
+# unit: an aggregate p50 is the median of the per-session p50s, while ratios
+# and their confidence intervals are copied from v2.py's session bootstrap.
+def v2_gap_label(gap):
+    gap = float(gap)
+    return str(int(gap)) if gap.is_integer() else str(gap).replace(".", "p")
+
+
+def v2_put(key, value, digits=3):
+    if value is None:
+        return
+    if isinstance(value, float):
+        values[key] = f"{value:.{digits}f}"
+    else:
+        values[key] = str(value)
+
+
+def v2_load(relative, required=True):
+    path = os.path.join(v2_results, relative)
+    if not os.path.exists(path):
+        if required:
+            raise FileNotFoundError(path)
+        return None
+    with open(path) as f:
+        doc = json.load(f)
+    if doc.get("warnings"):
+        raise ValueError(f"refusing benchmark summary with warnings: {path}: {doc['warnings']}")
+    return doc
+
+
+def v2_import_latency(prefix, relative, required=True, excluded_cases=()):
+    doc = v2_load(relative, required=required)
+    if doc is None:
+        return None
+    grouped = {}
+    for row in doc["latency"]["groups"]:
+        if row["case"] in excluded_cases:
+            continue
+        if row.get("failures", 0):
+            raise ValueError(
+                f"refusing latency group with failures: {relative}: {row['case']}: {row['failures']}")
+        gap = v2_gap_label(row["gap_ms"])
+        grouped.setdefault((row["case"], gap), []).append(row["ms"]["p50"])
+    for (case, gap), medians in grouped.items():
+        base = f"{prefix}/{case}/g{gap}/session-p50"
+        v2_put(base + "/n", len(medians))
+        v2_put(base + "/min", min(medians))
+        v2_put(base + "/median", statistics.median(medians))
+        v2_put(base + "/max", max(medians))
+    for row in doc["latency"]["ratios"]:
+        if row["case"] in excluded_cases:
+            continue
+        gap = v2_gap_label(row["gap_ms"])
+        base = f"{prefix}/ratio/{row['case']}/g{gap}"
+        for stat in ("paired_sessions", "min", "median", "max", "geomean"):
+            v2_put(base + "/" + stat, row.get(stat))
+        ci = row.get("ci95")
+        if ci:
+            v2_put(base + "/ci-low", ci["low"])
+            v2_put(base + "/ci-high", ci["high"])
+    return doc
+
+
+def v2_import_concurrency(prefix, relative, required=True, excluded_cases=()):
+    doc = v2_load(relative, required=required)
+    if doc is None:
+        return None
+    for row in doc["concurrency"]:
+        if row["case"] in excluded_cases:
+            continue
+        if row.get("failures", 0) or row.get("timeouts", 0):
+            raise ValueError(
+                f"refusing concurrency row with failures: {relative}: {row['case']} level "
+                f"{row['level']}: {row.get('failures', 0)} failures, "
+                f"{row.get('timeouts', 0)} timeouts")
+        base = f"{prefix}/{row['case']}/l{row['level']}"
+        for stat in ("batches", "invocations", "failures", "timeouts", "batch_wall_ms_p50"):
+            v2_put(base + "/" + stat, row.get(stat))
+        for stat, value in row["completions_per_s"].items():
+            v2_put(base + "/throughput-" + stat, value)
+        for stat, value in row["invocation_ms"].items():
+            v2_put(base + "/latency-" + stat, value)
+    return doc
+
+
+def v2_import_memory(prefix, relative, required=True, excluded_cases=()):
+    doc = v2_load(relative, required=required)
+    if doc is None:
+        return None
+    if doc["memory"].get("excluded_points", 0):
+        raise ValueError(
+            f"refusing memory summary with excluded points: {relative}: "
+            f"{doc['memory']['excluded_points']}")
+    for row in doc["memory"]["cases"]:
+        if row["case"] in excluded_cases:
+            continue
+        base = f"{prefix}/{row['case']}"
+        v2_put(base + "/fits", row["fits"])
+        for stat, value in row["slope_kib_per_sandbox"].items():
+            v2_put(base + "/slope-" + stat, value)
+    v2_put(prefix + "/excluded-points", doc["memory"]["excluded_points"])
+    return doc
+
+
+if v2_results is not None:
+    latency_v2 = v2_import_latency(
+        "v2/latency", "latency-summary/summary.json",
+        excluded_cases={"podman-crun-net"})
+    latency_net_v2 = v2_import_latency(
+        "v2/latency-net", "latency-summary-net/summary.json",
+        excluded_cases={"podman-crun-net"})
+    gap_v2 = v2_import_latency(
+        "v2/gap", "gap-summary/summary.json",
+        excluded_cases={"podman-crun-net"})
+    concurrency_v2 = v2_import_concurrency(
+        "v2/concurrency", "concurrency-summary/summary.json",
+        excluded_cases={"podman-crun-net", "youki-none"})
+    memory_v2 = v2_import_memory(
+        "v2/memory", "memory-summary/summary.json",
+        excluded_cases={"podman-crun-net"})
+    kiln_memory = float(values["v2/memory/kiln-none/slope-median"])
+    for case in ("docker-none", "podman-crun-none", "nerdctl-none", "crun-none",
+                 "runc-none", "runsc-none"):
+        v2_put(f"v2/memory/ratio/{case}-over-kiln",
+               float(values[f"v2/memory/{case}/slope-median"]) / kiln_memory)
+
+    corrected_latency = v2_import_latency(
+        "v2/podman-net/latency", "podman-net-corrected/latency-summary/summary.json", required=False)
+    corrected_gap = v2_import_latency(
+        "v2/podman-net/gap", "podman-net-corrected/gap-summary/summary.json", required=False)
+    corrected_concurrency = v2_import_concurrency(
+        "v2/podman-net/concurrency", "podman-net-corrected/concurrency-summary/summary.json", required=False)
+    corrected_memory = v2_import_memory(
+        "v2/podman-net/memory", "podman-net-corrected/memory-summary/summary.json", required=False)
+
+    workload_docs = {}
+    for workload in ("shell", "python", "node", "fs", "dns", "http"):
+        doc = v2_import_latency(
+            f"v2/workload/{workload}", f"workloads/summary-{workload}/summary.json", required=False)
+        if doc is not None:
+            workload_docs[workload] = doc
+
+    # A categorical idle-gap curve. Podman is sourced only from the corrected
+    # run: the original network overlapped kiln0 and could not pass traffic.
+    with open(os.path.join(out, "v2-gap-none.dat"), "w") as f:
+        f.write("gap kiln crun docker podman nerdctl runc youki runsc\n")
+        for gap in (0, 10, 100, 1000, 5000):
+            g = str(gap)
+            cols = []
+            for case in ("kiln-none", "crun-none", "docker-none", "podman-crun-none",
+                         "nerdctl-none", "runc-none", "youki-none", "runsc-none"):
+                cols.append(values[f"v2/gap/{case}/g{g}/session-p50/median"])
+            f.write(f"{gap} {' '.join(cols)}\n")
+    with open(os.path.join(out, "v2-concurrency.dat"), "w") as f:
+        f.write("level kiln crun docker runc runsc\n")
+        for level in (1, 4, 16, 32, 64):
+            cols = [values[f"v2/concurrency/{case}/l{level}/throughput-mean"]
+                    for case in ("kiln-none", "crun-none", "docker-none", "runc-none", "runsc-none")]
+            f.write(f"{level} {' '.join(cols)}\n")
+
+    with open(os.path.join(out, "v2-memory.dat"), "w") as f:
+        f.write("y median min max errminus errplus\n")
+        cases = ("kiln-none", "crun-none", "runc-none", "podman-crun-none",
+                 "docker-none", "nerdctl-none", "runsc-none")
+        for i, case in enumerate(cases):
+            median = float(values[f"v2/memory/{case}/slope-median"])
+            low = float(values[f"v2/memory/{case}/slope-min"])
+            high = float(values[f"v2/memory/{case}/slope-max"])
+            f.write(f"{i} {median:.3f} {low:.3f} {high:.3f} {median-low:.3f} {high-median:.3f}\n")
+
 with open(os.path.join(out, "values.tex"), "w") as f:
-    f.write("% Generated by gen-data.py from bench/results. Do not edit.\n")
+    f.write("% Generated by gen-data.py from benchmark results. Do not edit.\n")
     for k in sorted(values):
         f.write(f"\\expandafter\\def\\csname v@{k}\\endcsname{{{values[k]}}}\n")
 print(f"{len(values)} values, data in {out}/")

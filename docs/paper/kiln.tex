@@ -73,12 +73,14 @@ ruleset, a per-sandbox network namespace on a bridge with an nftables egress
 policy, a policy-enforcing DNS forwarder, and a stateless Prometheus exporter.
 Each layer was written directly against the kernel's files, system calls and
 netlink (with the \code{nft} tool for firewall rules), with no container
-libraries. On one uncontended ARM Lima VM, kiln's median one-shot \code{true}
-lifecycle was 13.2\,ms without networking and 22.2\,ms with networking---approximately
-equal to bare crun without networking, while the tested Docker CLI stack took
-about 6.4$\times$ as long. This paper describes each layer and the
-design decision behind it, where start-up time went, what two independent
-reviews found, and what is still missing.
+libraries. On one ARM Lima VM, an idle-gap sweep put kiln and bare crun's
+one-shot \code{true} lifecycle at 14.9 and 14.8\,ms after 5\,s idle, against
+140.9\,ms for Docker. Across five fresh boots at a defined 100\,ms gap,
+Docker's paired median ratio was 25.84$\times$ kiln's (95\% session-bootstrap
+interval 23.82--27.82$\times$). These are runtime-overhead measurements, not
+end-to-end agent speed. This paper describes each layer and the
+design decision behind it, where start-up time went, what two model-assisted
+adversarial reviews found, and what is still missing.
 \end{abstract}
 
 % ---------------------------------------------------------------------------
@@ -102,8 +104,8 @@ the kernel and a few directories, so the system can be inspected with
 network unless asked, limits on by default.
 
 \textbf{Non-goals (for now).} OCI image and runtime-spec compatibility, rootless
-operation, multi-tenant production hardening, and long-lived sandboxes (the
-next phase, \S\ref{sec:future}).
+operation, multi-tenant production hardening, multi-host orchestration, and a
+stable public API (\S\ref{sec:future}).
 
 \textbf{Environment.} macOS has no namespaces or cgroups, so kiln runs in an
 Ubuntu 24.04 arm64 VM under Lima (4 vCPU, 4\,GiB) with the source tree shared into
@@ -780,21 +782,27 @@ not sandboxes.
 \label{sec:perf}
 
 For an agent, a sandbox start sits on the critical path of every tool call, so
-start latency was measured and then optimized. \textbf{Method:} hyperfine times
-a one-shot \code{true} from a single client on an otherwise idle VM: runtime
-setup, the command and teardown, until the CLI exits, with the image already
-local and warm. 10 warm-up and 100 timed runs, each preceded by 100\,ms of idle;
-``cold'' here means only that gap, not cold caches, an image pull or
-time-to-ready. Every runtime starts the same rootfs contents (Alpine 3.24.2)
-with the same CPU, memory and PID limits. All cross-runtime numbers come from
-one fixed-order session on one ARM64 Lima VM (4 vCPU, 4\,GiB, Ubuntu 24.04, Linux
-6.8) on an M2 MacBook Air under normal host use; p99 from 100 serially
-correlated samples is exploratory, and there are no repeated-session confidence
-intervals. \code{KILN\us{}TRACE=1} prints each phase of a start on one
+start latency was measured and then optimized. \textbf{Method:} the v2 harness
+times a one-shot \code{true} from immediately before process spawn until the
+CLI's \code{waitpid} returns: runtime setup, the command and complete teardown,
+with the image local. Every measured round contains every runtime in seeded,
+randomized Latin-square order. The primary campaign used 10 warm-up and 100
+measured rounds at a defined 100\,ms idle gap across five fresh VM boots; a
+95\% interval bootstraps the geometric mean of one median ratio per boot. A
+separate one-boot sweep measures 0, 10, 100, 1000 and 5000\,ms gaps, because
+the absolute result changes with idle state. Every runtime starts the same
+rootfs contents under 512\,MiB memory with no swap, 1 CPU and 128 PIDs.
+
+The machine was an ARM64 Lima VM (4 vCPU, 4\,GiB, Ubuntu 24.04, Linux 6.8) on
+an M2 MacBook Air under normal use. Raw JSONL and manifests record the config,
+rootfs and executable hashes, versions, kernel and boot ID. \code{true} is an
+overhead microbenchmark, not evidence that application code runs faster.
+\code{KILN\us{}TRACE=1} prints each phase of a start on one
 \code{CLOCK\us{}MONOTONIC} timeline for the host side and the sandbox's init.
 
-\textbf{Where the time went.} Before this work a cold start took 28.9\,ms
-(p50) without a network and 87.9\,ms with one. Almost all of it was two things:
+\textbf{Where the time went.} In the earlier fixed-order 100\,ms-gap series,
+the baseline took 28.9\,ms (p50) without a network and 87.9\,ms with one.
+Almost all of it was two things:
 \begin{itemize}
 \item \emph{RCU grace periods} (5--20\,ms each on this VM). Writing a PID to
 \code{cgroup.procs} migrates a running process under a per-CPU rwsem whose
@@ -820,71 +828,88 @@ does); rtnetlink instead of \code{ip} and \code{nsenter}; one \code{nft} per
 networked start, committing base-ruleset repairs only on drift; teardown
 deletions as one nfnetlink batch whose socket a short-lived child closes, so
 kiln does not wait for the deferred freeing; and the veth left to the dying
-namespace. What is left at 13\,ms is mostly namespace creation (1.6\,ms), the
+namespace. The phase trace left mostly namespace creation (1.6\,ms), the
 child's mounts (2.5\,ms), starting the binary and about 5\,ms between the
 command exiting and the host seeing the sandbox gone; a networked start adds
-one \code{nft} process (about 6\,ms) and the veth.
+one \code{nft} process (about 6\,ms) and the veth. The v2 sweep later measured
+kiln at 2.78\,ms back to back and 14.88\,ms after 5\,s idle, with bare crun at
+2.58 and 14.80\,ms: the optimization reached the low-level floor, but the
+floor itself depends on idle state.
 
 \begin{table}[t]
 \centering\small
-\caption{kiln against Docker 29.1.3, runc 1.3.4 and crun 1.14.1, end-user
-stacks as configured, on one VM with the same rootfs contents
-(\code{docs/benchmarks.md}). Times are p50 of 100 runs of \code{true} in ms;
-memory is the growth of host memory per extra idle sandbox in two batches of 50.}
+\caption{Primary v2 results for end-user stacks on one ARM VM with identical
+rootfs contents (\code{docs/benchmarks.md}). The 5\,s values are 10-run p50s
+from one idle-gap sweep; ratios use five fresh boots; concurrency is three
+64-client batches; memory is the median of three 0--100-sandbox fits.}
 \label{tab:perf}
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
- & kiln & crun & runc & Docker \\
+ & kiln & Docker & Podman + crun & nerdctl \\
 \midrule
-Cold one-shot, no network (\code{run -- true}) & \textbf{13.2} & 13.4 & 34.2 & 84.0 \\
-Cold one-shot, network (kiln \code{--net full}, Docker bridge) & \textbf{22.2} & --- & --- & 141.8 \\
-\quad kiln before this work & 28.9 / 87.9 & & & \\
-Warm start: \code{exec true} in a running sandbox & \textbf{3.5} & 9.7 & 24.1 & 53.7 \\
-Host memory per idle sandbox (KiB) & 370--379 & 239--411 & 598--760 & 5328--5600 \\
-Shared daemons to start, no network & none & none & none & ${\approx}$160\,MiB \\
-Steady state, CPU-bound (7 runs) & \multicolumn{4}{c}{no difference observed} \\
-Steady state, I/O-bound & \multicolumn{4}{c}{inconclusive: storage differs} \\
+5\,s-idle \code{true}, no network (ms) & \textbf{14.88} & 140.90 & 109.27 & 147.49 \\
+100\,ms ratio to kiln (5 boots) & \textbf{1.00} & 25.84 & 17.49 & 27.64 \\
+64-way \code{true}, completions/s & \textbf{836.6} & 6.9 & 15.0 & 10.5 \\
+Idle memory slope (KiB/sandbox) & \textbf{749} & 5007 & 1203 & 13172 \\
+Shared daemon, no network & none & dockerd + containerd & none & containerd \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:perf} compares the result. These are end-user stacks as
-configured, and they do different work on different storage paths: kiln also
-creates a user namespace and an overlay on a quota'd XFS loop device and
-installs seccomp, which the bare runc and crun configurations (direct ext4) did
-not; Docker adds its daemon path (CLI $\rightarrow$ dockerd $\rightarrow$
-containerd $\rightarrow$ shim $\rightarrow$ runc) and an ext4-backed overlay
-snapshot. That does not invalidate the product-level comparison, but it prevents
-attributing a difference to any one component. Warm start favours kiln for the
-reason in \S\ref{sec:persistent}: the others start a host process that
-\code{setns}es into the container (runc then joins the cgroup through
-\code{cgroup.procs}), while kiln's PID 1 forks a child that inherits everything.
+Table~\ref{tab:perf} compares complete user-facing stacks. The low-level floor
+was bare crun: 14.80\,ms at the 5\,s gap and 827.0 completions/s at 64 clients,
+essentially kiln's result. Bare runc took 34.81\,ms; youki 30.96\,ms. gVisor
+runsc took 67.45\,ms and 13.7\,MiB per idle sandbox, but belongs to a stronger
+isolation tier. youki timed out 22 commands under concurrency; every other
+runtime completed all commands.
 
-\textbf{What the numbers do not show.} \code{true} is an overhead
-microbenchmark, not evidence of faster agent workloads. Memory limits matched,
-but Docker did not receive \code{--memory-swap 512m} and swap state was not
-captured, so strict no-swap equivalence was not established. An idle kiln
-sandbox grew host memory by 370--379\,KiB in two batches of 50; kiln-dns is a small
-fixed service for DNS in networked sandboxes, and persistent sandboxes keep a
-per-sandbox shim and PID~1. No CPU difference was observed in the seven-run
-steady-state test; the I/O result is inconclusive because each runtime wrote to
-different storage. Podman, containerd on its own and youki were not measured,
-nor were gVisor, Firecracker and Kata, which belong in a separate isolation
-tier. \textbf{Next measurements:} randomized independent sessions across boots,
-concurrency up to saturation, realistic Python, Node and DNS + HTTP workloads,
-memory slopes, matched storage where possible, and a reproducibility manifest
-with raw traces for every run.
+The corrected network pair was rerun separately. At 64 clients kiln averaged
+114.4 completions/s against 10.6 for Podman with crun; their median idle-memory
+slopes were 1101 and 1471\,KiB per sandbox, with overlapping three-fit ranges
+(550--1444 and 914--1844\,KiB). The first concurrency attempt found one real
+kiln failure in 351 invocations: a dying network namespace removed a reused
+veth between an \code{EEXIST} response and stale-link deletion. That attempt is
+preserved but excluded. The fix treats only the resulting \code{ENODEV} as
+already-cleaned state, adds a ten-wave 160-start regression, and the fresh-boot
+replacement completed all 702 paired invocations. This is one-boot exploratory
+evidence, not a capacity or memory-ranking claim.
+
+The stacks still do different work on different storage paths. kiln creates a
+user namespace, seccomp, an overlay on a quota'd XFS loop device and PID~1;
+Docker adds its daemon path (CLI $\rightarrow$ dockerd $\rightarrow$ containerd
+$\rightarrow$ shim $\rightarrow$ runc) and an ext4-backed overlay snapshot;
+Podman uses conmon; nerdctl crosses containerd. Bare runtimes receive a prepared
+bundle on ext4 with no seccomp or overlay. This is a product-level comparison,
+not attribution to one component.
+
+\textbf{What the numbers do not show.} The five-boot intervals apply only to
+ratios at the defined 100\,ms gap. The 5\,s sweep, concurrency and memory fits
+each use one boot and remain exploratory. Representative shell, Python, Node,
+filesystem, DNS and HTTP one-shot workloads used three fresh-boot sessions per
+workload;
+the Docker/kiln ratio narrowed from 21.36$\times$ for the tiny shell command to
+4.67$\times$ for Python, 3.81$\times$ for Node and 2.15$\times$ for HTTP, as
+fixed overhead was amortized. DNS and HTTP include public-network variance.
+The earlier warm-exec series
+(kiln 3.5\,ms, crun 9.7, runc 24.1, Docker 53.7) was not repeated under v2.
+No CPU difference was observed in the seven-run steady-state test; its I/O
+result is inconclusive because storage differed. Firecracker and Kata could not
+run because the VM exposed no \code{/dev/kvm}. Next measurements are a second
+host (the intended Mac Mini), x86-64 bare metal, replicated concurrency and
+memory, matched storage, larger images and KVM-based isolation.
 
 % ---------------------------------------------------------------------------
-\section{Independent review: what it found and taught}
+\section{Adversarial model review: what it found and taught}
 \label{sec:review}
 
-kiln was reviewed independently twice. After networking landed, four
-reviewers attacked it with the goal of breaking isolation. After the metrics
-layer, a second review by a separate security-focused model (``Daybreak'')
-examined the whole system, including the host-side services. It found five
-concrete issues and four it rated theoretical; all nine are fixed, and each fix
-has a check in \code{scripts/review-regressions.sh}.
+kiln went through two model-assisted adversarial review rounds. After
+networking landed, four independent model reviewers attacked it with the goal
+of breaking isolation. After the metrics layer, a separate security-focused
+model (``Daybreak'') examined the whole system, including the host-side
+services. These rounds were useful engineering review, not a professional
+security audit. The second found five concrete issues and four it rated
+theoretical; all nine are fixed, and each fix has a check in
+\code{scripts/review-regressions.sh}.
 Table~\ref{tab:review} summarizes both rounds by class of issue, not by
 individual reproduction.
 
@@ -967,8 +992,8 @@ Firecracker microVM backend.
 (2)~\textbf{The agent harness}: an agent loop with memory and tools
 (\code{exec}, \code{read\us{}file}, \code{write\us{}file}, \code{diff}) talking to
 kilnd over a Unix socket, with the upper layer as audit log and snapshot base.
-(3)~\textbf{A pool of pre-created sandboxes}, so a start becomes an exec
-(3.5\,ms instead of 13--22\,ms). (4)~\textbf{A Kubernetes operator}: a
+(3)~\textbf{A pool of pre-created sandboxes}, so a full lifecycle becomes an
+exec (3.5\,ms in the legacy exec series). (4)~\textbf{A Kubernetes operator}: a
 \code{Sandbox} custom resource on k3s, with kilnd as a DaemonSet.
 
 % ---------------------------------------------------------------------------
@@ -1011,10 +1036,12 @@ does the actual namespace, cgroup and mount setup from an OCI bundle. kiln cover
 roughly runc's job plus the parts of Docker that matter for sandboxing (image
 storage with overlayfs, bridge networking with NAT, disk quotas, an egress
 policy, metrics) in one binary. It has no OCI image or runtime-spec support and
-no image distribution. On one uncontended VM, its one-shot \code{true}
-lifecycle takes 13\,ms (p50) against 84\,ms for the Docker CLI stack as
-configured; part of that gap is the daemon path, though the two also differ in
-storage and isolation.}
+no image distribution. In one idle-gap sweep, after 5\,s idle, its one-shot
+\code{true} lifecycle took 14.9\,ms (p50) against 140.9\,ms for the Docker CLI
+stack as configured. Across five boots at a 100\,ms gap, Docker's paired median
+ratio was 25.84$\times$ (95\% bootstrap interval 23.82--27.82$\times$). Part of
+that gap is the daemon path, though the two also differ in storage and
+isolation.}
 
 \qa{And with gVisor and Firecracker?}
 {All three answer ``how much of the host kernel does untrusted code reach?''
@@ -1138,13 +1165,14 @@ automatic reconcile is daemon work. Catchable signals (Ctrl-C, \code{kill}) are
 consumed by \code{sigwait} and lead to a normal cleanup.}
 
 \qa{How fast does a sandbox start?}
-{A one-shot \code{true} (setup, command and teardown, warm local image, 100\,ms
-idle before each run) takes 13.2\,ms (p50) without a network, the same as bare
-crun (13.4), and 22.2\,ms with one; runc takes 34.2 and Docker 84.0 and 141.8.
-It took 28.9 and 87.9\,ms before the work in \S\ref{sec:perf}: RCU grace periods
-(a cgroup migration, nftables socket closes, a veth deletion) and spawning
-\code{ip}, \code{nsenter} and \code{nft}. A command in a running sandbox takes
-3.5\,ms.}
+{It depends on idle state. In a one-boot sweep, a one-shot \code{true} (setup,
+command and teardown) took 2.78\,ms p50 back to back and 14.88\,ms after 5\,s
+idle; bare crun took 2.58 and 14.80\,ms, and Docker 141.54 and 140.90\,ms.
+Across five fresh boots at a defined 100\,ms gap, Docker's paired median ratio
+was 25.84$\times$ kiln's (95\% interval 23.82--27.82$\times$). The original
+build took 28.9 and 87.9\,ms in the legacy no-network/network series; removing
+RCU waits and helper processes produced the current path. A command in an
+existing sandbox took 3.5\,ms in an earlier one-session exec benchmark.}
 
 \qa{How would you test it?}
 {Today, each limit was verified by triggering its failure mode on purpose (OOM

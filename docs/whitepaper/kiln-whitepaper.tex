@@ -1,6 +1,8 @@
 % kiln white paper. Numbers come from data/values.tex and the charts from
 % data/*.dat, both generated from bench/results:
-%   python3 -I gen-data.py ../../bench/results data && tectonic kiln-whitepaper.tex
+%   python3 -I gen-data.py ../../bench/results data \
+%     ../../bench/results/v2/macbook-air-2026-10-11
+%   tectonic kiln-whitepaper.tex
 \documentclass[10pt,letterpaper]{article}
 
 \usepackage{fontspec}
@@ -41,6 +43,8 @@
 % \V{name}: a number from bench/results (see gen-data.py).
 \newcommand{\V}[1]{\ifcsname v@#1\endcsname\csname v@#1\endcsname\else\textbf{??#1??}\fi}
 \newcommand{\ms}[1]{\V{#1}\,ms}
+\newcommand{\Vone}[1]{\ifcsname v@#1\endcsname\pgfmathprintnumber[fixed,precision=1]{\csname v@#1\endcsname}\else\textbf{??#1??}\fi}
+\newcommand{\Vtwo}[1]{\ifcsname v@#1\endcsname\pgfmathprintnumber[fixed,precision=2]{\csname v@#1\endcsname}\else\textbf{??#1??}\fi}
 
 \definecolor{kiln}{HTML}{2A78D6}
 \definecolor{other}{HTML}{9A998F}
@@ -75,45 +79,48 @@
 \noindent AI agents run code as a long series of short tool calls: a shell
 command, a test run, a script the model just wrote. Each call is untrusted, each
 one blocks the agent, and between calls the sandbox sits idle. kiln is a Linux
-container runtime built for exactly that pattern. On one uncontended ARM Lima
-VM, kiln's median one-shot \code{true} lifecycle (setup, command and teardown)
-was \ms{final/kiln-none/p50} without networking and \ms{final/kiln-net/p50} with
-networking---approximately equal to bare crun without networking, while the
-tested Docker CLI stack took about \V{ratio/docker-none-over-kiln}$\times$ as long.
-It runs a command in an existing sandbox in \ms{warm/exec-kiln/p50}, against
-\ms{warm/exec-crun/p50} for crun, \ms{warm/exec-runc/p50} for runc and
-\ms{warm/exec-docker/p50} for Docker. An idle sandbox grew host memory by
-\V{idle-run1/fifty/kiln/per}--\V{idle-run2/fifty/kiln/per}\,KiB in two batches
-of 50, and non-networked starts need no shared daemon. It does this with a user
-namespace, a seccomp filter, a per-sandbox disk quota and an egress policy
-turned on by default. The comparison is between end-user stacks as configured
-(Docker 29.1.3, runc 1.3.4, crun 1.14.1) starting the same rootfs contents.
-\code{true} is an overhead microbenchmark: kiln's advantage is in the cost
-around the code, and this paper claims nothing beyond what was measured.
+container runtime built for that pattern. In randomized measurements across
+one ARM Lima VM, an idle-gap sweep showed why an absolute ``cold-start'' number
+is misleading: after 5\,s idle, kiln and bare crun converged at
+\Vone{v2/gap/kiln-none/g5000/session-p50/median} and
+\Vone{v2/gap/crun-none/g5000/session-p50/median}\,ms, while Docker took
+\Vone{v2/gap/docker-none/g5000/session-p50/median}\,ms. In a separate campaign
+across five fresh boots, at a defined 100\,ms gap, Docker's lifecycle was
+\Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ kiln's (95\%
+session-bootstrap interval \Vone{v2/latency/ratio/docker-none/g100/ci-low}--\Vone{v2/latency/ratio/docker-none/g100/ci-high}$\times$).
+A fit over 0--100 idle sandboxes estimated kiln at
+\Vone{v2/memory/kiln-none/slope-median}\,KiB per sandbox against
+\Vone{v2/memory/docker-none/slope-median}\,KiB for Docker. Across three boots,
+Docker's ratio narrowed from
+\Vone{v2/workload/shell/ratio/docker-shell/g100/geomean}$\times$ for a tiny
+shell workload to \Vone{v2/workload/http/ratio/docker-http/g1000/geomean}$\times$
+for an HTTP GET, as fixed overhead was amortized. Non-networked starts need no
+shared daemon. kiln provides a user namespace, seccomp, a per-sandbox
+disk quota and optional egress policy by default. These are product-level
+comparisons of the tested stacks, not component benchmarks; \code{true} measures
+runtime overhead, not end-to-end agent speed.
 \end{abstract}
 
 \begin{table}[H]
-\centering\small
-\caption{Summary. Times are p50 of 100 runs of \code{true} from one client on
-one uncontended VM (ms); memory is the growth of host memory per extra idle
-sandbox (KiB, two batches of 50). kiln-dns, a small fixed service, serves DNS
-for networked kiln sandboxes. Details and conditions in \S\ref{sec:results} and
-\S\ref{sec:fair}.}
+\centering\footnotesize
+\caption{Primary v2 results on one 4-vCPU ARM VM. Lifecycle values are p50 from
+the 5\,s point of one-boot idle-gap sweeps (ms); throughput is the mean of
+three 64-client batches (successful completions/s); memory is the median slope
+of three fits over 0--100 sandboxes (KiB/sandbox). These rows are exploratory
+until replicated on another host. Details in \S\ref{sec:results}.}
 \label{tab:summary}
-\begin{tabular}{@{}lrrrr@{}}
+\begin{tabularx}{\linewidth}{@{}Xrrrr@{}}
 \toprule
- & kiln & crun & runc & Docker \\
+ & kiln & Docker & Podman & nerdctl \\
 \midrule
-Cold one-shot \code{true}, no network & \textbf{\V{final/kiln-none/p50}} & \V{final/crun-none/p50} & \V{final/runc-none/p50} & \V{final/docker-none/p50} \\
-Cold one-shot \code{true}, network & \textbf{\V{final/kiln-net/p50}} & --- & --- & \V{final/docker-net/p50} \\
-Warm start (exec \code{true}) & \textbf{\V{warm/exec-kiln/p50}} & \V{warm/exec-crun/p50} & \V{warm/exec-runc/p50} & \V{warm/exec-docker/p50} \\
-Memory per idle sandbox (KiB) & \V{idle-run1/fifty/kiln/per}--\V{idle-run2/fifty/kiln/per} & \V{idle-run2/fifty/crun/per}--\V{idle-run1/fifty/crun/per} & \V{idle-run1/fifty/runc/per}--\V{idle-run2/fifty/runc/per} & \V{idle-run1/fifty/docker/per}--\V{idle-run2/fifty/docker/per} \\
-Shared daemons to start, no network & none & none & none & ${\approx}$\V{idle-run1/docker-daemons-pss-mib}\,MiB \\
-User namespace, seccomp, disk quota & all three & none & none & seccomp \\
-Steady-state CPU (\V{steady/cpu/kiln/n} runs) & \multicolumn{4}{c}{no difference observed} \\
-Steady-state I/O & \multicolumn{4}{c}{inconclusive: storage differs} \\
+5\,s idle, no network (ms) & \textbf{\Vone{v2/gap/kiln-none/g5000/session-p50/median}} & \Vone{v2/gap/docker-none/g5000/session-p50/median} & \Vone{v2/gap/podman-crun-none/g5000/session-p50/median} & \Vone{v2/gap/nerdctl-none/g5000/session-p50/median} \\
+5\,s network, all-runtime sweep (ms) & \textbf{\Vone{v2/gap/kiln-net/g5000/session-p50/median}} & \Vone{v2/gap/docker-net/g5000/session-p50/median} & --- & \Vone{v2/gap/nerdctl-net/g5000/session-p50/median} \\
+5\,s network, paired rerun (ms) & \textbf{\Vone{v2/podman-net/gap/kiln-net/g5000/session-p50/median}} & --- & \Vone{v2/podman-net/gap/podman-crun-net/g5000/session-p50/median} & --- \\
+64 clients, no network (/s) & \textbf{\Vone{v2/concurrency/kiln-none/l64/throughput-mean}} & \Vone{v2/concurrency/docker-none/l64/throughput-mean} & \Vone{v2/concurrency/podman-crun-none/l64/throughput-mean} & \Vone{v2/concurrency/nerdctl-none/l64/throughput-mean} \\
+Memory slope (KiB) & \textbf{\Vone{v2/memory/kiln-none/slope-median}} & \Vone{v2/memory/docker-none/slope-median} & \Vone{v2/memory/podman-crun-none/slope-median} & \Vone{v2/memory/nerdctl-none/slope-median} \\
+Shared daemon, no network & none & two & none & containerd \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
 % ---------------------------------------------------------------------------
@@ -162,15 +169,15 @@ command and tearing down.
   \node[box, right=of d4] (d5) {runc};
   \node[box, right=of d5, fill=gray!10] (d6) {container};
   \foreach \a/\b in {d1/d2,d2/d3,d3/d4,d4/d5,d5/d6} \draw[arr] (\a) -- (\b);
-  \node[font=\scriptsize, right=2mm of d6] {Docker \ms{final/docker-none/p50}};
+  \node[font=\scriptsize, right=2mm of d6] {Docker \Vone{v2/gap/docker-none/g5000/session-p50/median}\,ms};
   \node[box, anchor=west] (r1) at (0,-1.35) {runc / crun};
   \node[box, right=of r1, fill=gray!10] (r2) {container};
   \draw[arr] (r1) -- (r2);
-  \node[font=\scriptsize, right=2mm of r2] {runc \ms{final/runc-none/p50}, crun \ms{final/crun-none/p50}};
+  \node[font=\scriptsize, right=2mm of r2] {runc \Vone{v2/gap/runc-none/g5000/session-p50/median}\,ms, crun \Vone{v2/gap/crun-none/g5000/session-p50/median}\,ms};
   \node[box, anchor=west, fill=kiln!12] (k1) at (0,-2.1) {kiln};
   \node[box, right=14mm of k1, fill=kiln!12] (k2) {sandbox, born in its cgroup};
   \draw[arr] (k1) -- node[lab] {\code{clone3}} (k2);
-  \node[font=\scriptsize, right=2mm of k2] {kiln \ms{final/kiln-none/p50}};
+  \node[font=\scriptsize, right=2mm of k2] {kiln \Vone{v2/gap/kiln-none/g5000/session-p50/median}\,ms};
   \node[font=\footnotesize\bfseries, anchor=west] at (0,-2.95) {Next command (\code{exec})};
   \node[box, anchor=west] (e1) at (0,-3.8) {new host process};
   \node[box, right=56mm of e1, fill=gray!10] (e2) {container};
@@ -187,7 +194,8 @@ command and tearing down.
 daemons; runc and crun are single processes. For the next command in an existing
 sandbox, the others start a host process that joins the container from outside;
 kiln asks the sandbox's own PID 1 to fork it. Times are p50 of the one-shot
-and exec benchmarks in \S\ref{sec:results}.}
+5\,s-idle v2 sweep and the legacy exec series in \S\ref{sec:results}; those
+protocols are not directly comparable.}
 \label{fig:paths}
 \end{figure}
 
@@ -198,8 +206,9 @@ and orchestrators, and their costs follow from that (Figure~\ref{fig:paths}).
 over its API, to \code{containerd}, to a per-container shim, and finally to runc,
 which does the actual work. Those layers buy remote management, logging
 drivers, restart policies and a stable API, none of which a sandbox for one tool
-call uses. They show up as start time (\ms{final/docker-none/p50} for Docker
-against \ms{final/runc-none/p50} for runc, which Docker uses underneath, though
+call uses. They show up in the 5\,s-idle one-shot lifecycle
+(\Vone{v2/gap/docker-none/g5000/session-p50/median}\,ms for Docker against
+\Vone{v2/gap/runc-none/g5000/session-p50/median}\,ms for runc, which Docker uses underneath, though
 Docker also prepares an overlay snapshot and a seccomp profile, so the gap is
 not the daemons' alone), as resident
 memory (\code{dockerd} and \code{containerd} together use about
@@ -279,8 +288,8 @@ available as an option; it was not part of the benchmark runs.
 
 \begin{table}[t]
 \centering\small
-\caption{What each runtime sets up in the benchmarks: end-user stacks as
-configured (from \code{docs/benchmarks.md}).}
+\caption{What selected cases set up in the benchmarks. Podman and nerdctl are
+described with the full matrix in \code{docs/benchmarks.md}.}
 \label{tab:setup}
 \begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
 \toprule
@@ -289,7 +298,7 @@ configured (from \code{docs/benchmarks.md}).}
 Path to the kernel & one process & CLI, dockerd, containerd, shim, runc & one process \\
 Root filesystem & overlay on XFS loop device, per-run quota & overlay snapshot on ext4 & unpacked tree on ext4, read-only \\
 Namespaces & PID, mount, UTS, IPC, net, cgroup, \textbf{user} & same, no user ns & same, no user ns \\
-cgroup limits & memory, swap, CPU, PIDs, OOM group kill & memory, CPU, PIDs; swap at Docker's default & memory, swap, CPU, PIDs \\
+cgroup limits & memory, swap, CPU, PIDs, OOM group kill & memory, no swap, CPU, PIDs & memory, swap, CPU, PIDs \\
 Syscall filter & seccomp denylist, \code{no\us{}new\us{}privs} & default seccomp profile & none \\
 PID 1 & kiln-init (signals, reaping) & the command & the command \\
 Network (networked cases) & veth, bridge, nft chain, DNS policy & veth on docker0, iptables NAT & loopback only \\
@@ -301,94 +310,97 @@ Network (networked cases) & veth, bridge, nft chain, DNS policy & veth on docker
 \section{Results}
 \label{sec:results}
 
-\textbf{Method.} Each number is the wall time of one command from a single
-client on an otherwise idle VM, measured with hyperfine without a shell: 10
-warm-up runs, then 100 timed runs, with 100\,ms of idle before each. For a
-one-shot start that time is the whole lifecycle of \code{true}: the runtime's
-setup, the command and teardown, until the CLI exits, with the image already
-local and warm. ``Cold'' in this paper means only that 100\,ms idle gap
-(back-to-back runs reuse warm kernel paths and hide real costs); it does not
-mean cold caches, an image pull, or time-to-ready. Every runtime starts the same
-rootfs contents, the Alpine 3.24.2 minirootfs, with kiln's default limits
-(512\,MiB memory, 1 CPU, 128 PIDs; see \S\ref{sec:fair} on swap). \code{true} is
-an overhead microbenchmark: the time is the runtime's own. All cross-runtime
-numbers come from one fixed-order session on one ARM64 Lima VM on an M2 MacBook
-Air under normal host use: Lima VM (vz, 4 vCPU, 4\,GiB), Ubuntu 24.04, Linux
-6.8.0-146 aarch64; Docker 29.1.3 with runc 1.3.4, runc 1.3.4, crun 1.14.1, kiln
-release build. Percentiles describe one series of 100 serially run samples per
-case: p99 is exploratory, and with no repeated sessions there are no confidence
-intervals.
+\textbf{Method.} The v2 harness times direct argument vectors from immediately
+before \code{Popen} until \code{waitpid}: setup, the command and complete
+teardown until the CLI exits. Output goes to files, not pipes. Each measured
+round runs every case once; seeded randomized Latin squares balance each case's
+position. Ten warm-up rounds precede 100 measured rounds. Five fresh VM boots
+are the replication units, and the 95\% intervals below bootstrap the geometric
+mean of per-boot median ratios. Individual-invocation p95 and p99 values are not
+confidence intervals.
 
-\subsection{Cold one-shot start}
+Every runtime starts the same imported Alpine tree under 512\,MiB memory with
+no swap, 1 CPU and 128 PIDs. The image is already local. \code{true} is an
+overhead microbenchmark: it does no useful work and therefore exposes the
+fixed lifecycle cost. It is not time-to-ready, an image pull, cold caches or
+evidence that application code runs faster. The end-user stack tier is kiln,
+Docker 29.1.3, Podman 4.9.3 and nerdctl 2.4.1/containerd 2.2.1; runc 1.3.4,
+crun 1.14.1 and youki 0.7.0 are a low-level floor handed a prepared OCI bundle;
+gVisor runsc is reported separately because it interposes a userspace kernel.
+
+The host was an M2 MacBook Air under normal use. The guest was a Lima
+\code{vz} VM with 4 vCPUs and 4\,GiB, Ubuntu 24.04 and Linux 6.8 aarch64. Raw
+JSONL, copied configs, executable and rootfs hashes, versions, kernel boot IDs
+and environment manifests accompany every run.
+
+\subsection{Idle time changes the answer}
 
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}
-\begin{axis}[kilnbars, title={No network}, xlabel={ms (p50; whisker to p95)},
-  yticklabels={Docker, runc, crun, kiln}, xmax=115]
-  \addplot+[fill=other, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
-    table[x=p50, y=y, x error=err] {data/cold-none.dat};
-  \addplot+[fill=kiln, restrict y to domain=3:3, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
-    table[x=p50, y=y, x error=err] {data/cold-none.dat};
-  \addplot[only marks, mark=none, nodes near coords, point meta=explicit,
-    nodes near coords style={font=\scriptsize, anchor=west, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
-    table[x=p95, y=y, meta=p50] {data/cold-none.dat};
-\end{axis}
-\end{tikzpicture}\hfill
-\begin{tikzpicture}
-\begin{axis}[kilnbars, title={With network}, xlabel={ms (p50; whisker to p95)},
-  yticklabels={Docker (bridge), kiln (\code{--net full})}, xmax=195, height=30mm]
-  \addplot+[fill=other, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
-    table[x=p50, y=y, x error=err] {data/cold-net.dat};
-  \addplot+[fill=kiln, restrict y to domain=1:1, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
-    table[x=p50, y=y, x error=err] {data/cold-net.dat};
-  \addplot[only marks, mark=none, nodes near coords, point meta=explicit,
-    nodes near coords style={font=\scriptsize, anchor=west, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
-    table[x=p95, y=y, meta=p50] {data/cold-net.dat};
+\begin{axis}[width=0.82\linewidth, height=55mm, ymode=log,
+  symbolic x coords={0,10,100,1000,5000}, xtick=data,
+  xlabel={idle before invocation (ms)}, ylabel={lifecycle p50 (ms, log scale)},
+  ymin=2, ymax=300, tick label style={font=\footnotesize},
+  label style={font=\footnotesize}, ymajorgrids, grid style={gray!20},
+  legend style={font=\scriptsize, at={(0.5,-0.27)}, anchor=north, draw=none,
+    legend columns=5}]
+  \addplot[very thick, kiln, mark=*] table[x=gap, y=kiln] {data/v2-gap-none.dat};
+  \addplot[thick, crunc, mark=square*] table[x=gap, y=crun] {data/v2-gap-none.dat};
+  \addplot[thick, dockerc, mark=triangle*] table[x=gap, y=docker] {data/v2-gap-none.dat};
+  \addplot[thick, before, mark=diamond*] table[x=gap, y=podman] {data/v2-gap-none.dat};
+  \addplot[thick, other, mark=pentagon*] table[x=gap, y=nerdctl] {data/v2-gap-none.dat};
+  \legend{kiln, bare crun, Docker, Podman + crun, nerdctl}
 \end{axis}
 \end{tikzpicture}
-\caption{Cold one-shot \code{true} (setup, command, teardown), 100 runs each
-in one session. runc and crun were measured
-only without a network: their bare configuration has loopback only.}
-\label{fig:cold}
+\caption{One-shot \code{true} across idle gaps, 10 measured runs per point in
+one boot. The 100\,ms point is not a stable ``cold'' state: kiln and crun still
+benefit from recently active kernel and VM paths. This sweep is exploratory,
+not a confidence interval.}
+\label{fig:gap}
 \end{figure}
 
-Without a network, kiln and crun tie: p50 \ms{final/kiln-none/p50} and
-\ms{final/crun-none/p50}, p95 \ms{final/kiln-none/p95} and
-\ms{final/crun-none/p95}, and (exploratory) p99 \ms{final/kiln-none/p99} and
-\ms{final/crun-none/p99}. runc takes \ms{final/runc-none/p50}
-(\V{ratio/runc-none-over-kiln}$\times$) and Docker \ms{final/docker-none/p50}
-(\V{ratio/docker-none-over-kiln}$\times$), Figure~\ref{fig:cold}. With a
-network, kiln takes \ms{final/kiln-net/p50} (p95 \ms{final/kiln-net/p95})
-against Docker's \ms{final/docker-net/p50} (p95 \ms{final/docker-net/p95}),
-\V{ratio/docker-net-over-kiln}$\times$ as long for Docker, while kiln installs a
-per-sandbox firewall chain and DNS policy.
+At zero idle, kiln and crun take
+\Vone{v2/gap/kiln-none/g0/session-p50/median} and
+\Vone{v2/gap/crun-none/g0/session-p50/median}\,ms. At 5\,s they converge again
+at \Vone{v2/gap/kiln-none/g5000/session-p50/median} and
+\Vone{v2/gap/crun-none/g5000/session-p50/median}\,ms, while Docker, Podman with
+crun and nerdctl take \Vone{v2/gap/docker-none/g5000/session-p50/median},
+\Vone{v2/gap/podman-crun-none/g5000/session-p50/median} and
+\Vone{v2/gap/nerdctl-none/g5000/session-p50/median}\,ms. With their normal
+network paths at 5\,s, kiln takes
+\Vone{v2/gap/kiln-net/g5000/session-p50/median}\,ms and Docker
+\Vone{v2/gap/docker-net/g5000/session-p50/median}\,ms. In the separate corrected
+Podman pair, kiln took
+\Vone{v2/podman-net/gap/kiln-net/g5000/session-p50/median}\,ms and Podman
+\Vone{v2/podman-net/gap/podman-crun-net/g5000/session-p50/median}\,ms. These are
+ten-run points from one boot per sweep, so they establish the idle-gap effect
+and approximate scale, not a universal cold-start constant.
 
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}
-\begin{axis}[width=0.62\linewidth, height=52mm, xmode=log, xmin=2, xmax=200,
-  ymin=0, ymax=1, xlabel={ms (log scale)}, ylabel={fraction of runs},
-  tick label style={font=\footnotesize}, label style={font=\footnotesize},
-  legend style={font=\scriptsize, at={(1.03,0.5)}, anchor=west, draw=none}, legend cell align=left,
-  xmajorgrids, ymajorgrids, grid style={gray!20},
-  log ticks with fixed point, xtick={2,5,10,20,50,100,200}]
-  \addplot[const plot, very thick, kiln] table[x=ms, y=frac] {data/cdf-kiln-none.dat};
-  \addplot[const plot, thick, crunc] table[x=ms, y=frac] {data/cdf-crun-none.dat};
-  \addplot[const plot, thick, before] table[x=ms, y=frac] {data/cdf-runc-none.dat};
-  \addplot[const plot, thick, dockerc] table[x=ms, y=frac] {data/cdf-docker-none.dat};
-  \addplot[const plot, very thick, kiln, dashed] table[x=ms, y=frac] {data/cdf-kiln-net.dat};
-  \addplot[const plot, thick, dockerc, dashed] table[x=ms, y=frac] {data/cdf-docker-net.dat};
-  \legend{kiln, crun, runc, Docker, kiln \code{--net full}, Docker bridge}
-\end{axis}
-\end{tikzpicture}
-\caption{Distribution of the cold-start runs. A few runs of the fastest
-runtimes finished in a few milliseconds (\V{final/kiln-none/under6} of 100 for
-kiln, \V{final/crun-none/under6} for crun, under 6\,ms): the 100\,ms pause did
-not always let the system go fully idle. Reported figures are percentiles of
-all 100 runs.}
-\label{fig:cdf}
-\end{figure}
+\subsection{Replicated ratios at a defined 100\,ms gap}
+
+Across five fresh boots, Docker's non-networked lifecycle was
+\Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ kiln's (95\% CI
+\Vone{v2/latency/ratio/docker-none/g100/ci-low}--\Vone{v2/latency/ratio/docker-none/g100/ci-high}$\times$),
+Podman with crun was
+\Vone{v2/latency/ratio/podman-crun-none/g100/geomean}$\times$ and nerdctl was
+\Vone{v2/latency/ratio/nerdctl-none/g100/geomean}$\times$. On the networked
+paths Docker was \Vone{v2/latency-net/ratio/docker-net/g100/geomean}$\times$
+(\Vone{v2/latency-net/ratio/docker-net/g100/ci-low}--\Vone{v2/latency-net/ratio/docker-net/g100/ci-high}$\times$)
+and nerdctl \Vone{v2/latency-net/ratio/nerdctl-net/g100/geomean}$\times$ kiln.
+The corrected Podman network comparison was
+\Vone{v2/podman-net/latency/ratio/podman-crun-net/g100/geomean}$\times$
+(\Vone{v2/podman-net/latency/ratio/podman-crun-net/g100/ci-low}--\Vone{v2/podman-net/latency/ratio/podman-crun-net/g100/ci-high}$\times$).
+
+The low-level floor explains the architecture: crun's ratio was
+\Vtwo{v2/latency/ratio/crun-none/g100/geomean}$\times$ (95\% CI
+\Vtwo{v2/latency/ratio/crun-none/g100/ci-low}--\Vtwo{v2/latency/ratio/crun-none/g100/ci-high}$\times$),
+a small absolute difference that changes with idle state. kiln tracks crun; it
+does not consistently beat it. runc and youki were
+\Vone{v2/latency/ratio/runc-none/g100/geomean}$\times$ and
+\Vone{v2/latency/ratio/youki-none/g100/geomean}$\times$ kiln. runsc was
+\Vone{v2/latency/ratio/runsc-none/g100/geomean}$\times$, but belongs to the
+stronger-isolation tier rather than the shared-kernel product comparison.
 
 \textbf{Where kiln's time went.} Before this work, kiln took
 \ms{final-session-baseline/kiln-none/p50} cold without a network and
@@ -449,7 +461,7 @@ session (\code{bench/results/steps}). Some changes only show in combination;
 \label{fig:steps}
 \end{figure}
 
-\subsection{Warm start: the next command}
+\subsection{Warm start: the next command (legacy series)}
 
 \begin{figure}[H]
 \centering
@@ -465,8 +477,10 @@ session (\code{bench/results/steps}). Some changes only show in combination;
     table[x=p95, y=y, meta=p50] {data/warm.dat};
 \end{axis}
 \end{tikzpicture}
-\caption{Warm start, 100 runs each with 100\,ms idle before each run. kiln: a
-\code{kiln create} sandbox; others: a container running \code{sleep infinity}.}
+\caption{Warm start, 100 runs each with 100\,ms idle before each run. This is
+the earlier one-session fixed-order series, retained because v2 did not repeat
+the exec path. kiln: a \code{kiln create} sandbox; others: a container running
+\code{sleep infinity}.}
 \label{fig:warm}
 \end{figure}
 
@@ -483,45 +497,144 @@ kiln's time. With a network the numbers barely move (kiln
 difference is the path in Figure~\ref{fig:paths}: a fork inside the sandbox
 against a new process joining from outside.
 
-\subsection{Idle overhead}
+\subsection{Concurrency: kiln stays near the crun floor}
 
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}
-\begin{axis}[width=0.6\linewidth, height=45mm, ybar, bar width=8pt, ymin=0, ymax=7600,
-  /pgf/number format/1000 sep={},
-  symbolic x coords={kiln,crun,runc,docker}, xtick=data,
-  xticklabels={kiln, crun, runc, Docker},
-  ylabel={KiB per idle sandbox}, label style={font=\footnotesize}, tick label style={font=\footnotesize},
-  nodes near coords, nodes near coords style={font=\tiny, rotate=90, anchor=west},
-  legend style={font=\scriptsize, at={(0.02,0.97)}, anchor=north west},
-  ymajorgrids, grid style={gray!20}, enlarge x limits=0.18]
-  \addplot[fill=kiln!70, draw=none] table[x=rt, y=run1] {data/idle.dat};
-  \addplot[fill=kiln!30, draw=none] table[x=rt, y=run2] {data/idle.dat};
-  \legend{run 1, run 2}
+\begin{axis}[width=0.75\linewidth, height=52mm, xmode=log, ymode=log,
+  log basis x=2, xmin=1, xmax=64, ymin=3, ymax=1500,
+  xtick={1,4,16,32,64}, xlabel={simultaneous one-shot commands},
+  ylabel={successful completions/s (mean)},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize},
+  xmajorgrids, ymajorgrids, grid style={gray!20},
+  legend style={font=\scriptsize, at={(0.5,-0.27)}, anchor=north, draw=none,
+    legend columns=5}]
+  \addplot[very thick, kiln, mark=*] table[x=level, y=kiln] {data/v2-concurrency.dat};
+  \addplot[thick, crunc, mark=square*] table[x=level, y=crun] {data/v2-concurrency.dat};
+  \addplot[thick, dockerc, mark=triangle*] table[x=level, y=docker] {data/v2-concurrency.dat};
+  \addplot[thick, before, mark=diamond*] table[x=level, y=runc] {data/v2-concurrency.dat};
+  \addplot[thick, other, mark=pentagon*] table[x=level, y=runsc] {data/v2-concurrency.dat};
+  \legend{kiln, crun, Docker, runc, runsc}
 \end{axis}
 \end{tikzpicture}
-\caption{Growth of host memory in use (\code{MemTotal $-$ MemAvailable}, page
-cache dropped) per sandbox when 50 idle sandboxes are started, two runs. Coarse
-(about $\pm$200\,KiB) but clear in order of magnitude. Not shown: Docker's
-daemons, about \V{idle-run1/docker-daemons-pss-mib}\,MiB PSS, paid once.}
+\caption{One exploratory boot, three batches per level. Throughput is
+successful completions divided by batch wall time. Python threads release a
+barrier together, but process starts still spread by 16--20\,ms at level 64.}
+\label{fig:concurrency}
+\end{figure}
+
+At 64 simultaneous non-networked starts, kiln averaged
+\Vone{v2/concurrency/kiln-none/l64/throughput-mean} completions/s and crun
+\Vone{v2/concurrency/crun-none/l64/throughput-mean}; Docker, Podman with crun
+and nerdctl averaged \Vone{v2/concurrency/docker-none/l64/throughput-mean},
+\Vone{v2/concurrency/podman-crun-none/l64/throughput-mean} and
+\Vone{v2/concurrency/nerdctl-none/l64/throughput-mean}. kiln completed every
+invocation, with p50 \Vone{v2/concurrency/kiln-none/l64/latency-p50}\,ms and
+p95 \Vone{v2/concurrency/kiln-none/l64/latency-p95}\,ms. The three kiln batches
+varied widely (\Vone{v2/concurrency/kiln-none/l64/throughput-min}--\Vone{v2/concurrency/kiln-none/l64/throughput-max}
+completions/s), so this establishes a promising saturation profile, not a
+stable capacity number. youki timed out 22 invocations across levels 4--64 and
+is excluded from throughput comparisons. Every other runtime completed all
+commands.
+
+A separate corrected network pair averaged
+\Vone{v2/podman-net/concurrency/kiln-net/l64/throughput-mean} completions/s for
+kiln and
+\Vone{v2/podman-net/concurrency/podman-crun-net/l64/throughput-mean} for Podman
+at 64 clients, again in three batches on one boot. Its first attempt exposed a
+real kiln race: one of 351 invocations failed when an older network namespace
+removed a reused veth between an \code{EEXIST} response and stale-link deletion.
+That entire attempt is preserved but excluded. Commit \code{2cca44a} treats
+only the resulting \code{ENODEV} as already-cleaned state and adds a 160-start
+regression; the fresh-boot replacement completed all 702 paired invocations
+without a failure or timeout.
+
+\subsection{Representative one-shot workloads}
+
+The same four end-user stacks ran six small tool-like commands from one
+identical expanded rootfs, with three fresh-boot sessions per workload. The
+non-networked cases used a 100\,ms gap and 40 measured rounds per session; DNS
+and HTTP used a 1\,s gap and
+15 rounds because they contact public infrastructure. Table~\ref{tab:workloads}
+reports the geometric mean, over boots, of each stack's median divided by
+kiln's. The three-session bootstrap intervals are coarse, and DNS/HTTP include
+resolver and Internet variance.
+
+\begin{table}[H]
+\centering\small
+\caption{End-to-end lifecycle ratio to kiln for representative workloads
+(three fresh-boot sessions per workload; lower is better, kiln $=1.0$).}
+\label{tab:workloads}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Workload & Docker & Podman + crun & nerdctl \\
+\midrule
+Shell + SHA-256 & \Vtwo{v2/workload/shell/ratio/docker-shell/g100/geomean} & \Vtwo{v2/workload/shell/ratio/podman-crun-shell/g100/geomean} & \Vtwo{v2/workload/shell/ratio/nerdctl-shell/g100/geomean} \\
+Python + JSON/SHA-256 & \Vtwo{v2/workload/python/ratio/docker-python/g100/geomean} & \Vtwo{v2/workload/python/ratio/podman-crun-python/g100/geomean} & \Vtwo{v2/workload/python/ratio/nerdctl-python/g100/geomean} \\
+Node + JSON/SHA-256 & \Vtwo{v2/workload/node/ratio/docker-node/g100/geomean} & \Vtwo{v2/workload/node/ratio/podman-crun-node/g100/geomean} & \Vtwo{v2/workload/node/ratio/nerdctl-node/g100/geomean} \\
+Write + hash 4\,MiB & \Vtwo{v2/workload/fs/ratio/docker-fs/g100/geomean} & \Vtwo{v2/workload/fs/ratio/podman-crun-fs/g100/geomean} & \Vtwo{v2/workload/fs/ratio/nerdctl-fs/g100/geomean} \\
+DNS lookup & \Vtwo{v2/workload/dns/ratio/docker-dns/g1000/geomean} & \Vtwo{v2/workload/dns/ratio/podman-crun-dns/g1000/geomean} & \Vtwo{v2/workload/dns/ratio/nerdctl-dns/g1000/geomean} \\
+HTTP GET & \Vtwo{v2/workload/http/ratio/docker-http/g1000/geomean} & \Vtwo{v2/workload/http/ratio/podman-crun-http/g1000/geomean} & \Vtwo{v2/workload/http/ratio/nerdctl-http/g1000/geomean} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The expected amortization is visible: Docker's ratio falls from
+\Vtwo{v2/workload/shell/ratio/docker-shell/g100/geomean}$\times$ for the tiny
+shell command to \Vtwo{v2/workload/python/ratio/docker-python/g100/geomean}$\times$
+for Python, \Vtwo{v2/workload/node/ratio/docker-node/g100/geomean}$\times$ for
+Node and \Vtwo{v2/workload/http/ratio/docker-http/g1000/geomean}$\times$ for
+HTTP. kiln is reducing the fixed cost around the command, not accelerating the
+work itself. The filesystem case still uses different backing storage. DNS was
+the noisiest: Docker's coarse interval was
+\Vtwo{v2/workload/dns/ratio/docker-dns/g1000/ci-low}--\Vtwo{v2/workload/dns/ratio/docker-dns/g1000/ci-high}$\times$,
+so its point estimate should not be read as a precise ranking.
+
+\subsection{Idle memory slope}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.68\linewidth, height=53mm, xbar, xmode=log,
+  xmin=300, xmax=25000, bar width=6pt, ytick=data,
+  yticklabels={kiln, crun, runc, Podman + crun, Docker, nerdctl, runsc},
+  xlabel={KiB per additional idle sandbox (median slope, log scale)},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize},
+  xmajorgrids, grid style={gray!20}, enlarge y limits=0.1]
+  \addplot[fill=kiln!65, draw=none] table[x=median, y=y] {data/v2-memory.dat};
+\end{axis}
+\end{tikzpicture}
+\caption{OLS slope of host memory in use against 0, 10, 25, 50 and 100 idle
+sandboxes. Three randomized fits in one boot; fixed daemon costs land in the
+intercept. The chart shows median slopes.}
 \label{fig:idle}
 \end{figure}
 
-Fifty idle sandboxes grew the host's memory use by \V{idle-run1/fifty/kiln/per}
-and \V{idle-run2/fifty/kiln/per}\,KiB per sandbox for kiln in two runs, against
-\V{idle-run1/fifty/crun/per} and \V{idle-run2/fifty/crun/per} for crun,
-\V{idle-run1/fifty/runc/per} and \V{idle-run2/fifty/runc/per} for runc, and
-\V{idle-run1/fifty/docker/per} and \V{idle-run2/fifty/docker/per} for Docker
-(Figure~\ref{fig:idle}), with a resolution of about $\pm$200\,KiB. This counts kernel objects too: namespaces, mounts,
-page tables and the cgroup. kiln keeps a supervisor per persistent sandbox and
-still lands with crun and runc, which keep none: after start, their container is
-reparented to the host's init and nothing is left to clean up after it or to
-serve exec. Docker needs \code{dockerd} and \code{containerd} running in
-addition, about \V{idle-run1/docker-daemons-pss-mib}\,MiB PSS. kiln has no
-mandatory shared daemon for non-networked starts: kiln-dns, a small fixed
-service (\V{idle-run1/daemon/kiln-dns/pss}\,KiB PSS), serves DNS for networked
-sandboxes, and each persistent sandbox keeps its own shim and PID~1.
+kiln's median slope was \Vone{v2/memory/kiln-none/slope-median}\,KiB per
+sandbox (range \Vone{v2/memory/kiln-none/slope-min}--\Vone{v2/memory/kiln-none/slope-max}),
+against \Vone{v2/memory/docker-none/slope-median}\,KiB for Docker
+(\Vone{v2/memory/ratio/docker-none-over-kiln}$\times$ kiln),
+\Vone{v2/memory/podman-crun-none/slope-median}\,KiB for Podman and
+\Vone{v2/memory/nerdctl-none/slope-median}\,KiB for nerdctl. The v2 host-wide
+fit includes kernel objects and supersedes the earlier two-batch estimate of
+370--379\,KiB. It is still one boot with three fits, not a confidence interval.
+Bare crun and runc used \Vone{v2/memory/crun-none/slope-median} and
+\Vone{v2/memory/runc-none/slope-median}\,KiB; runsc used
+\Vone{v2/memory/runsc-none/slope-median}\,KiB. Docker's shared daemons and
+nerdctl's containerd are fixed costs outside these slopes. kiln has no
+mandatory shared daemon for non-networked starts; kiln-dns is a small fixed
+service for networked sandboxes, and each persistent sandbox keeps its own
+shim and PID~1.
+
+In the separate corrected network pair, kiln's median slope was
+\Vone{v2/podman-net/memory/kiln-net/slope-median}\,KiB (range
+\Vone{v2/podman-net/memory/kiln-net/slope-min}--\Vone{v2/podman-net/memory/kiln-net/slope-max})
+and Podman's was
+\Vone{v2/podman-net/memory/podman-crun-net/slope-median}\,KiB
+(\Vone{v2/podman-net/memory/podman-crun-net/slope-min}--\Vone{v2/podman-net/memory/podman-crun-net/slope-max}).
+The three-fit ranges overlap, so this run does not establish a network-memory
+ranking.
 
 \subsection{Steady state: no CPU difference observed}
 \label{sec:steady}
@@ -559,40 +672,40 @@ I/O-bound & \V{steady/io/kiln/median} (\V{steady/io/kiln/min}--\V{steady/io/kiln
 \begin{itemize}
 \item \textbf{One machine, one VM.} Every number comes from a Lima VM (4 vCPU,
 4\,GiB) on an M2 MacBook Air: aarch64, Linux 6.8, Ubuntu 24.04. The Mac was
-otherwise in normal use, and results from different sessions differ by a few
-milliseconds; tables that compare kiln builds were measured in one session. The
-VM's vCPUs sleep when idle, so cold runs include waking them. Nothing was measured
-on x86-64 or on bare metal, and the benchmarks were run by kiln's author. The
-cross-runtime numbers come from one session, with the cases run in a fixed
-order rather than randomized.
+otherwise in normal use. The primary 100\,ms latency ratios use five fresh boots;
+representative workloads use three. The idle-gap sweep, concurrency and memory
+slope each use one boot and are exploratory. Nothing was measured on x86-64 or
+bare metal, and kiln's author ran the benchmarks.
 \item \textbf{End-user stacks, not components.} Table~\ref{tab:setup} lists
-what each runtime sets up as configured. Docker, bare runc/crun and kiln do
-different work and use different storage paths: kiln does more isolation than
-the bare runc and crun configurations (user namespace, seccomp, overlay with
-quota, an init process), and Docker more management. This does not invalidate
-the product-level comparison, but it prevents attributing a difference to any
-one component. The networked comparison is kiln's nftables policy against Docker's
-iptables NAT; runc and crun had no networked case. Docker was configured with
-\code{ip-forward-no-drop} so its FORWARD policy would not drop kiln's traffic.
-\item \textbf{Limits not strictly equivalent.} Docker received
-\code{--memory 512m} but not \code{--memory-swap 512m}, and the VM's swap state
-was not captured, so equal no-swap limits were not established.
-\item \textbf{Bimodal cold runs.} A few cold runs of kiln and crun completed in
-a few milliseconds (Figure~\ref{fig:cdf}); percentiles over all 100 runs are
-reported, and the p50 is not materially changed by them: excluding kiln's
-sub-6\,ms runs moves its p50 from 13.24 to 13.46\,ms.
-\item \textbf{One series per case.} Each case is 100 serially run samples from
-one session. p95 is shown with every p50; p99 is exploratory, and with no
-repeated sessions there are no confidence intervals.
-\item \textbf{Coarse memory.} Host-wide memory growth is good to about
-$\pm$200\,KiB per sandbox; per-process RSS, PSS and USS for one sandbox are in
-\code{docs/benchmarks.md}. Steady state used \V{steady/cpu/kiln/n} runs per case.
+what each runtime sets up as configured. kiln, Docker, Podman and nerdctl are
+complete user-facing stacks, but their image, overlay, networking, seccomp and
+daemon paths still differ. runc, crun and youki receive a prepared bundle and
+are only a low-level floor. runsc offers stronger isolation. These comparisons
+cannot assign a difference to one component.
+\item \textbf{Matched inputs, not identical work.} v2 imports one rootfs tar into
+each stack and gives every case 512\,MiB memory with no swap, 1 CPU and 128 PIDs.
+kiln additionally creates a user namespace and per-sandbox XFS quota. Storage
+paths differ: kiln uses overlayfs on an XFS loop device; image stacks use their
+configured snapshotters; bare runtimes use the unpacked ext4 tree. The legacy
+warm and optimization series predate v2 and did not give Docker an explicit
+no-swap flag.
+\item \textbf{No universal ``cold'' number.} Figure~\ref{fig:gap} shows that
+latency changes materially between 0, 100 and 1000\,ms idle. The paper therefore
+names the gap with every lifecycle result. The five-boot confidence intervals
+apply to ratios at 100\,ms, not to the one-boot 5\,s values.
+\item \textbf{Sampling limits.} p95 and p99 describe individual invocations.
+Only the five-boot latency campaign has a five-session interval; the workload
+intervals have three sessions and are coarse. Three concurrency batches and
+three memory fits in one boot expose behavior but do not establish host-to-host
+capacity or confidence intervals.
 \item \textbf{An overhead microbenchmark.} \code{true} isolates the runtime's
-cost; it does not demonstrate that agent workloads run faster. A real tool call
-adds its own run time, which was not measured here.
-\item \textbf{Competitors.} Docker 29.1.3, runc 1.3.4 and crun 1.14.1 only.
-Podman, containerd on its own and youki were not measured; gVisor, Firecracker
-and Kata, which isolate more strongly, belong in a separate tier.
+cost. The representative shell, Python, Node, filesystem, DNS and HTTP cases add
+small real workloads, but they remain synthetic one-shot commands. DNS and HTTP
+also include public resolver and Internet variance.
+\item \textbf{Runtime coverage.} The suite measured Docker, Podman with crun and
+runc, nerdctl/containerd, bare runc, crun and youki, and gVisor runsc. The VM
+does not expose \code{/dev/kvm}, so Firecracker and Kata were not runnable; they
+remain a separate stronger-isolation tier for a KVM host.
 \item \textbf{Scope.} kiln has no OCI image or runtime-spec compatibility, runs
 on a single host, and has no orchestrator integration yet. Its isolation is a
 shared-kernel container's: a kernel bug reachable through an allowed syscall is
@@ -605,7 +718,7 @@ still an escape.
 \begin{itemize}
 \item \textbf{Pre-warmed pools.} A daemon that creates sandboxes ahead of time
 and hands one out on request would turn a cold start into an exec:
-\ms{warm/exec-kiln/p50} instead of \ms{final/kiln-none/p50}--\V{final/kiln-net/p50}\,ms.
+\ms{warm/exec-kiln/p50} in the legacy exec series instead of a full lifecycle.
 Networked pool members could have their veth pair and firewall chain prepared
 ahead too. This needs the planned daemon and a policy for pool size.
 \item \textbf{Smaller steps already measured.} Loading libnftables in-process
@@ -618,30 +731,26 @@ warm files) so a session can start from where a previous one left off; the
 overlay's upper layer already records exactly what a session changed.
 \item \textbf{Multiple hosts}: a daemon per node and a Kubernetes operator that
 places sandboxes, with the same per-node design.
-\item \textbf{Next measurements.} Randomized, independent sessions across
-boots, with confidence intervals; concurrency up to saturation; realistic
-workloads (Python and Node start-up, DNS + HTTP) rather than \code{true};
-memory slopes over a range of sandbox counts; matched storage where possible;
-x86-64 and bare metal; Podman, containerd and youki, and gVisor, Firecracker and
-Kata as a separate isolation tier; and a manifest plus raw traces for every
-run, so each number can be reproduced.
+\item \textbf{Next measurements.} Repeat v2 on the intended Mac Mini and on an
+x86-64 bare-metal host; replicate concurrency and memory across boots; match
+the storage and overlay path where possible; add package installation, larger
+images and long-lived exec-heavy agent traces; and run Firecracker and Kata on
+a host that exposes KVM. An independent operator should reproduce at least the
+headline campaign from the committed manifests and raw traces.
 \end{itemize}
 
 % ---------------------------------------------------------------------------
 \section{Conclusion}
 
 A sandbox for agents is judged on the cost around the code: how fast it starts,
-how fast it runs the next command, and what it costs while it waits. On one
-uncontended ARM VM, with the same rootfs contents and each stack as configured,
-kiln's one-shot \code{true} lifecycle matched bare crun's while Docker's took
-\V{ratio/docker-none-over-kiln}$\times$ as long; \code{kiln exec} ran
-\V{ratio/warm-crun-over-kiln}$\times$ faster than crun's and
-\V{ratio/warm-docker-over-kiln}$\times$ faster than Docker's; and an idle
-sandbox cost \V{idle-run1/fifty/kiln/per}--\V{idle-run2/fifty/kiln/per}\,KiB with
-no shared daemon for non-networked starts, all while turning on a user
-namespace, seccomp, a disk quota and an egress policy by default. These are
-overhead measurements: kiln does not make code run faster once started, and the
-next measurements will show how the gap holds under concurrency and real
-workloads.
+how it behaves under many simultaneous calls, and what it costs while it waits.
+On one ARM VM, with identical rootfs contents and randomized case order, kiln
+tracked bare crun's lifecycle floor while remaining far below the tested Docker,
+Podman and nerdctl stacks in lifecycle overhead and marginal idle memory. It did
+so while turning on a user namespace, seccomp and a disk quota by default. The
+result is architectural evidence, not a universal speed claim: idle state
+changes the absolute number, most experiments still need another host, and kiln
+shares the host kernel. The raw records and manifests make those boundaries
+auditable and the next replication straightforward.
 
 \end{document}

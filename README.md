@@ -77,17 +77,22 @@ directory and atomically exchanges it with the installed image.
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal
    (`journalctl -u kiln-dns -f`).
-7. **Cold start** (done): on one uncontended ARM Lima VM, a one-shot
-   `kiln run -- true` (setup, command and teardown, warm local image, 100 ms
-   idle before each run) has a median of 13 ms (22 ms with `--net full`),
-   down from 29 ms (88 ms); bare crun takes 13 ms, runc 34 ms and
-   `docker run --rm` 84 ms (142 ms on its bridge). These are end-user stacks
-   as configured, with the same rootfs contents but different work and
-   storage, and `true` measures overhead, not agent workloads. Most of the old time was
-   spent waiting for RCU grace periods (a `cgroup.procs` move, closing nft
-   sockets, deleting a veth) and starting `ip`, `nsenter` and `nft`. Method,
-   numbers and analysis: [docs/benchmarks.md](docs/benchmarks.md);
-   `KILN_TRACE=1` prints the time of each phase.
+7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
+   show that there is no universal “cold-start” number. After 5 seconds idle,
+   a one-shot `kiln run -- true` lifecycle (setup, command and teardown) was
+   14.9 ms p50, essentially bare crun's 14.8 ms; Docker was 140.9 ms. Across
+   five fresh boots at a defined 100 ms gap, Docker's median lifecycle was
+   25.84× kiln's (95% session-bootstrap interval 23.82–27.82×). `true` is an
+   overhead microbenchmark, and the stacks do different work on different
+   storage paths. Across three boots the Docker/kiln ratio narrowed, as
+   expected, to 4.67× for the Python workload, 3.81× for Node and 2.15× for an
+   HTTP GET. The wider suite covers Docker, Podman, nerdctl/containerd, runc,
+   crun, youki and gVisor, plus concurrency and memory slopes. Most of kiln's
+   original overhead was RCU waits and helper processes. A corrected network
+   concurrency run also found and fixed a veth-reuse race; the failed run is
+   preserved and excluded, and its fresh-boot replacement completed without a
+   failure. Full method, raw-data boundaries and analysis:
+   [docs/benchmarks.md](docs/benchmarks.md); `KILN_TRACE=1` prints each phase.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
    exits with the command's code. The host-side `kiln` survives Ctrl-C and
@@ -265,8 +270,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 
 ### From the first review
 
-Four independent reviewers attacked kiln at `bf66bdf`. What they found, and
-what each fix teaches:
+Four independent model reviewers attacked kiln at `bf66bdf`. This was an
+adversarial engineering review, not a professional security audit. What they
+found, and what each fix teaches:
 
 - **No IPC namespace meant shared System V IPC.** One sandbox created a private
   shared-memory segment; a later sandbox read, changed and deleted it. User

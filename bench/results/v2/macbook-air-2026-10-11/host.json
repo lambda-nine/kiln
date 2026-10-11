@@ -1,0 +1,23 @@
+{
+  "schema": "kiln-bench-host/1",
+  "captured_utc": "2026-10-11T21:49:06Z",
+  "host": {
+    "hardware": "MacBook Air",
+    "model_identifier": "Mac14,15",
+    "chip": "Apple M2",
+    "memory_bytes": 25769803776,
+    "logical_cpu_count": 8,
+    "os": "macOS 27.0.1",
+    "os_build": "26A434"
+  },
+  "vm": {
+    "manager": "Lima 2.2.1",
+    "instance": "kiln",
+    "driver": "vz",
+    "arch": "aarch64",
+    "vcpus": 4,
+    "memory_bytes": 4294967296,
+    "disk_bytes": 42949672960
+  },
+  "privacy": "Serial number and hardware UUID intentionally omitted."
+}

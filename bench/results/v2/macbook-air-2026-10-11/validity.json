@@ -1,0 +1,36 @@
+{
+  "schema": "kiln-bench-validity/1",
+  "excluded": [
+    {
+      "case": "podman-crun-net",
+      "runs": [
+        "boot-*-latency",
+        "gap-sweep",
+        "concurrency",
+        "memory"
+      ],
+      "reason": "Podman's original 10.88.0.0/16 bridge overlapped kiln0, so the network path was not functional.",
+      "replacement": "podman-net-corrected"
+    },
+    {
+      "case": "youki-none",
+      "run": "concurrency",
+      "levels": [4, 16, 32, 64],
+      "reason": "22 invocations timed out at 120 seconds; do not compare its reported throughput."
+    },
+    {
+      "case": "kiln-net",
+      "run": "podman-net-corrected/invalid-concurrency-veth-race",
+      "reason": "One level-16 invocation failed when concurrent namespace teardown removed a reused veth between EEXIST and stale-link deletion.",
+      "replacement": "podman-net-corrected/concurrency",
+      "fixed_in": "2cca44ad89e1bf1d86573204e062d87a8aa83722"
+    }
+  ],
+  "boundaries": [
+    "The 100 ms latency confidence intervals apply to paired session ratios, not absolute cold-start latency.",
+    "The idle-gap sweep, concurrency and memory campaign each use one VM boot.",
+    "Workload confidence intervals use only three boots and are coarse.",
+    "DNS and HTTP include public network and resolver variance.",
+    "runsc is a stronger-isolation tier; Firecracker and Kata were unavailable without /dev/kvm."
+  ]
+}
