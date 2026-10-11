@@ -414,59 +414,94 @@ pub fn ensure_bridge() -> Result<()> {
 /// Repairs base objects in one nft transaction while preserving active
 /// per-sandbox chains and `egress` map elements. Hook chains are replaced only
 /// when their stateless listing differs, so their counters survive normal runs.
+///
+/// Everything is checked from one `nft -s list table` (reading costs about
+/// as much as starting `nft`), and nothing is committed when the ruleset is
+/// already canonical, which is every run but the first after boot. Skipping
+/// the commit matters more than it looks: rewriting the private set deletes
+/// its old elements, and in nf_tables a commit that deletes anything makes
+/// the next close of an nftables netlink socket wait for an RCU grace period
+/// (about 10 ms here; see docs/benchmarks.md).
 fn reconcile_ruleset() -> Result<()> {
-    let mut nft = String::from(
-        "add table inet kiln\n\
-         add set inet kiln private { type ipv4_addr; flags interval; }\n\
-         flush set inet kiln private\n",
-    );
-    nft += &format!("add element inet kiln private {{ {PRIVATE_RANGES} }}\n");
-    nft += "add map inet kiln egress { type ipv4_addr : verdict; }\n";
-    nft += "add counter inet kiln egress_rejected\n";
-    nft += "add set inet kiln connlimit { type ipv4_addr; flags dynamic; }\n";
-    nft += "add counter inet kiln conntrack_rejected\n";
+    let listing = Command::new("nft").args(["-s", "list", "table", "inet", "kiln"]).output()?;
+    let blocks = if listing.status.success() { top_level_blocks(&String::from_utf8_lossy(&listing.stdout)) } else { HashMap::new() };
+
+    let mut nft = String::new();
+    if !private_set_matches(blocks.get("set private")) {
+        nft += "add set inet kiln private { type ipv4_addr; flags interval; }\n\
+                flush set inet kiln private\n";
+        nft += &format!("add element inet kiln private {{ {PRIVATE_RANGES} }}\n");
+    }
+    for (object, decl) in [
+        ("map egress", "{ type ipv4_addr : verdict; }"),
+        ("counter egress_rejected", ""),
+        ("set connlimit", "{ type ipv4_addr; flags dynamic; }"),
+        ("counter conntrack_rejected", ""),
+    ] {
+        if !blocks.contains_key(object) {
+            nft += &format!("add {} {decl}\n", object.replacen(' ', " inet kiln ", 1));
+        }
+    }
     for (name, rules) in [
         ("forward", FORWARD_RULES),
         ("input", INPUT_RULES),
         ("postrouting", POSTROUTING_RULES),
     ] {
-        if chain_matches(name, rules) {
-            continue;
-        }
-        if nft_object_exists("chain", name) {
-            nft += &format!("delete chain inet kiln {name}\n");
+        match blocks.get(&format!("chain {name}")) {
+            Some(body) if body == rules => continue,
+            Some(_) => nft += &format!("delete chain inet kiln {name}\n"),
+            None => {}
         }
         nft += &format!("add chain inet kiln {name} {{ {} }}\n", rules[0]);
         for rule in &rules[1..] {
             nft += &format!("add rule inet kiln {name} {rule}\n");
         }
     }
-    run("nft", &["-f", "-"], Some(&nft))
+    if nft.is_empty() {
+        return Ok(());
+    }
+    run("nft", &["-f", "-"], Some(&format!("add table inet kiln\n{nft}")))
 }
 
-fn nft_object_exists(kind: &str, name: &str) -> bool {
-    Command::new("nft")
-        .args(["list", kind, "inet", "kiln", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// Splits an `nft list table` listing into its top-level objects, keyed by
+/// "chain forward", "set private", ..., each with its trimmed body lines.
+fn top_level_blocks(listing: &str) -> HashMap<String, Vec<String>> {
+    let mut blocks: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current = None;
+    let mut depth = 0;
+    for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if depth == 1 && line.ends_with('{') {
+            let key = line.trim_end_matches('{').trim().to_string();
+            blocks.insert(key.clone(), Vec::new());
+            current = Some(key);
+        } else if depth >= 2
+            && line != "}"
+            && let Some(body) = current.as_ref().and_then(|key| blocks.get_mut(key))
+        {
+            body.push(line.to_string());
+        }
+        depth += line.matches('{').count();
+        depth = depth.saturating_sub(line.matches('}').count());
+    }
+    blocks
 }
 
-fn chain_matches(name: &str, expected: &[&str]) -> bool {
-    let Ok(out) = Command::new("nft").args(["-s", "list", "chain", "inet", "kiln", name]).output() else {
+/// The private set must be an interval set holding exactly PRIVATE_RANGES.
+/// Its elements may be wrapped over several lines.
+fn private_set_matches(body: Option<&Vec<String>>) -> bool {
+    let Some(body) = body else { return false };
+    let text = body.join(" ");
+    let Some(elements) = text.split_once("elements = {").and_then(|(_, rest)| rest.split_once('}')) else {
         return false;
     };
-    if !out.status.success() {
-        return false;
-    }
-    let listing = String::from_utf8_lossy(&out.stdout);
-    let actual: Vec<&str> = listing
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "{" && *line != "}" && !line.starts_with("table ") && !line.starts_with("chain "))
-        .collect();
-    actual == expected
+    let sorted = |items: &str| {
+        let mut v: Vec<String> = items.split(',').map(|i| i.trim().to_string()).collect();
+        v.sort();
+        v
+    };
+    body.first().is_some_and(|l| l == "type ipv4_addr")
+        && body.iter().any(|l| l == "flags interval")
+        && sorted(elements.0) == sorted(PRIVATE_RANGES)
 }
 
 /// Leases the lowest free address. Creating the lease file with O_EXCL is

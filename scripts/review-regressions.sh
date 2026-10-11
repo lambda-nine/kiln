@@ -86,11 +86,13 @@ echo "PASS"
 
 echo "6. Base nftables reconciliation"
 sudo nft add rule inet kiln forward counter accept comment '"review stale rule"'
+sudo nft flush set inet kiln private
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true
 if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
     echo "FAIL: stale base rule survived reconciliation"
     exit 1
 fi
+sudo nft list set inet kiln private | grep -q '192.168.0.0/16' || { echo "FAIL: private set was not restored"; exit 1; }
 echo "PASS"
 
 echo "7. Alpine release signature"

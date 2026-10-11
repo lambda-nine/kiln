@@ -233,7 +233,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 - **The shared firewall is reconciled, not merely detected.** Under the network
   lock, kiln restores the private-address set and replaces any noncanonical
   input, forward or NAT hook chain in one nft transaction. Active sandbox
-  chains and verdict-map entries remain in place.
+  chains and verdict-map entries remain in place. It checks everything from
+  one `nft -s list table` and commits nothing when the ruleset is already
+  canonical, which is every run but the first after boot.
 - **Conntrack is bounded per sandbox IP.** Before egress policy, a dynamic nft
   set rejects new flows once an IP has 256 conntrack entries. The count for an
   IP is reset when a sandbox using it starts or stops, so a new sandbox on a
