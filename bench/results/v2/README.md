@@ -6,6 +6,11 @@ the exact config copied into each run, machine-readable manifests and generated
 JSON/Markdown summaries. `docs/benchmarks.md` is the interpretation; these
 files are the evidence behind it.
 
+For publication, the author's absolute checkout path in each manifest's
+`lima_config.realpath` field was normalized to `$REPO/lima.yaml`. This is a
+privacy-only metadata edit: the recorded config SHA-256, raw measurements,
+commands and all generated statistics are unchanged.
+
 ## Layout
 
 - `boot-01-latency` through `boot-05-latency`: randomized lifecycle latency

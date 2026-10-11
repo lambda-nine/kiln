@@ -21,7 +21,7 @@
     "lima_config": {
       "bytes": 777,
       "path": "lima.yaml",
-      "realpath": "/Users/stephenestrada/Projects/kiln/lima.yaml",
+      "realpath": "$REPO/lima.yaml",
       "sha256": "c153529da462e24ac5050b819452c4ec61bd20cbc243b9f9ea7235de5ad40865"
     },
     "rootfs_tar": {
