@@ -529,10 +529,9 @@ def _identity(run: Run) -> dict[str, Any]:
     }
 
 
-def build_manifest(run: Run) -> dict[str, Any]:
+def _input_fingerprints(run: Run) -> dict[str, Any]:
     cfg = run.config
     executables: dict[str, dict[str, Any]] = {}
-    versions: dict[str, Any] = {}
     for name in run.cases:
         case = cfg.cases[name]
         env = run.env(case)
@@ -544,6 +543,19 @@ def build_manifest(run: Run) -> dict[str, Any]:
                 exe = expand(argv[:1], run.values(id="x", sandbox="x"), case.workload)[0]
                 if exe not in executables:
                     executables[exe] = executable_info(exe, env)
+    return {
+        "vars": cfg.variables,
+        "artifacts": {name: artifact_info(path) for name, path in cfg.artifacts.items()},
+        "executables": executables,
+    }
+
+
+def build_manifest(run: Run) -> dict[str, Any]:
+    cfg = run.config
+    fingerprints = _input_fingerprints(run)
+    versions: dict[str, Any] = {}
+    for name in run.cases:
+        case = cfg.cases[name]
         if case.version_argv:
             argv = expand(case.version_argv, run.values(id=run.new_id("version"), sandbox="x"), case.workload)
             r = invoke(argv, cwd=case.cwd, env=case.env, timeout_s=30, output_limit=cfg.output_limit)
@@ -558,8 +570,7 @@ def build_manifest(run: Run) -> dict[str, Any]:
         **_identity(run),
         "argv": sys.argv,
         "config_path": str(cfg.path),
-        "vars": cfg.variables,
-        "artifacts": {name: artifact_info(path) for name, path in cfg.artifacts.items()},
+        **fingerprints,
         "case_specs": {
             n: {"tier": cfg.cases[n].tier, "capabilities": cfg.cases[n].capabilities,
                 "argv": cfg.cases[n].argv, "workload": cfg.cases[n].workload}
@@ -576,9 +587,9 @@ def build_manifest(run: Run) -> dict[str, Any]:
         "cgroup_mode": run.host.cgroup_mode(),
         "euid": os.geteuid() if hasattr(os, "geteuid") else None,
         "root": is_root(),
-        "executables": executables,
         "versions": versions,
-        "segments": [{"run_id": run.run_id, "started_utc": _utc(now), "argv": sys.argv}],
+        "segments": [{"run_id": run.run_id, "started_utc": _utc(now), "argv": sys.argv,
+                      "input_fingerprints": fingerprints}],
     }
 
 
@@ -597,7 +608,8 @@ def open_run(run: Run) -> None:
         if not manifest_path.exists():
             raise HarnessError(f"--resume: {manifest_path} does not exist")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        mine = _identity(run)
+        fingerprints = _input_fingerprints(run)
+        mine = {**_identity(run), **fingerprints}
         for key, value in mine.items():
             if manifest.get(key) != value:
                 raise HarnessError(
@@ -610,7 +622,8 @@ def open_run(run: Run) -> None:
         run.done = {r[slot_key] for r in read_records(run.out / RECORDS) if r.get("kind") == done_kind}
         manifest.setdefault("segments", []).append(
             {"run_id": run.run_id, "started_utc": _utc(time.time_ns()), "argv": sys.argv,
-             "git": git_info(), "slots_already_done": len(run.done)})
+             "git": git_info(), "slots_already_done": len(run.done),
+             "input_fingerprints": fingerprints})
         _write_json(manifest_path, manifest)
     else:
         if run.out.exists():
@@ -1013,6 +1026,8 @@ def summarize_concurrency(records: list[dict[str, Any]]) -> list[dict[str, Any]]
             "timeouts": sum(b["timeouts"] for b in bs),
             "completions_per_s": describe(tput),
             "batch_wall_ms_p50": percentile([_ms(b["wall_ns"]) for b in bs], 50),
+            "start_spread_ms": describe([_ms(b["start_spread_ns"]) for b in bs
+                                         if b.get("start_spread_ns") is not None]),
             "invocation_ms": describe(ok_ms),
         })
     return rows
@@ -1112,11 +1127,12 @@ def render_markdown(summary: dict[str, Any]) -> str:
         out += ["## Concurrency", "",
                 "Throughput is successful completions per second of batch wall time; latency is per invocation (ms).", "",
                 "| case | level | batches | invocations | failures | completions/s p50 | completions/s mean | "
-                "inv p50 | inv p95 | inv p99 |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                "start spread p50 ms | start spread max ms | inv p50 | inv p95 | inv p99 |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for c in summary["concurrency"]:
             out.append(f"| {c['case']} | {c['level']} | {c['batches']} | {c['invocations']} | {c['failures']} | "
                        f"{_f(c['completions_per_s']['p50'], 1)} | {_f(c['completions_per_s']['mean'], 1)} | "
+                       f"{_f(c['start_spread_ms']['p50'])} | {_f(c['start_spread_ms']['max'])} | "
                        f"{_f(c['invocation_ms']['p50'])} | {_f(c['invocation_ms']['p95'])} | "
                        f"{_f(c['invocation_ms']['p99'])} |")
         out.append("")
@@ -1210,7 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
     lat.add_argument("--warmups", type=_nonneg_int, required=True)
     lat.add_argument("--gap-ms", type=_numbers(float, 0), required=True, help="comma-separated pauses")
 
-    con = sub.add_parser("concurrency", help="batches of simultaneous invocations")
+    con = sub.add_parser("concurrency", help="batches of barrier-released concurrent invocations")
     common(con)
     con.add_argument("--levels", type=_numbers(int, 1), required=True)
     con.add_argument("--batches", type=_nonneg_int, required=True)

@@ -79,7 +79,8 @@ directory and atomically exchanges it with the installed image.
    (`journalctl -u kiln-dns -f`).
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
-   a one-shot `kiln run -- true` lifecycle (setup, command and teardown) was
+   a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous
+   cleanup through CLI exit) was
    14.9 ms p50, essentially bare crun's 14.8 ms; Docker was 140.9 ms. Across
    five fresh boots at a defined 100 ms gap, Docker's median lifecycle was
    25.84× kiln's (95% session-bootstrap interval 23.82–27.82×). `true` is an
@@ -265,8 +266,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   a stale lease only when its run has no cgroup, veth, nft map entry or live
   supervisor. `/run` is a tmpfs, so all leases also vanish on reboot.
 - **DNS inside the sandbox.** systemd-resolved's `127.0.0.53` only exists in the
-  host's namespace, so kiln writes the upstream resolvers into the sandbox's
-  `/etc/resolv.conf` as real root, which makes it read-only for sandbox root.
+  host's namespace. `kiln-dns` reads the host's real upstream resolvers and
+  listens on the bridge; kiln writes only `nameserver 10.88.0.1` into the
+  sandbox's `/etc/resolv.conf` as real root, which makes it read-only for
+  sandbox root.
 
 ### From the first review
 
@@ -380,8 +383,10 @@ found, and what each fix teaches:
 ### From the second review
 
 A separate security-focused model ("Daybreak") reviewed kiln after the
-metrics layer, including the host-side services. All five findings are fixed
-and each was verified with a regression script:
+metrics layer, including the host-side services. All five findings are fixed.
+The regression suite directly exercises the DNS worker bound and inode quota;
+the metrics worker, journal escaping and Grafana password changes were checked
+in their code and service configuration:
 
 - **The DNS forwarder could be made to start unlimited threads.** It spawned
   one per query, so any networked sandbox could exhaust the host's tasks.

@@ -40,14 +40,31 @@ failure: a prior sandbox's namespace teardown removed a reused veth between an
 `EEXIST` response and kiln's explicit stale-link deletion. The failed run is
 preserved under `podman-net-corrected/invalid-concurrency-veth-race/` and is
 excluded from performance claims. Commit `2cca44a` treats only the resulting
-`ENODEV` as already-cleaned state, adds a 160-start regression, and the standard
+`ENODEV` as already-cleaned state, adds a 160-start concurrent stress check, and the standard
 `podman-net-corrected/concurrency/` directory is its fresh-boot replacement.
+
+The first `workload-boot-01-dns` attempt completed without invocation failures,
+but its manifest recorded a dirty worktree (`bench/README.md` and
+`bench/run-v2-podman-net.sh`). It is preserved under
+`workloads/invalid-workload-boot-01-dns-dirty-manifest/`, with its summary in
+`workloads/invalid-summary-dns-dirty-manifest/`, and excluded. DNS boot 01 was
+repeated on a fresh VM boot with a clean manifest. The three published DNS
+sessions therefore still use three distinct clean boot IDs; the replacement's
+kiln median was slower than the excluded attempt.
 
 DNS and HTTP contact `example.com`; they include public resolver, route and
 server variance. runsc is a stronger-isolation tier. Firecracker and Kata were
 not run because this Lima VM had no `/dev/kvm`.
 
 ## Regeneration
+
+The committed records are sufficient to regenerate every v2 summary and v2
+paper value. A byte-for-byte measurement rerun also needs the two rootfs tarballs
+named by SHA-256 in the manifests. They are not stored in Git: the setup
+scripts rebuild matched inputs for a new campaign, but Alpine's
+`latest-stable` release and package indexes can move. Publish the hashed
+tarballs as release artifacts (or replace them with immutable image references)
+before asking an independent operator to repeat this exact campaign.
 
 From the repository root:
 
@@ -60,8 +77,9 @@ python3 -I bench/v2.py summarize \
 cd docs/whitepaper
 python3 -I gen-data.py ../../bench/results data \
   ../../bench/results/v2/macbook-air-2026-10-11
-tectonic kiln-whitepaper.tex
+SOURCE_DATE_EPOCH=0 tectonic kiln-whitepaper.tex
 ```
 
-See [`bench/README.md`](../../README.md) for the record schema, timing boundary,
-schedule, resume rules and complete rerun commands.
+Each run manifest records its exact argv. See
+[`bench/README.md`](../../README.md) for the record schema, timing boundary,
+schedule, resume rules and campaign command templates.

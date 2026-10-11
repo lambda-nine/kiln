@@ -1,4 +1,5 @@
-% kiln: a design paper. Build with `tectonic kiln.tex` in this directory.
+% kiln: a design paper. Build with
+% `SOURCE_DATE_EPOCH=0 tectonic kiln.tex` in this directory.
 \documentclass[10pt,letterpaper]{article}
 
 \usepackage{fontspec}
@@ -784,8 +785,10 @@ not sandboxes.
 For an agent, a sandbox start sits on the critical path of every tool call, so
 start latency was measured and then optimized. \textbf{Method:} the v2 harness
 times a one-shot \code{true} from immediately before process spawn until the
-CLI's \code{waitpid} returns: runtime setup, the command and complete teardown,
-with the image local. Every measured round contains every runtime in seeded,
+CLI's \code{waitpid} returns: runtime setup, the command and synchronous cleanup
+through CLI exit, with the image local. Kernel-deferred destruction, such as a
+veth tied to a dying namespace, can finish after the timer. Every measured
+round contains every runtime in seeded,
 randomized Latin-square order. The primary campaign used 10 warm-up and 100
 measured rounds at a defined 100\,ms idle gap across five fresh VM boots; a
 95\% interval bootstraps the geometric mean of one median ratio per boot. A
@@ -870,8 +873,8 @@ slopes were 1101 and 1471\,KiB per sandbox, with overlapping three-fit ranges
 kiln failure in 351 invocations: a dying network namespace removed a reused
 veth between an \code{EEXIST} response and stale-link deletion. That attempt is
 preserved but excluded. The fix treats only the resulting \code{ENODEV} as
-already-cleaned state, adds a ten-wave 160-start regression, and the fresh-boot
-replacement completed all 702 paired invocations. This is one-boot exploratory
+already-cleaned state, adds a ten-wave 160-start concurrent stress check, and the fresh-boot
+replacement completed all 702 invocations across the pair. This is one-boot exploratory
 evidence, not a capacity or memory-ranking claim.
 
 The stacks still do different work on different storage paths. kiln creates a
@@ -884,7 +887,10 @@ not attribution to one component.
 
 \textbf{What the numbers do not show.} The five-boot intervals apply only to
 ratios at the defined 100\,ms gap. The 5\,s sweep, concurrency and memory fits
-each use one boot and remain exploratory. Representative shell, Python, Node,
+each use one boot and remain exploratory. Concurrency is a barrier-released
+client-load test, not perfectly simultaneous kernel starts: at level 64,
+kiln without networking spread 15.7--20.4\,ms, and the widest original batch
+(Docker with networking) spread 7.87\,s. Representative shell, Python, Node,
 filesystem, DNS and HTTP one-shot workloads used three fresh-boot sessions per
 workload;
 the Docker/kiln ratio narrowed from 21.36$\times$ for the tiny shell command to
@@ -896,7 +902,10 @@ No CPU difference was observed in the seven-run steady-state test; its I/O
 result is inconclusive because storage differed. Firecracker and Kata could not
 run because the VM exposed no \code{/dev/kvm}. Next measurements are a second
 host (the intended Mac Mini), x86-64 bare metal, replicated concurrency and
-memory, matched storage, larger images and KVM-based isolation.
+memory, matched storage, larger images and KVM-based isolation. The committed
+traces reproduce the current analysis; a byte-for-byte measurement rerun also
+needs the rootfs tarballs identified by hash in the manifests, which should be
+published as release artifacts first.
 
 % ---------------------------------------------------------------------------
 \section{Adversarial model review: what it found and taught}
@@ -908,8 +917,9 @@ of breaking isolation. After the metrics layer, a separate security-focused
 model (``Daybreak'') examined the whole system, including the host-side
 services. These rounds were useful engineering review, not a professional
 security audit. The second found five concrete issues and four it rated
-theoretical; all nine are fixed, and each fix has a check in
-\code{scripts/review-regressions.sh}.
+theoretical; all nine are fixed. The focused regression suite exercises the
+sandbox-visible security and lifecycle invariants, while service-only changes
+are also checked in their code and configuration.
 Table~\ref{tab:review} summarizes both rounds by class of issue, not by
 individual reproduction.
 
@@ -1178,8 +1188,9 @@ existing sandbox took 3.5\,ms in an earlier one-session exec benchmark.}
 {Today, each limit was verified by triggering its failure mode on purpose (OOM
 kill, fork bomb, full disk, rejected packet), \code{scripts/metrics-demo.sh}
 exercises the whole stack, and \code{scripts/review-regressions.sh} checks
-each second-review fix, the persistent lifecycle and that no state is left
-behind. It already caught one regression (the inherited conntrack count). Next:
+the sandbox-visible second-review fixes, the persistent lifecycle and that no
+state is left behind. It already caught one regression (the inherited
+conntrack count). Next:
 run it in a VM in CI; turn the first review's findings into tests too; unit-test
 the seccomp program and size parsing; and fuzz the DNS question parser, the one
 piece that parses sandbox-controlled bytes on the host.}

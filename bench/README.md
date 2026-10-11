@@ -142,8 +142,10 @@ readings.
 summary fits an ordinary least-squares line of the growth in used KiB
 (after − before) against the number of sandboxes running, per case and repeat,
 and summarizes the slopes across repeats. The slope is the marginal cost of one
-more sandbox; fixed costs such as dockerd or kiln-dns land in the intercept and
-in `count 0`, not in the slope.
+more sandbox. Daemons that are already running before a point, such as dockerd
+or kiln-dns, cancel in the before/after subtraction; their resident memory is
+outside both the slope and intercept and needs a separate measurement. The
+intercept captures count-independent change and measurement noise.
 
 ## Configuration
 
@@ -195,7 +197,9 @@ an unknown `{name}` is an error when the config loads.
 
 `artifacts` names regular files whose path, size and SHA-256 are copied into
 the manifest. The shipped config records the exact rootfs tar imported by the
-other runtimes and the Lima VM configuration. `tier` and `capabilities` are
+other runtimes and the Lima VM configuration. The manifest identifies those
+files but does not archive them; an exact rerun requires retaining or
+publishing the files separately. `tier` and `capabilities` are
 free-form metadata copied into the manifest: `end-user-stack` for kiln,
 Docker, Podman and nerdctl (a complete
 CLI with images or rootfs management, networking and cleanup), `low-level` for
@@ -279,11 +283,12 @@ Each measuring run writes to a new directory; an existing `--out` is refused.
 ```
 
 **Resuming.** `--resume` reuses an existing directory only if mode, session,
-seed, config SHA-256, selected cases, plan parameters and boot ID all match the
+seed, config SHA-256, effective variables, selected cases, plan parameters,
+boot ID, artifact fingerprints and executable fingerprints all match the
 manifest, and `config.json` matches the config. The schedule is a function of
 the seed, so the harness skips the slots already recorded and runs the rest
 with a new run ID (and therefore new `{id}`s). The manifest gains an entry in
-`segments`.
+`segments`, including that segment's input fingerprints.
 
 **manifest.json**: `schema`, `created_utc`, `argv`, `mode`, `session`,
 `seed`, `params`, `cases`, `case_specs` (tier, capabilities, argv), `vars`,
@@ -295,7 +300,7 @@ SHA-256), `executables` (for every
 command: resolved realpath and SHA-256), `versions` (each case's version
 command: argv, exit code, stdout, stderr; `null` for kiln, which has no
 `--version` and is identified by its binary's SHA-256 and the git commit), and
-`segments`.
+`segments` (each run ID, start time, argv and input fingerprints).
 
 **records.jsonl**: every record has `schema`, `kind`, `mode`, `session`,
 `boot_id` and `run_id`. Records of one command invocation also have

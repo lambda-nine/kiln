@@ -166,7 +166,7 @@ sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
 wait "$first"
 echo "PASS"
 
-echo "11. Concurrent network reuse"
+echo "11. Concurrent network reuse stress"
 wave=0
 failed=0
 while [ "$wave" -lt 10 ]; do
@@ -189,6 +189,15 @@ echo "12. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]
+i=0
+while [ -n "$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'kv*' -print -quit)" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+[ -z "$(find /sys/class/net -mindepth 1 -maxdepth 1 -name 'kv*' -print -quit)" ] || {
+    echo "FAIL: kiln veth remains after cleanup"
+    exit 1
+}
 systemctl is-active --quiet kiln-dns
 systemctl is-active --quiet kiln-metrics
 echo "PASS"

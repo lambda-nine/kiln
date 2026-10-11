@@ -1,0 +1,195 @@
+{
+  "schema": "kiln-bench-v2-config/1",
+  "description": "Representative short tool workloads on one identical Alpine tree with Python and Node installed. DNS and HTTP use each stack's normal network path and are exploratory because they contact public infrastructure.",
+  "vars": {
+    "kiln": "/usr/local/bin/kiln",
+    "image": "kiln-workloads",
+    "podman_image": "localhost/kiln-workloads:latest",
+    "nerdctl_image": "kiln-workloads:latest"
+  },
+  "artifacts": {
+    "workload_rootfs_tar": "/var/lib/kiln-bench/workload-rootfs.tar",
+    "lima_config": "lima.yaml"
+  },
+  "workload": ["true"],
+  "defaults": {
+    "timeout_s": 120,
+    "output_limit_bytes": 4096,
+    "env": {}
+  },
+  "cases": {
+    "kiln-shell": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "none", "workload": "BusyBox shell plus SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "printf '%s\\n' '{\"items\":[3,1,4,1,5]}' | sha256sum >/dev/null"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-shell": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "none", "workload": "BusyBox shell plus SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "printf '%s\\n' '{\"items\":[3,1,4,1,5]}' | sha256sum >/dev/null"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-shell": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "none", "workload": "BusyBox shell plus SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "printf '%s\\n' '{\"items\":[3,1,4,1,5]}' | sha256sum >/dev/null"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-shell": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "none", "workload": "BusyBox shell plus SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "printf '%s\\n' '{\"items\":[3,1,4,1,5]}' | sha256sum >/dev/null"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--net", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    },
+
+    "kiln-python": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "none", "workload": "Python startup, JSON encoding and SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import hashlib,json; b=json.dumps([{'id':i,'ok':i%2==0} for i in range(1000)],separators=(',',':')).encode(); hashlib.sha256(b).hexdigest()"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-python": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "none", "workload": "Python startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import hashlib,json; b=json.dumps([{'id':i,'ok':i%2==0} for i in range(1000)],separators=(',',':')).encode(); hashlib.sha256(b).hexdigest()"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-python": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "none", "workload": "Python startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import hashlib,json; b=json.dumps([{'id':i,'ok':i%2==0} for i in range(1000)],separators=(',',':')).encode(); hashlib.sha256(b).hexdigest()"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-python": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "none", "workload": "Python startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import hashlib,json; b=json.dumps([{'id':i,'ok':i%2==0} for i in range(1000)],separators=(',',':')).encode(); hashlib.sha256(b).hexdigest()"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--net", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    },
+
+    "kiln-node": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "none", "workload": "Node startup, JSON encoding and SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["node", "-e", "const c=require('crypto'); const b=JSON.stringify(Array.from({length:1000},(_,i)=>({id:i,ok:i%2===0}))); c.createHash('sha256').update(b).digest('hex')"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-node": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "none", "workload": "Node startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["node", "-e", "const c=require('crypto'); const b=JSON.stringify(Array.from({length:1000},(_,i)=>({id:i,ok:i%2===0}))); c.createHash('sha256').update(b).digest('hex')"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-node": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "none", "workload": "Node startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["node", "-e", "const c=require('crypto'); const b=JSON.stringify(Array.from({length:1000},(_,i)=>({id:i,ok:i%2===0}))); c.createHash('sha256').update(b).digest('hex')"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-node": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "none", "workload": "Node startup, JSON encoding and SHA-256", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["node", "-e", "const c=require('crypto'); const b=JSON.stringify(Array.from({length:1000},(_,i)=>({id:i,ok:i%2===0}))); c.createHash('sha256').update(b).digest('hex')"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--net", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    },
+
+    "kiln-fs": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "none", "workload": "write and SHA-256 4 MiB", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "dd if=/dev/zero of=/tmp/kiln-bench.bin bs=64K count=64 2>/dev/null && sha256sum /tmp/kiln-bench.bin >/dev/null"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-fs": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "none", "workload": "write and SHA-256 4 MiB", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "dd if=/dev/zero of=/tmp/kiln-bench.bin bs=64K count=64 2>/dev/null && sha256sum /tmp/kiln-bench.bin >/dev/null"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-fs": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "none", "workload": "write and SHA-256 4 MiB", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "dd if=/dev/zero of=/tmp/kiln-bench.bin bs=64K count=64 2>/dev/null && sha256sum /tmp/kiln-bench.bin >/dev/null"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-fs": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "none", "workload": "write and SHA-256 4 MiB", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["sh", "-c", "dd if=/dev/zero of=/tmp/kiln-bench.bin bs=64K count=64 2>/dev/null && sha256sum /tmp/kiln-bench.bin >/dev/null"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--net", "none", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    },
+
+    "kiln-dns": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "full via veth/NAT/kiln-dns", "workload": "Python DNS lookup of example.com", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import socket; socket.getaddrinfo('example.com',80,type=socket.SOCK_STREAM)"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--net", "full", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-dns": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "bridge/NAT", "workload": "Python DNS lookup of example.com", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import socket; socket.getaddrinfo('example.com',80,type=socket.SOCK_STREAM)"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-dns": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "dedicated bridge/NAT (10.89.0.0/24)", "workload": "Python DNS lookup of example.com", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import socket; socket.getaddrinfo('example.com',80,type=socket.SOCK_STREAM)"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "kiln-bench", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-dns": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "CNI bridge/NAT", "workload": "Python DNS lookup of example.com", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import socket; socket.getaddrinfo('example.com',80,type=socket.SOCK_STREAM)"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    },
+
+    "kiln-http": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "kiln", "network": "full via veth/NAT/kiln-dns", "workload": "HTTP GET of example.com via Python", "limits": "512M memory, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://example.com/',timeout=10); r.read(4096); r.close()"],
+      "argv": ["{kiln}", "run", "--image", "workloads", "--net", "full", "--", "{workload}"],
+      "version_argv": null
+    },
+    "docker-http": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Docker", "network": "bridge/NAT", "workload": "HTTP GET of example.com via Python", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://example.com/',timeout=10); r.read(4096); r.close()"],
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"]
+    },
+    "podman-crun-http": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "Podman + crun", "network": "dedicated bridge/NAT (10.89.0.0/24)", "workload": "HTTP GET of example.com via Python", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://example.com/',timeout=10); r.read(4096); r.close()"],
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "kiln-bench", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"]
+    },
+    "nerdctl-http": {
+      "tier": "end-user-stack",
+      "capabilities": {"runtime": "nerdctl + containerd + runc", "network": "CNI bridge/NAT", "workload": "HTTP GET of example.com via Python", "limits": "512m memory and memory+swap, 1 CPU, 128 PIDs"},
+      "workload": ["python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://example.com/',timeout=10); r.read(4096); r.close()"],
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128", "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"]
+    }
+  }
+}

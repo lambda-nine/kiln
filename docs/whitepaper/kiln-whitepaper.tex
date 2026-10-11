@@ -2,7 +2,7 @@
 % data/*.dat, both generated from bench/results:
 %   python3 -I gen-data.py ../../bench/results data \
 %     ../../bench/results/v2/macbook-air-2026-10-11
-%   tectonic kiln-whitepaper.tex
+%   SOURCE_DATE_EPOCH=0 tectonic kiln-whitepaper.tex
 \documentclass[10pt,letterpaper]{article}
 
 \usepackage{fontspec}
@@ -311,8 +311,10 @@ Network (networked cases) & veth, bridge, nft chain, DNS policy & veth on docker
 \label{sec:results}
 
 \textbf{Method.} The v2 harness times direct argument vectors from immediately
-before \code{Popen} until \code{waitpid}: setup, the command and complete
-teardown until the CLI exits. Output goes to files, not pipes. Each measured
+before \code{Popen} until \code{waitpid}: setup, the command and the runtime's
+synchronous cleanup through CLI exit. Kernel-deferred destruction, such as a
+veth tied to a dying namespace, can finish after the timer. Output goes to
+files, not pipes. Each measured
 round runs every case once; seeded randomized Latin squares balance each case's
 position. Ten warm-up rounds precede 100 measured rounds. Five fresh VM boots
 are the replication units, and the 95\% intervals below bootstrap the geometric
@@ -504,7 +506,7 @@ against a new process joining from outside.
 \begin{tikzpicture}
 \begin{axis}[width=0.75\linewidth, height=52mm, xmode=log, ymode=log,
   log basis x=2, xmin=1, xmax=64, ymin=3, ymax=1500,
-  xtick={1,4,16,32,64}, xlabel={simultaneous one-shot commands},
+  xtick={1,4,16,32,64}, xlabel={requested concurrent commands},
   ylabel={successful completions/s (mean)},
   tick label style={font=\footnotesize}, label style={font=\footnotesize},
   xmajorgrids, ymajorgrids, grid style={gray!20},
@@ -520,11 +522,13 @@ against a new process joining from outside.
 \end{tikzpicture}
 \caption{One exploratory boot, three batches per level. Throughput is
 successful completions divided by batch wall time. Python threads release a
-barrier together, but process starts still spread by 16--20\,ms at level 64.}
+barrier together, but starts are not perfectly simultaneous: at level 64,
+kiln without networking spread 15.7--20.4\,ms; all original cases ranged from
+12.3\,ms to 7.87\,s, with the widest spread in one Docker network batch.}
 \label{fig:concurrency}
 \end{figure}
 
-At 64 simultaneous non-networked starts, kiln averaged
+At the requested 64-client non-networked level, kiln averaged
 \Vone{v2/concurrency/kiln-none/l64/throughput-mean} completions/s and crun
 \Vone{v2/concurrency/crun-none/l64/throughput-mean}; Docker, Podman with crun
 and nerdctl averaged \Vone{v2/concurrency/docker-none/l64/throughput-mean},
@@ -547,7 +551,7 @@ real kiln race: one of 351 invocations failed when an older network namespace
 removed a reused veth between an \code{EEXIST} response and stale-link deletion.
 That entire attempt is preserved but excluded. Commit \code{2cca44a} treats
 only the resulting \code{ENODEV} as already-cleaned state and adds a 160-start
-regression; the fresh-boot replacement completed all 702 paired invocations
+concurrent stress check; the fresh-boot replacement completed all 702 invocations across the pair
 without a failure or timeout.
 
 \subsection{Representative one-shot workloads}
@@ -606,8 +610,9 @@ so its point estimate should not be read as a precise ranking.
 \end{axis}
 \end{tikzpicture}
 \caption{OLS slope of host memory in use against 0, 10, 25, 50 and 100 idle
-sandboxes. Three randomized fits in one boot; fixed daemon costs land in the
-intercept. The chart shows median slopes.}
+sandboxes. Three randomized fits in one boot. Pre-existing daemon memory
+cancels in each before/after delta and is outside the fit; the intercept is
+count-independent change and noise. The chart shows median slopes.}
 \label{fig:idle}
 \end{figure}
 
@@ -736,7 +741,9 @@ x86-64 bare-metal host; replicate concurrency and memory across boots; match
 the storage and overlay path where possible; add package installation, larger
 images and long-lived exec-heavy agent traces; and run Firecracker and Kata on
 a host that exposes KVM. An independent operator should reproduce at least the
-headline campaign from the committed manifests and raw traces.
+headline campaign. The committed traces reproduce the current analysis, but a
+byte-for-byte measurement rerun also needs the rootfs tarballs identified by
+hash in the manifests; publish them as release artifacts first.
 \end{itemize}
 
 % ---------------------------------------------------------------------------
@@ -751,6 +758,7 @@ so while turning on a user namespace, seccomp and a disk quota by default. The
 result is architectural evidence, not a universal speed claim: idle state
 changes the absolute number, most experiments still need another host, and kiln
 shares the host kernel. The raw records and manifests make those boundaries
-auditable and the next replication straightforward.
+auditable; exact measurement replication additionally requires the separately
+archived rootfs artifacts named by their hashes.
 
 \end{document}

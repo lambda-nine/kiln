@@ -8,7 +8,7 @@ of that claim with randomized order and raw per-invocation records:
 
 - lifecycle latency across five fresh VM boots;
 - sensitivity to 0, 10, 100, 1000 and 5000 ms of idle;
-- throughput and tail latency from 1 to 64 simultaneous starts;
+- throughput and tail latency under barrier-released client loads from 1 to 64;
 - marginal host memory across 0, 10, 25, 50 and 100 idle sandboxes;
 - six small shell, Python, Node, filesystem, DNS and HTTP workloads, each in
   three fresh-boot sessions.
@@ -35,13 +35,14 @@ The first table compares complete end-user stacks. Every row is from this one
 |---|---:|---:|---:|---:|
 | One-shot `true`, 5 s idle, p50 ms | **14.88** | 140.90 | 109.27 | 147.49 |
 | Ratio to kiln at 100 ms, 5 boots | **1.00×** | 25.84× | 17.49× | 27.64× |
-| 64 simultaneous `true`, mean completions/s | **836.6** | 6.9 | 15.0 | 10.5 |
+| 64-client `true`, mean completions/s | **836.6** | 6.9 | 15.0 | 10.5 |
 | Idle memory, median KiB/sandbox slope | **749** | 5007 | 1203 | 13172 |
 
 The 5-second values are 10-run p50s from one exploratory idle-gap sweep. The
 100 ms ratios are geometric means of per-boot median ratios across five boots.
 Concurrency is three batches in one boot. Memory is the median of three fits in
-one boot. Fixed daemon memory lands in the memory-fit intercept, not its slope.
+one boot. Memory that was resident before a point, including existing daemons,
+cancels in its before/after delta and is outside the fitted slope and intercept.
 
 The runtime-floor and stronger-isolation cases are separate tiers:
 
@@ -62,8 +63,10 @@ a PID 1 and a per-sandbox disk quota.
 
 `bench/v2.py` starts each command directly, without a shell. Its monotonic
 clock begins immediately before `Popen` and stops when `waitpid` returns, so a
-one-shot result includes CLI launch, sandbox setup, `true`, waiting and complete
-teardown. Output goes to temporary files rather than pipes. A watchdog records
+one-shot result includes CLI launch, sandbox setup, `true`, waiting and the
+runtime's synchronous cleanup through CLI exit. Kernel-deferred destruction,
+such as a veth tied to a dying namespace, can finish after the timer. Output
+goes to temporary files rather than pipes. A watchdog records
 and kills timeouts; spawn errors, signals and non-zero exits are records rather
 than reasons to abort the campaign.
 
@@ -190,9 +193,12 @@ divided by batch wall time; latency is per invocation.
 
 The three kiln no-network batches ranged from 296.9 to 1243.2 completions/s,
 and its network batches from 25.3 to 135.1. That variance is why these values
-are exploratory saturation evidence, not capacity promises. Python's barrier
-released all client threads together, but their actual starts spread 16–20 ms
-at level 64. youki timed out 22 invocations across levels 4–64 and was removed
+are exploratory client-load saturation evidence, not capacity promises.
+Python's barrier released all client threads together, but starts were not
+perfectly simultaneous. At level 64, kiln without networking spread 15.7–20.4
+ms; across all original cases the batches ranged from 12.3 ms to 7.87 s, the
+widest being one Docker network batch. youki timed out 22 invocations across
+levels 4–64 and was removed
 from the original campaign's throughput comparison; every other original case
 completed every invocation.
 
@@ -202,8 +208,8 @@ network namespace removed a reused veth after the new run received `EEXIST`
 but before it explicitly deleted the stale link. That entire attempt is stored
 under `podman-net-corrected/invalid-concurrency-veth-race` and excluded. Commit
 `2cca44a` treats only the resulting `ENODEV` as already-cleaned state and adds a
-ten-wave, 160-start regression. The replacement produced all 702 paired
-invocations with zero failures or timeouts. Its three level-64 kiln batches
+ten-wave, 160-start concurrent stress check. The replacement produced all 702 invocations
+across the pair with zero failures or timeouts. Its three level-64 kiln batches
 ranged from 91.6 to 154.0 completions/s, so this remains exploratory.
 
 ### Idle memory
@@ -226,8 +232,11 @@ Median OLS slope across three randomized fits in one boot:
 | Podman + crun, network, corrected | 1471 | 914–1844 |
 
 This measures host-wide `MemTotal - MemAvailable`, including namespaces,
-mounts, page tables, cgroups and per-sandbox processes. Fixed daemons belong to
-the intercept. The new multi-count estimate supersedes the earlier
+mounts, page tables, cgroups and per-sandbox processes. Memory already resident
+before each point—including fixed daemons—cancels in the before/after delta; it
+is outside both the slope and intercept and needs a separate measurement. The
+intercept instead captures count-independent change and noise. The new
+multi-count estimate supersedes the earlier
 370–379 KiB two-batch estimate: kiln is about 0.73 MiB per additional idle
 sandbox, roughly 6.7× below Docker's slope on this run. Network and no-network
 kiln ranges overlap too widely to claim a difference. The corrected network
@@ -304,8 +313,9 @@ bare crun without networking, while the tested Docker CLI stack took about
 
 **What these numbers are.** Each start time is the run-to-completion latency
 of one one-shot command, `true`, from a single client with nothing else
-running in the VM: the runtime's setup, the command and the teardown, until
-the CLI exits. The image is already local and warm (no pull, no unpack),
+running in the VM: the runtime's setup, the command and synchronous cleanup
+through CLI exit. Kernel-deferred cleanup can continue afterward. The image is
+already local and warm (no pull, no unpack),
 10 warmup runs precede the 100 timed ones, and each timed run follows 100 ms
 of idle. That idle gap is all "cold" means here: not cold caches, not an
 image pull, and not time-to-ready. `true` is an overhead microbenchmark: it
@@ -747,8 +757,10 @@ memory slopes, representative workloads, a wider runtime matrix and manifests.
 The highest-value remaining work is:
 
 - **A second machine.** Repeat the headline campaign on the intended Mac Mini,
-  then on x86-64 bare metal. Another operator should reproduce it from the
-  committed scripts without help from the author.
+  then on x86-64 bare metal. Another operator should repeat it without help
+  from the author. The committed raw records reproduce the current analysis,
+  but an exact measurement rerun also needs the rootfs tarballs identified by
+  hash in the manifests; archive them as release artifacts first.
 - **Replicate the exploratory modes.** Run concurrency and memory on several
   fresh boots so their host-level estimates get session confidence intervals.
 - **Matched storage where possible.** Put each runtime over the same filesystem

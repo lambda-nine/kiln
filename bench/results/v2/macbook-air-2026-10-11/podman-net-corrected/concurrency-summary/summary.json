@@ -27,6 +27,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
       "timeouts": 0
     },
     {
@@ -55,6 +63,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 0.662117,
+        "mean": 0.5558823333333333,
+        "min": 0.408194,
+        "p50": 0.597336,
+        "p95": 0.6556388999999999,
+        "p99": 0.66082138
+      },
       "timeouts": 0
     },
     {
@@ -83,6 +99,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 4.493023,
+        "mean": 3.5014686666666663,
+        "min": 2.691957,
+        "p50": 3.319426,
+        "p95": 4.375663299999999,
+        "p99": 4.46955106
+      },
       "timeouts": 0
     },
     {
@@ -111,6 +135,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 10.222532,
+        "mean": 7.953520999999999,
+        "min": 5.16078,
+        "p50": 8.477251,
+        "p95": 10.0480039,
+        "p99": 10.18762638
+      },
       "timeouts": 0
     },
     {
@@ -139,6 +171,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 19.924253,
+        "mean": 14.626671,
+        "min": 10.290559,
+        "p50": 13.665201,
+        "p95": 19.2983478,
+        "p99": 19.79907196
+      },
       "timeouts": 0
     },
     {
@@ -167,6 +207,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
       "timeouts": 0
     },
     {
@@ -195,6 +243,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 0.88601,
+        "mean": 0.506786,
+        "min": 0.273957,
+        "p50": 0.360391,
+        "p95": 0.8334480999999999,
+        "p99": 0.87549762
+      },
       "timeouts": 0
     },
     {
@@ -223,6 +279,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 8.165874,
+        "mean": 5.701308999999999,
+        "min": 3.530506,
+        "p50": 5.407547,
+        "p95": 7.8900413,
+        "p99": 8.11070746
+      },
       "timeouts": 0
     },
     {
@@ -251,6 +315,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 29.095722,
+        "mean": 26.250563999999997,
+        "min": 22.686105,
+        "p50": 26.969865,
+        "p95": 28.883136299999997,
+        "p99": 29.053204859999997
+      },
       "timeouts": 0
     },
     {
@@ -279,6 +351,14 @@
       "sessions": [
         "podman-net-concurrency-fixed"
       ],
+      "start_spread_ms": {
+        "max": 95.787355,
+        "mean": 54.972074666666664,
+        "min": 32.306763,
+        "p50": 36.822106,
+        "p95": 89.8908301,
+        "p99": 94.60805002000001
+      },
       "timeouts": 0
     }
   ],

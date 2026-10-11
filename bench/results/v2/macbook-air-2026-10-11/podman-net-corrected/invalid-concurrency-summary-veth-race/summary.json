@@ -27,6 +27,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
       "timeouts": 0
     },
     {
@@ -55,6 +63,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 0.413657,
+        "mean": 0.25445433333333334,
+        "min": 0.120873,
+        "p50": 0.228833,
+        "p95": 0.3951746,
+        "p99": 0.40996052
+      },
       "timeouts": 0
     },
     {
@@ -83,6 +99,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 4.130849,
+        "mean": 2.745638,
+        "min": 1.956034,
+        "p50": 2.150031,
+        "p95": 3.9327672000000002,
+        "p99": 4.09123264
+      },
       "timeouts": 0
     },
     {
@@ -111,6 +135,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 12.131696,
+        "mean": 7.9975526666666665,
+        "min": 3.609441,
+        "p50": 8.251521,
+        "p95": 11.7436785,
+        "p99": 12.0540925
+      },
       "timeouts": 0
     },
     {
@@ -139,6 +171,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 13.271037,
+        "mean": 10.519443333333333,
+        "min": 9.043226,
+        "p50": 9.244067,
+        "p95": 12.86834,
+        "p99": 13.1904976
+      },
       "timeouts": 0
     },
     {
@@ -167,6 +207,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 0.0,
+        "mean": 0.0,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
       "timeouts": 0
     },
     {
@@ -195,6 +243,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 1.243977,
+        "mean": 0.6178246666666667,
+        "min": 0.213165,
+        "p50": 0.396332,
+        "p95": 1.1592125,
+        "p99": 1.2270241
+      },
       "timeouts": 0
     },
     {
@@ -223,6 +279,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 10.26279,
+        "mean": 7.348229333333333,
+        "min": 3.623957,
+        "p50": 8.157941,
+        "p95": 10.0523051,
+        "p99": 10.22069302
+      },
       "timeouts": 0
     },
     {
@@ -251,6 +315,14 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 24.442171,
+        "mean": 17.170265333333333,
+        "min": 8.605575,
+        "p50": 18.46305,
+        "p95": 23.8442589,
+        "p99": 24.322588579999998
+      },
       "timeouts": 0
     },
     {
@@ -279,11 +351,19 @@
       "sessions": [
         "podman-net-concurrency"
       ],
+      "start_spread_ms": {
+        "max": 107.942501,
+        "mean": 51.92498533333333,
+        "min": 15.819026,
+        "p50": 32.013429,
+        "p95": 100.3495938,
+        "p99": 106.42391955999999
+      },
       "timeouts": 0
     }
   ],
   "inputs": [
-    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/concurrency/records.jsonl"
+    "bench/results/v2/macbook-air-2026-10-11/podman-net-corrected/invalid-concurrency-veth-race/records.jsonl"
   ],
   "latency": {
     "groups": [],

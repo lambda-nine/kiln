@@ -272,9 +272,44 @@ class LatencyRunTest(Tmp):
         manifest = json.loads((out / v2.MANIFEST).read_text())
         self.assertEqual(len(manifest["segments"]), 2)
         self.assertEqual(manifest["segments"][1]["slots_already_done"], 19)
+        self.assertEqual(manifest["segments"][0]["input_fingerprints"]["vars"], {})
+        self.assertEqual(manifest["segments"][1]["input_fingerprints"]["executables"],
+                         manifest["executables"])
+
+        code, err = self.latency(out, "--resume", "--var", "unused=different")
+        self.assertEqual(code, 2)
+        self.assertIn("vars differs", err)
 
         code, _ = self.latency(self.tmp / "fresh", "--resume")
         self.assertEqual(code, 2)
+
+    def test_resume_refuses_changed_executable_or_artifact(self) -> None:
+        tool = self.tmp / "tool"
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+        artifact = self.tmp / "rootfs.tar"
+        artifact.write_bytes(b"rootfs v1")
+        config = write_config(self.tmp / "cfg.json", {"case": {"argv": [str(tool)]}},
+                              artifacts={"rootfs": str(artifact)})
+
+        def run(out: Path, *extra: str) -> tuple[int, str]:
+            return run_main("latency", "--config", str(config), "--out", str(out), "--session", "s1",
+                            "--runs", "1", "--warmups", "0", "--gap-ms", "0", "--seed", "1",
+                            "--proc-root", str(fake_proc(self.tmp)), *extra)
+
+        executable_run = self.tmp / "executable-run"
+        self.assertEqual(run(executable_run)[0], 0)
+        tool.write_text("#!/bin/sh\n# changed\nexit 0\n")
+        code, err = run(executable_run, "--resume")
+        self.assertEqual(code, 2)
+        self.assertIn("executables differs", err)
+
+        artifact_run = self.tmp / "artifact-run"
+        self.assertEqual(run(artifact_run)[0], 0)
+        artifact.write_bytes(b"rootfs v2")
+        code, err = run(artifact_run, "--resume")
+        self.assertEqual(code, 2)
+        self.assertIn("artifacts differs", err)
 
     def test_cli_entry_point(self) -> None:
         out = self.tmp / "cli"
@@ -328,6 +363,7 @@ class ConcurrencyTest(Tmp):
         self.assertEqual(rows[("slow", 4)]["invocations"], 8)
         self.assertEqual(rows[("flaky", 4)]["failures"], sum(b["failures"] for b in flaky if b["level"] == 4))
         self.assertIsNotNone(rows[("slow", 4)]["invocation_ms"]["p95"])
+        self.assertIsNotNone(rows[("slow", 4)]["start_spread_ms"]["max"])
 
 
 class MemoryTest(Tmp):

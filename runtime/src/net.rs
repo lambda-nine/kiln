@@ -331,9 +331,7 @@ impl Network {
             // Namespace teardown can remove the stale pair between the
             // EEXIST acknowledgement above and this delete. In that case the
             // desired cleanup already happened, so proceed to the retry.
-            if let Err(e) = nl.delete_link(&host_if)
-                && e.root_cause().downcast_ref() != Some(&nix::errno::Errno::ENODEV)
-            {
+            if let Err(e) = nl.delete_link(&host_if) && !link_already_gone(&e) {
                 return Err(e);
             }
             nl.add_veth(&host_if, bridge, "eth0", pid.as_raw())?;
@@ -364,6 +362,12 @@ impl Network {
             }
         }
     }
+}
+
+/// True only for the one benign stale-veth race: namespace teardown removed
+/// the link after `add_veth` reported `EEXIST` but before `delete_link` ran.
+fn link_already_gone(error: &anyhow::Error) -> bool {
+    error.root_cause().downcast_ref() == Some(&nix::errno::Errno::ENODEV)
 }
 
 /// Run by kiln-init inside its new network namespace, as real root, before
@@ -688,4 +692,22 @@ fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
         bail!("{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{Context, anyhow};
+    use nix::errno::Errno;
+
+    use super::link_already_gone;
+
+    #[test]
+    fn only_enodev_means_a_stale_link_is_already_gone() {
+        assert!(link_already_gone(&anyhow::Error::new(Errno::ENODEV)));
+        assert!(!link_already_gone(&anyhow::Error::new(Errno::EPERM)));
+        assert!(!link_already_gone(&anyhow!("not a netlink errno")));
+
+        let wrapped = Err::<(), _>(Errno::ENODEV).context("delete kv0007").unwrap_err();
+        assert!(link_already_gone(&wrapped));
+    }
 }

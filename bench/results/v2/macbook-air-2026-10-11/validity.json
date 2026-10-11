@@ -2,7 +2,7 @@
   "schema": "kiln-bench-validity/1",
   "excluded": [
     {
-      "case": "podman-crun-net",
+      "cases": ["podman-crun-net"],
       "runs": [
         "boot-*-latency",
         "gap-sweep",
@@ -13,17 +13,25 @@
       "replacement": "podman-net-corrected"
     },
     {
-      "case": "youki-none",
+      "cases": ["youki-none"],
       "run": "concurrency",
       "levels": [4, 16, 32, 64],
       "reason": "22 invocations timed out at 120 seconds; do not compare its reported throughput."
     },
     {
-      "case": "kiln-net",
+      "cases": ["kiln-net", "podman-crun-net"],
       "run": "podman-net-corrected/invalid-concurrency-veth-race",
       "reason": "One level-16 invocation failed when concurrent namespace teardown removed a reused veth between EEXIST and stale-link deletion.",
       "replacement": "podman-net-corrected/concurrency",
       "fixed_in": "2cca44ad89e1bf1d86573204e062d87a8aa83722"
+    },
+    {
+      "cases": ["kiln-dns", "docker-dns", "podman-crun-dns", "nerdctl-dns"],
+      "run": "workloads/invalid-workload-boot-01-dns-dirty-manifest",
+      "reason": "The completed attempt's manifest recorded a dirty worktree, so it was excluded to keep published workload sessions clean.",
+      "replacement": "workloads/workload-boot-01-dns",
+      "original_boot_id": "3215852f-0053-4717-9cd2-a6e66f0b5a18",
+      "replacement_boot_id": "242accc9-ddae-4f3d-9f45-e8a64260d7e0"
     }
   ],
   "boundaries": [
@@ -31,6 +39,7 @@
     "The idle-gap sweep, concurrency and memory campaign each use one VM boot.",
     "Workload confidence intervals use only three boots and are coarse.",
     "DNS and HTTP include public network and resolver variance.",
+    "The workload session label is an ordinal within each workload; compare manifest boot IDs across workload directories.",
     "runsc is a stronger-isolation tier; Firecracker and Kata were unavailable without /dev/kvm."
   ]
 }

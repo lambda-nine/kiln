@@ -1,0 +1,268 @@
+{
+  "baseline": "kiln-dns",
+  "concurrency": [],
+  "inputs": [
+    "bench/results/v2/macbook-air-2026-10-11/workloads/invalid-workload-boot-01-dns-dirty-manifest/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-02-dns/records.jsonl",
+    "bench/results/v2/macbook-air-2026-10-11/workloads/workload-boot-03-dns/records.jsonl"
+  ],
+  "latency": {
+    "groups": [
+      {
+        "case": "docker-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 227.576238,
+          "mean": 189.57440146666667,
+          "min": 163.2362,
+          "p50": 186.737667,
+          "p95": 223.6304283,
+          "p99": 226.78707605999998
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "docker-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 205.288414,
+          "mean": 177.1461492,
+          "min": 164.234125,
+          "p50": 172.957652,
+          "p95": 196.2038805,
+          "p99": 203.47150729999998
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "docker-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 228.028949,
+          "mean": 195.07742073333333,
+          "min": 158.324499,
+          "p50": 191.984182,
+          "p95": 218.51928870000003,
+          "p99": 226.12701694
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "kiln-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 61.873843,
+          "mean": 46.4126602,
+          "min": 26.169319,
+          "p50": 47.376183,
+          "p95": 60.255802100000004,
+          "p99": 61.55023482
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "kiln-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 34.822897,
+          "mean": 26.254233133333333,
+          "min": 22.720124,
+          "p50": 25.196503,
+          "p95": 32.2980341,
+          "p99": 34.31792442
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "kiln-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 62.398535,
+          "mean": 56.7611796,
+          "min": 24.998883,
+          "p50": 59.748137,
+          "p95": 62.3796182,
+          "p99": 62.39475164
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "nerdctl-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 262.513828,
+          "mean": 246.63426153333333,
+          "min": 224.768686,
+          "p50": 247.58022,
+          "p95": 260.9151869,
+          "p99": 262.19409978
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "nerdctl-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 266.429686,
+          "mean": 230.51653606666665,
+          "min": 215.842345,
+          "p50": 225.847458,
+          "p95": 260.1030111,
+          "p99": 265.16435101999997
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "nerdctl-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 280.880288,
+          "mean": 243.1765168,
+          "min": 195.754271,
+          "p50": 245.685922,
+          "p95": 280.4860193,
+          "p99": 280.80143426
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      },
+      {
+        "case": "podman-crun-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 256.163373,
+          "mean": 238.43634046666665,
+          "min": 196.098885,
+          "p50": 241.098693,
+          "p95": 252.4355748,
+          "p99": 255.41781335999997
+        },
+        "n": 15,
+        "session": "workload-boot-01"
+      },
+      {
+        "case": "podman-crun-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 255.845244,
+          "mean": 211.47262393333332,
+          "min": 193.040307,
+          "p50": 212.956493,
+          "p95": 232.96793570000003,
+          "p99": 251.26978233999998
+        },
+        "n": 15,
+        "session": "workload-boot-02"
+      },
+      {
+        "case": "podman-crun-dns",
+        "failures": 0,
+        "gap_ms": 1000.0,
+        "ms": {
+          "max": 237.674947,
+          "mean": 218.59899320000002,
+          "min": 196.254081,
+          "p50": 216.688879,
+          "p95": 234.7647551,
+          "p99": 237.09290862
+        },
+        "n": 15,
+        "session": "workload-boot-03"
+      }
+    ],
+    "ratios": [
+      {
+        "baseline": "kiln-dns",
+        "case": "docker-dns",
+        "ci95": {
+          "high": 6.864351453850561,
+          "low": 3.2132245730105358,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 4.430004328998553,
+        "max": 6.86435145385056,
+        "median": 3.941593753975494,
+        "min": 3.2132245730105358,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 3.941593753975494,
+          "workload-boot-02": 6.86435145385056,
+          "workload-boot-03": 3.2132245730105358
+        }
+      },
+      {
+        "baseline": "kiln-dns",
+        "case": "nerdctl-dns",
+        "ci95": {
+          "high": 8.963444570065933,
+          "low": 4.112026488792446,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 5.775136309137766,
+        "max": 8.963444570065933,
+        "median": 5.225837210228608,
+        "min": 4.112026488792446,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 5.225837210228608,
+          "workload-boot-02": 8.963444570065933,
+          "workload-boot-03": 4.112026488792446
+        }
+      },
+      {
+        "baseline": "kiln-dns",
+        "case": "podman-crun-dns",
+        "ci95": {
+          "high": 8.451827342865796,
+          "low": 3.6267051975193803,
+          "method": "percentile bootstrap over sessions, 10000 resamples, seed 20261021",
+          "statistic": "geometric mean of per-session median ratios"
+        },
+        "ci_note": "only 3 sessions; the interval is coarse",
+        "gap_ms": 1000.0,
+        "geomean": 5.383101308985035,
+        "max": 8.451827342865794,
+        "median": 5.0890273916748425,
+        "min": 3.6267051975193803,
+        "paired_sessions": 3,
+        "session_median_ratios": {
+          "workload-boot-01": 5.0890273916748425,
+          "workload-boot-02": 8.451827342865794,
+          "workload-boot-03": 3.6267051975193803
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [],
+    "excluded_points": 0,
+    "fits": []
+  },
+  "schema": "kiln-bench-v2/1",
+  "warnings": []
+}
