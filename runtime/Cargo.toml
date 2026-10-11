@@ -2,6 +2,10 @@
 name = "kiln"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A small Linux sandbox runtime for AI agent tools"
+license = "Apache-2.0"
+repository = "https://github.com/stcrestrada/kiln"
 
 [dependencies]
 anyhow = "1.0.104"

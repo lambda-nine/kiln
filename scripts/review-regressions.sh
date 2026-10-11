@@ -126,17 +126,32 @@ echo "9. Persistent sandbox lifecycle"
 persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 16M)
 sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
 [ "$(cat "/sys/fs/cgroup/kiln/$persistent/pids.max")" = 16 ]
-sudo "$KILN" exec "$persistent" -- sh -c 'echo persistent >/workspace/review-state'
-[ "$(sudo "$KILN" exec "$persistent" -- cat /workspace/review-state)" = persistent ]
-if sudo "$KILN" exec "$persistent" -- touch /etc/review-write 2>/dev/null; then
+# kiln exec refuses terminal stdio, so every call redirects all three fds.
+sudo "$KILN" exec "$persistent" -- sh -c 'echo persistent >/workspace/review-state' </dev/null >/dev/null 2>&1
+[ "$(sudo "$KILN" exec "$persistent" -- cat /workspace/review-state </dev/null 2>&1)" = persistent ]
+if sudo "$KILN" exec "$persistent" -- touch /etc/review-write </dev/null >/dev/null 2>&1; then
     echo "FAIL: persistent exec did not inherit Landlock"
     exit 1
 fi
 set +e
-sudo "$KILN" exec "$persistent" -- sh -c 'exit 37'
+sudo "$KILN" exec "$persistent" -- sh -c 'exit 37' </dev/null >/dev/null 2>&1
 code=$?
 set -e
 [ "$code" -eq 37 ] || { echo "FAIL: exec returned $code, expected 37"; exit 1; }
+# With a terminal on stdio, exec must fail before reaching the sandbox.
+set +e
+tty_out=$(timeout 20 script -qec "sudo -n '$KILN' exec $persistent -- touch /workspace/tty-ran" /dev/null </dev/null 2>&1)
+code=$?
+set -e
+[ "$code" -eq 1 ] || { echo "FAIL: exec from a terminal returned $code, expected 1"; exit 1; }
+echo "$tty_out" | grep -q 'interactive (PTY) exec is not implemented' || {
+    echo "FAIL: exec from a terminal did not explain the refusal: $tty_out"
+    exit 1
+}
+if sudo "$KILN" exec "$persistent" -- test -e /workspace/tty-ran </dev/null >/dev/null 2>&1; then
+    echo "FAIL: exec from a terminal ran the command"
+    exit 1
+fi
 sudo "$KILN" rm "$persistent"
 [ ! -e "/var/lib/kiln/runs/$persistent" ]
 

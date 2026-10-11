@@ -59,8 +59,10 @@ pub fn exec(id: &str, cmd: &[String]) -> Result<i32> {
     if payload.len() > MAX_REQUEST {
         bail!("command is too large");
     }
+    let stdio = [0, 1, 2];
+    refuse_terminal_stdio(&stdio)?;
     let mut stream = connect(id)?;
-    send_header(&stream, 1, payload.len() as u32, &[0, 1, 2])?;
+    send_header(&stream, 1, payload.len() as u32, &stdio)?;
     stream.write_all(&payload)?;
     let mut status = [0u8; 4];
     stream
@@ -164,6 +166,33 @@ pub fn receive(stream: &mut UnixStream) -> Result<(u8, Vec<CString>, Vec<OwnedFd
         bail!("trailing request data");
     }
     Ok((op, argv, fds))
+}
+
+/// Whether `fd` is a terminal.
+fn is_terminal(fd: RawFd) -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// The sandbox's command gets these exact descriptors over SCM_RIGHTS. A
+/// terminal among them would hand the sandbox the caller's own tty, outside
+/// any PTY kiln controls, so `kiln exec` only accepts redirected stdio until
+/// it allocates PTYs itself.
+fn refuse_terminal_stdio(fds: &[RawFd]) -> Result<()> {
+    if let Some(&fd) = fds.iter().find(|&&fd| is_terminal(fd)) {
+        let name = match fd {
+            0 => "stdin".to_string(),
+            1 => "stdout".to_string(),
+            2 => "stderr".to_string(),
+            _ => format!("fd {fd}"),
+        };
+        bail!(
+            "{name} is a terminal, and interactive (PTY) exec is not implemented: \
+             redirect all of stdin, stdout and stderr away from the terminal, \
+             e.g. kiln exec ID -- CMD </dev/null >out.log 2>err.log"
+        );
+    }
+    Ok(())
 }
 
 fn connect(id: &str) -> Result<UnixStream> {
@@ -279,4 +308,44 @@ fn recv_header(stream: &UnixStream) -> Result<(u8, u32, Vec<OwnedFd>)> {
         u32::from_ne_bytes(header[4..].try_into().unwrap()),
         fds,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use super::*;
+
+    fn open(path: &str) -> fs::File {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn detects_terminals() {
+        let pty = open("/dev/ptmx");
+        let null = open("/dev/null");
+        let (rx, tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        assert!(is_terminal(pty.as_raw_fd()));
+        assert!(!is_terminal(null.as_raw_fd()));
+        assert!(!is_terminal(rx.as_raw_fd()));
+        assert!(!is_terminal(tx.as_raw_fd()));
+    }
+
+    #[test]
+    fn refuses_any_terminal_stdio() {
+        let pty = open("/dev/ptmx");
+        let null = open("/dev/null");
+        let (pty, null) = (pty.as_raw_fd(), null.as_raw_fd());
+        refuse_terminal_stdio(&[null, null, null]).unwrap();
+        for fds in [[pty, null, null], [null, pty, null], [null, null, pty]] {
+            let err = refuse_terminal_stdio(&fds).unwrap_err().to_string();
+            assert!(err.contains("interactive (PTY) exec is not implemented"), "{err}");
+            assert!(err.contains("redirect all of stdin, stdout and stderr"), "{err}");
+        }
+    }
 }

@@ -26,6 +26,16 @@ const AUDIT_ARCH: u32 = 0xC000_003E;
 const NR: u32 = 0;
 const ARCH: u32 = 4;
 const ARG0_LOW: u32 = 16; // low 32 bits of args[0] (little-endian)
+const ARG1_LOW: u32 = 24; // low 32 bits of args[1]
+
+/// Terminal ioctls denied with EPERM. TIOCSTI pushes bytes into a terminal's
+/// input queue and TIOCLINUX can paste the console selection back as input,
+/// so a sandbox holding the user's terminal could type commands into the
+/// shell that started it. The kernel reads the request as a 32-bit `unsigned
+/// int`, so the low half of args[1] is exactly what it acts on. Same values
+/// on aarch64 and x86_64.
+const TIOCSTI: u32 = 0x5412;
+const TIOCLINUX: u32 = 0x541C;
 
 /// Every CLONE_NEW* flag. Sandbox root holds every capability inside its user
 /// namespace, so without this it could create fresh namespaces and reach
@@ -122,6 +132,17 @@ fn program() -> Vec<sock_filter> {
         p.push(stmt(BPF_RET | BPF_K, errno(Errno::EPERM)));
     }
 
+    // ioctl: deny only the terminal-injection requests; every other ioctl
+    // falls through to the remaining rules.
+    p.extend([
+        jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_ioctl as u32, 0, 5),
+        stmt(BPF_LD | BPF_W | BPF_ABS, ARG1_LOW),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 1, 0),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, TIOCLINUX, 0, 1),
+        stmt(BPF_RET | BPF_K, errno(Errno::EPERM)),
+        stmt(BPF_LD | BPF_W | BPF_ABS, NR), // reload nr for the next check
+    ]);
+
     // clone3 passes its flags in a struct the filter can't read, so make it
     // look unimplemented; libc then falls back to clone, which we can check.
     p.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone3 as u32, 0, 1));
@@ -148,7 +169,10 @@ fn program() -> Vec<sock_filter> {
 /// CAP_SYS_ADMIN) first, so a filtered process can't exec a setuid binary
 /// that would run with the filter but more privilege.
 pub fn install() -> Result<()> {
-    let filter = program();
+    install_filter(&program())
+}
+
+fn install_filter(filter: &[sock_filter]) -> Result<()> {
     let prog = sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
     // SAFETY: prog points at a valid BPF program that outlives the call; the
     // kernel copies it.
@@ -162,4 +186,150 @@ pub fn install() -> Result<()> {
     };
     Errno::result(ret).context("install seccomp filter")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libc::{BPF_JGE, BPF_JSET};
+
+    /// Runs the filter on a `seccomp_data` the way the kernel's classic BPF
+    /// interpreter does, for the handful of opcodes `program` emits.
+    fn eval(nr: i64, args: [u64; 6]) -> u32 {
+        let mut data = Vec::with_capacity(64);
+        data.extend_from_slice(&(nr as i32).to_ne_bytes());
+        data.extend_from_slice(&AUDIT_ARCH.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes()); // instruction pointer
+        for a in args {
+            data.extend_from_slice(&a.to_ne_bytes());
+        }
+        let prog = program();
+        let (mut pc, mut acc) = (0usize, 0u32);
+        loop {
+            let ins = prog[pc];
+            pc += 1;
+            let code = u32::from(ins.code);
+            if code == BPF_LD | BPF_W | BPF_ABS {
+                let at = ins.k as usize;
+                acc = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+            } else if code == BPF_RET | BPF_K {
+                return ins.k;
+            } else {
+                let taken = match code {
+                    c if c == BPF_JMP | BPF_JEQ | BPF_K => acc == ins.k,
+                    c if c == BPF_JMP | BPF_JGE | BPF_K => acc >= ins.k,
+                    c if c == BPF_JMP | BPF_JSET | BPF_K => acc & ins.k != 0,
+                    c => panic!("unexpected BPF opcode {c:#x} at {}", pc - 1),
+                };
+                pc += usize::from(if taken { ins.jt } else { ins.jf });
+            }
+        }
+    }
+
+    fn ioctl(request: u64) -> u32 {
+        eval(libc::SYS_ioctl, [1, request, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn request_values_match_libc() {
+        assert_eq!(u64::from(TIOCSTI), libc::TIOCSTI);
+        assert_eq!(u64::from(TIOCLINUX), libc::TIOCLINUX);
+    }
+
+    #[test]
+    fn denies_terminal_injection_ioctls() {
+        let eperm = errno(Errno::EPERM);
+        assert_eq!(ioctl(TIOCSTI.into()), eperm);
+        assert_eq!(ioctl(TIOCLINUX.into()), eperm);
+        // The kernel truncates the request to 32 bits, so high garbage
+        // must not slip past the filter.
+        assert_eq!(ioctl(0xdead_beef_0000_0000 | u64::from(TIOCSTI)), eperm);
+        assert_eq!(ioctl(0xffff_ffff_0000_0000 | u64::from(TIOCLINUX)), eperm);
+    }
+
+    #[test]
+    fn allows_other_ioctls() {
+        for request in [
+            libc::TCGETS,
+            libc::TCSETS,
+            libc::TIOCGWINSZ,
+            libc::TIOCSWINSZ,
+            libc::FIONREAD,
+            libc::FIONBIO,
+            u64::from(TIOCSTI) + 1,
+            u64::from(TIOCLINUX) - 1,
+            0,
+        ] {
+            assert_eq!(ioctl(request), SECCOMP_RET_ALLOW, "ioctl {request:#x}");
+        }
+        // Requests that equal a syscall number a later rule matches on: the
+        // accumulator must hold nr again, not args[1], when those rules run.
+        let later = [libc::SYS_clone3, libc::SYS_clone, libc::SYS_unshare];
+        for &nr in DENIED.iter().chain(&later) {
+            assert_eq!(ioctl(nr as u64), SECCOMP_RET_ALLOW, "ioctl {nr:#x}");
+        }
+    }
+
+    #[test]
+    fn later_rules_still_see_the_syscall_number() {
+        let eperm = errno(Errno::EPERM);
+        // Another syscall whose args[1] happens to equal TIOCSTI is allowed.
+        assert_eq!(eval(libc::SYS_write, [1, TIOCSTI.into(), 1, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        // Rules after the ioctl check still match on nr, not on args[1].
+        assert_eq!(eval(libc::SYS_clone3, [0; 6]), errno(Errno::ENOSYS));
+        let newuser = libc::CLONE_NEWUSER as u64;
+        assert_eq!(eval(libc::SYS_unshare, [newuser, 0, 0, 0, 0, 0]), eperm);
+        assert_eq!(eval(libc::SYS_unshare, [libc::CLONE_FILES as u64, 0, 0, 0, 0, 0]), SECCOMP_RET_ALLOW);
+        for &nr in DENIED {
+            assert_eq!(eval(nr, [0; 6]), eperm, "syscall {nr}");
+        }
+        assert_eq!(eval(libc::SYS_getpid, [0; 6]), SECCOMP_RET_ALLOW);
+    }
+
+    /// Installs the real filter in a forked child and checks the kernel's
+    /// answers on a pseudo-terminal: TIOCSTI and TIOCLINUX fail with EPERM,
+    /// while an ordinary terminal ioctl still works.
+    #[test]
+    fn kernel_enforces_ioctl_rule() {
+        let prog = program();
+        // SAFETY: the child only makes raw syscalls (no allocation or locks)
+        // before _exit, so forking the multi-threaded test process is fine.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork: {}", std::io::Error::last_os_error()),
+            0 => unsafe {
+                // Exit codes say which step failed.
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(10);
+                }
+                if install_filter(&prog).is_err() {
+                    libc::_exit(11);
+                }
+                let fd = libc::open(c"/dev/ptmx".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                if fd < 0 {
+                    libc::_exit(12);
+                }
+                let c = b'x';
+                if libc::ioctl(fd, libc::TIOCSTI, &c) != -1 || Errno::last() != Errno::EPERM {
+                    libc::_exit(13);
+                }
+                let mut sel = [0u8; 1];
+                if libc::ioctl(fd, libc::TIOCLINUX, sel.as_mut_ptr()) != -1
+                    || Errno::last() != Errno::EPERM
+                {
+                    libc::_exit(14);
+                }
+                let mut ws: libc::winsize = std::mem::zeroed();
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) != 0 {
+                    libc::_exit(15);
+                }
+                libc::_exit(0);
+            },
+            child => {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(libc::WIFEXITED(status), "child status {status:#x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0, "child failed at step");
+            }
+        }
+    }
 }

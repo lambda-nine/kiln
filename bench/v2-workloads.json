@@ -23,7 +23,7 @@
       "capabilities": {"runtime": "kiln", "network": "none", "workload": "BusyBox shell plus SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["sh", "-c", "printf '%s\\n' '{\"items\":[3,1,4,1,5]}' | sha256sum >/dev/null"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-shell": {
       "tier": "end-user-stack",
@@ -52,7 +52,7 @@
       "capabilities": {"runtime": "kiln", "network": "none", "workload": "Python startup, JSON encoding and SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["python3", "-c", "import hashlib,json; b=json.dumps([{'id':i,'ok':i%2==0} for i in range(1000)],separators=(',',':')).encode(); hashlib.sha256(b).hexdigest()"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-python": {
       "tier": "end-user-stack",
@@ -81,7 +81,7 @@
       "capabilities": {"runtime": "kiln", "network": "none", "workload": "Node startup, JSON encoding and SHA-256", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["node", "-e", "const c=require('crypto'); const b=JSON.stringify(Array.from({length:1000},(_,i)=>({id:i,ok:i%2===0}))); c.createHash('sha256').update(b).digest('hex')"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-node": {
       "tier": "end-user-stack",
@@ -110,7 +110,7 @@
       "capabilities": {"runtime": "kiln", "network": "none", "workload": "write and SHA-256 4 MiB", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["sh", "-c", "dd if=/dev/zero of=/tmp/kiln-bench.bin bs=64K count=64 2>/dev/null && sha256sum /tmp/kiln-bench.bin >/dev/null"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-fs": {
       "tier": "end-user-stack",
@@ -139,7 +139,7 @@
       "capabilities": {"runtime": "kiln", "network": "full via veth/NAT/kiln-dns", "workload": "Python DNS lookup of example.com", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["python3", "-c", "import socket; socket.getaddrinfo('example.com',80,type=socket.SOCK_STREAM)"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--net", "full", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-dns": {
       "tier": "end-user-stack",
@@ -168,7 +168,7 @@
       "capabilities": {"runtime": "kiln", "network": "full via veth/NAT/kiln-dns", "workload": "HTTP GET of example.com via Python", "limits": "512M memory, 1 CPU, 128 PIDs"},
       "workload": ["python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://example.com/',timeout=10); r.read(4096); r.close()"],
       "argv": ["{kiln}", "run", "--image", "workloads", "--net", "full", "--", "{workload}"],
-      "version_argv": null
+      "version_argv": ["{kiln}", "--version"]
     },
     "docker-http": {
       "tier": "end-user-stack",

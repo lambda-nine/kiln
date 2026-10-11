@@ -164,7 +164,7 @@ intercept captures count-independent change and measurement noise.
       "argv": ["{kiln}", "run", "--", "{workload}"],
       "cwd": null,
       "env": {},
-      "version_argv": null,
+      "version_argv": ["{kiln}", "--version"],
       "timeout_s": 120,
       "memory": {
         "start_argv": ["{kiln}", "create"],
@@ -298,9 +298,16 @@ governors where available), `memory` (MemTotal, MemAvailable, SwapTotal,
 SwapFree in kB), `cgroup_mode`, `euid`, `root`, `artifacts` (path, size and
 SHA-256), `executables` (for every
 command: resolved realpath and SHA-256), `versions` (each case's version
-command: argv, exit code, stdout, stderr; `null` for kiln, which has no
-`--version` and is identified by its binary's SHA-256 and the git commit), and
+command: argv, exit code, stdout, stderr; `null` for a case without one), and
 `segments` (each run ID, start time, argv and input fingerprints).
+
+kiln builds identify themselves: `kiln --version` prints the package version
+and the commit its build inputs came from, like `kiln 0.1.0 (git
+abcdef123456, clean)`, or `dirty` or `git unknown`. The shipped configs run it
+for every kiln case, so manifests from now on capture that output alongside
+the binary's SHA-256 (`executables`) and the repository commit (`git`).
+Archived results predate `--version` and have `null` there; they identify
+kiln by the binary's SHA-256 and the repository commit alone.
 
 **records.jsonl**: every record has `schema`, `kind`, `mode`, `session`,
 `boot_id` and `run_id`. Records of one command invocation also have

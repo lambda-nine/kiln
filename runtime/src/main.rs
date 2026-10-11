@@ -19,7 +19,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "kiln", about = "A small Linux sandbox runtime for AI agent tools")]
+#[command(
+    name = "kiln",
+    about,
+    // The package version plus the commit build.rs saw, e.g.
+    // "0.1.0 (git abcdef123456, clean)".
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("KILN_GIT"), ")")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -222,4 +228,35 @@ pub fn parse_max(s: &str) -> Result<Option<u64>> {
         return Ok(None);
     }
     Ok(Some(s.parse().with_context(|| format!("invalid number {s:?}"))?))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn about_matches_package_description() {
+        let about = Cli::command().get_about().unwrap().to_string();
+        assert_eq!(about, "A small Linux sandbox runtime for AI agent tools");
+    }
+
+    #[test]
+    fn version_reports_build_commit() {
+        let err = Cli::try_parse_from(["kiln", "--version"]).err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let version = err.to_string();
+        let version = version.trim_end();
+        let rest = version
+            .strip_prefix(concat!("kiln ", env!("CARGO_PKG_VERSION"), " (git "))
+            .and_then(|r| r.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("unexpected version {version:?}"));
+        if rest != "unknown" {
+            let (commit, state) = rest.split_once(", ").unwrap();
+            assert_eq!(commit.len(), 12, "{version:?}");
+            assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{version:?}");
+            assert!(state == "clean" || state == "dirty", "{version:?}");
+        }
+    }
 }
