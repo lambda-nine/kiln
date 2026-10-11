@@ -120,7 +120,8 @@ in `count 0`, not in the slope.
 ```json
 {
   "vars": {"kiln": "/usr/local/bin/kiln"},
-  "artifacts": {"rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar"},
+  "artifacts": {"rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar",
+                "lima_config": "lima.yaml"},
   "workload": ["true"],
   "defaults": {"timeout_s": 120, "output_limit_bytes": 4096, "env": {}},
   "memory": {"settle_s": 2},
@@ -164,8 +165,9 @@ an unknown `{name}` is an error when the config loads.
 
 `artifacts` names regular files whose path, size and SHA-256 are copied into
 the manifest. The shipped config records the exact rootfs tar imported by the
-other runtimes. `tier` and `capabilities` are free-form metadata copied into
-the manifest: `end-user-stack` for kiln, Docker, Podman and nerdctl (a complete
+other runtimes and the Lima VM configuration. `tier` and `capabilities` are
+free-form metadata copied into the manifest: `end-user-stack` for kiln,
+Docker, Podman and nerdctl (a complete
 CLI with images or rootfs management, networking and cleanup), `low-level` for
 runc, crun and youki (an OCI runtime handed a prepared bundle), and
 `strong-isolation` for gVisor/runsc.

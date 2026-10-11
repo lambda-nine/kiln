@@ -10,7 +10,8 @@
     "nerdctl_image": "kiln-alpine:latest"
   },
   "artifacts": {
-    "rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar"
+    "rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar",
+    "lima_config": "lima.yaml"
   },
   "workload": ["true"],
   "defaults": {
