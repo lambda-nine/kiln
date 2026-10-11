@@ -20,6 +20,11 @@ docker import "$BENCH/alpine-rootfs.tar" kiln-alpine >/dev/null
 if command -v podman >/dev/null 2>&1; then
     podman image rm -f localhost/kiln-alpine:latest >/dev/null 2>&1 || true
     podman import "$BENCH/alpine-rootfs.tar" localhost/kiln-alpine:latest >/dev/null
+    # Podman's default 10.88.0.0/16 overlaps kiln0. A container can start on
+    # that bridge while its traffic follows kiln0's route and DNS fails, so
+    # networked benchmark cases use an explicit non-overlapping bridge.
+    podman network rm -f kiln-bench >/dev/null 2>&1 || true
+    podman network create --subnet 10.89.0.0/24 --gateway 10.89.0.1 kiln-bench >/dev/null
 fi
 if command -v nerdctl >/dev/null 2>&1; then
     nerdctl image rm -f kiln-alpine:latest >/dev/null 2>&1 || true

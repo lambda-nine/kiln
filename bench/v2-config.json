@@ -131,7 +131,7 @@
     "podman-crun-net": {
       "tier": "end-user-stack",
       "capabilities": {
-        "network": "Podman bridge (netavark)",
+        "network": "dedicated Podman bridge (netavark, 10.89.0.0/24)",
         "daemon": "none (conmon is per-container)",
         "oci_runtime": "crun",
         "rootfs": "Podman overlayfs image",
@@ -139,12 +139,12 @@
         "seccomp": true,
         "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
       },
-      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}",
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "kiln-bench",
                "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
                "{podman_image}", "{workload}"],
       "version_argv": ["podman", "--version"],
       "memory": {
-        "start_argv": ["podman", "--runtime", "crun", "run", "-d", "--name", "{id}",
+        "start_argv": ["podman", "--runtime", "crun", "run", "-d", "--name", "{id}", "--network", "kiln-bench",
                        "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
                        "{podman_image}", "sleep", "infinity"],
         "sandbox_id_from": "id",

@@ -455,6 +455,28 @@ class ShippedConfigTest(unittest.TestCase):
             start = cfg.cases[n].memory.start_argv
             self.assertEqual(start[start.index("--memory-swap") + 1], "512m")
         self.assertTrue(all(c.memory for c in cfg.cases.values()))
+        podman_net = cfg.cases["podman-crun-net"]
+        self.assertEqual(podman_net.argv[podman_net.argv.index("--network") + 1], "kiln-bench")
+        self.assertEqual(podman_net.memory.start_argv[
+            podman_net.memory.start_argv.index("--network") + 1], "kiln-bench")
+
+    def test_representative_workload_cases(self) -> None:
+        cfg = v2.load_config(BENCH / "v2-workloads.json")
+        runtimes = {"kiln", "docker", "podman-crun", "nerdctl"}
+        workloads = {"shell", "python", "node", "fs", "dns", "http"}
+        self.assertEqual(set(cfg.cases), {
+            f"{runtime}-{workload}"
+            for runtime in runtimes
+            for workload in workloads
+        })
+        self.assertTrue(all(c.tier == "end-user-stack" for c in cfg.cases.values()))
+        self.assertTrue(all(c.memory is None for c in cfg.cases.values()))
+        for name, case in cfg.cases.items():
+            self.assertTrue(case.workload)
+            if name.endswith(("-dns", "-http")):
+                self.assertNotIn("none", case.capabilities["network"])
+            else:
+                self.assertEqual(case.capabilities["network"], "none")
 
 
 if __name__ == "__main__":

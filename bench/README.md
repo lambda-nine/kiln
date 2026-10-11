@@ -42,6 +42,23 @@ python3 -I bench/v2.py summarize bench/results/v2/boot*-latency \
     --out bench/results/v2/summary --baseline kiln-none
 ```
 
+For the representative workload campaign, first build one expanded rootfs and
+import those exact bytes into every end-user stack, then launch the campaign
+from the macOS host:
+
+```sh
+limactl shell --workdir "$PWD" kiln -- sudo bench/setup-workloads.sh
+bench/run-v2-workloads.sh bench/results/v2/workloads
+```
+
+[`v2-workloads.json`](v2-workloads.json) covers a short shell pipeline, Python
+and Node startup plus JSON/SHA-256 work, a 4 MiB filesystem write and hash, a
+DNS lookup, and an HTTP GET. The first four run without a network; DNS and HTTP
+use each stack's normal network path. The campaign uses three fresh VM boots by
+default and writes a separate paired summary for each workload. DNS and HTTP
+contact `example.com`, so their results are exploratory and include public
+network and resolver variance; they are not a pure runtime benchmark.
+
 `--case REGEX` selects cases by `re.search` on their names. `--var NAME=VALUE`
 overrides a config variable (`kiln`, `bundle`, `idle_bundle`, `image`).
 Failed invocations never stop a run: each one is recorded with its exit code,
@@ -195,7 +212,9 @@ what each case does:
   overlay; Docker has seccomp and an overlay but no user namespace by default.
   The `capabilities` metadata lists what each case does.
 - **Networking.** `-none` cases have no network; the `-net` end-user cases set
-  up their configured bridge/NAT path. Compare `-net` with `-net`.
+  up their configured bridge/NAT path. Podman uses the dedicated `kiln-bench`
+  bridge at `10.89.0.0/24`, because its default `10.88.0.0/16` overlaps
+  kiln's bridge. Compare `-net` with `-net`.
 - **Harness overhead.** Python's spawn cost is in every number. It's small
   next to a container lifecycle and the same for every case, but it's there.
 - **Concurrency start spread.** Commands in a batch start within
