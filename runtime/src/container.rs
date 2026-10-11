@@ -21,6 +21,7 @@ use crate::net;
 use crate::seccomp;
 use crate::storage;
 use crate::quota;
+use crate::trace;
 use crate::userns;
 
 const STACK_SIZE: usize = 1024 * 1024;
@@ -78,7 +79,9 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
 
     let id = run_id();
+    trace::mark("host: check image");
     storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
+    trace::mark("host: storage::prepare");
     let run_dir = run_dir(&id);
     let layers = Layers {
         lower,
@@ -98,6 +101,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     } else if let Err(e) = fs::remove_dir_all(&run_dir) {
         eprintln!("kiln: failed to remove {}: {e}", run_dir.display());
     }
+    trace::mark("host: remove run dir");
     result
 }
 
@@ -153,12 +157,14 @@ fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     // The quota goes on the run dir while it's still empty, so upper/ and
     // work/ (and everything the sandbox writes) inherit its project.
     quota::limit(run_dir, cfg.disk)?;
+    trace::mark("host: disk quota");
     for dir in [&layers.upper, &layers.work, &layers.merged] {
         fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     // The sandbox's "/" takes its owner from upper/, so hand it to sandbox root.
     let id = Some(userns::ID_BASE);
     chown(&layers.upper, id, id).context("chown upper")?;
+    trace::mark("host: overlay dirs");
     Ok(())
 }
 
@@ -169,6 +175,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
 fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     listener: Option<UnixListener>, ready: Option<&OwnedFd>) -> Result<i32> {
     let cgroup = Cgroup::create(id, &cfg.limits)?;
+    trace::mark("host: cgroup");
     let persistent = listener.is_some();
 
     // Two one-byte handshakes over a pair of pipes. Parent → child: "you're in
@@ -216,6 +223,7 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     // Our copy of the child's write end must go, or we'd never see EOF if the
     // child dies before writing.
     drop(to_parent_tx);
+    trace::mark("host: clone");
 
     let mut network = None;
     let setup = (|| -> Result<()> {
@@ -223,8 +231,10 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         // go. Doing this from the parent avoids a race where the command
         // starts before its limits apply.
         cgroup.add(pid)?;
+        trace::mark("host: join cgroup");
         // Plug its network namespace in from the outside, same reasoning.
         network = net::setup(pid, id, &cfg.net)?;
+        trace::mark("host: network");
         write(&to_child_tx, b"1").context("signal child")?;
 
         // The child does its mounts as real root, then creates its user
@@ -233,8 +243,10 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         if read(&to_parent_rx, &mut buf).context("wait for child")? == 0 {
             return Ok(()); // Child failed and printed why; wait_for collects it.
         }
+        trace::mark("host: wait for child's mounts");
         userns::write_maps(pid)?;
         write(&to_child_tx, b"1").context("signal child")?;
+        trace::mark("host: ID maps");
         if persistent && read(&to_parent_rx, &mut buf).context("wait for persistent init")? == 0 {
             return Ok(());
         }
@@ -252,6 +264,7 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     }
 
     let code = wait_for(pid, &signals)?;
+    trace::mark("host: sandbox exited");
     if cgroup.stat("memory.events", "oom_kill") > 0 {
         eprintln!("kiln: sandbox ran out of memory and was killed (memory.max)");
     }
@@ -261,6 +274,12 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
             eprintln!("kiln: ip {} | egress packets rejected {}", n.ip(), n.blocked_packets());
         }
     }
+    // Explicit drops (in reverse creation order, as Rust would) so each
+    // teardown step shows up in KILN_TRACE.
+    drop(network);
+    trace::mark("host: network cleanup");
+    drop(cgroup);
+    trace::mark("host: cgroup cleanup");
     Ok(code)
 }
 
@@ -310,6 +329,7 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
 
     // Wait for the parent to put us in our cgroup.
     wait_for_parent(from_parent)?;
+    trace::mark("init: released by parent");
 
     // A cgroup namespace makes our current cgroup look like the root, so the
     // sandbox sees /sys/fs/cgroup as just its own limits and nothing above.
@@ -333,9 +353,11 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     );
     mount(Some("overlay"), &layers.merged, Some("overlay"), MsFlags::empty(), Some(opts.as_str()))
         .context("mount overlay")?;
+    trace::mark("init: cgroup ns, hostname, overlay");
 
     // Device files must be bind-mounted from the host before we lose sight of it.
     setup_dev(&layers.merged.join("dev"))?;
+    trace::mark("init: /dev");
 
     // Swap roots. pivot_root(".", ".") stacks the old root on top of the new
     // one at "/"; detaching "." then removes the old root, leaving no path
@@ -344,6 +366,7 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     pivot_root(".", ".").context("pivot_root")?;
     umount2(".", MntFlags::MNT_DETACH).context("detach old root")?;
     chdir("/").context("chdir /")?;
+    trace::mark("init: pivot_root");
 
     // /proc reflects the PID namespace of whoever mounted it. Mount a fresh
     // one so `ps` inside the sandbox only sees the sandbox's processes.
@@ -381,7 +404,9 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
     // Last step as real root. Every namespace above was created first, so it
     // stays owned by the host's user namespace and sandbox root gets no power
     // over it: no mounting, unmounting or changing the hostname.
+    trace::mark("init: /proc, sysctls, cgroupfs");
     unshare(CloneFlags::CLONE_NEWUSER).context("unshare user namespace")?;
+    trace::mark("init: user namespace");
     write(to_parent, b"1").context("signal parent")?;
     wait_for_parent(from_parent)?;
     userns::become_root()?;
@@ -411,6 +436,7 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         landlock::restrict_writes(&cfg.writable)?;
     }
     seccomp::install()?;
+    trace::mark("init: credentials, env, seccomp");
 
     if let Some(listener) = listener {
         write(to_parent, b"1").context("signal persistent init ready")?;

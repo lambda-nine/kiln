@@ -24,6 +24,8 @@ use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Pid;
 
+use crate::trace;
+
 const BRIDGE: &str = "kiln0";
 const NETWORK: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 0);
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
@@ -298,11 +300,13 @@ pub fn setup(pid: Pid, run_id: &str, plan: &Plan) -> Result<Option<Network>> {
         None
     } else {
         ensure_bridge()?;
+        trace::mark("host: net: bridge and base ruleset");
         let forwarder = SocketAddr::from((GATEWAY, 53));
         if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
             eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
         }
         let network = lease(run_id)?;
+        trace::mark("host: net: DNS check and lease");
         let policy_file = dns_policy_path(network.ip);
         fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
         fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
@@ -320,6 +324,7 @@ pub fn setup(pid: Pid, run_id: &str, plan: &Plan) -> Result<Option<Network>> {
             )),
         )
         .context("create veth pair")?;
+        trace::mark("host: net: veth pair");
 
         inside.push_str(&format!(
             "addr add {ip}/{PREFIX} dev eth0\n\
@@ -328,6 +333,7 @@ pub fn setup(pid: Pid, run_id: &str, plan: &Plan) -> Result<Option<Network>> {
         ));
 
         run("nft", &["-f", "-"], Some(&policy(&network, plan))).context("apply egress policy")?;
+        trace::mark("host: net: egress policy");
         Some(network)
     };
 

@@ -46,6 +46,7 @@ pub fn run(argv: &[CString]) -> Result<i32> {
             match all.wait().context("sigwait")? {
                 Signal::SIGCHLD => {
                     if let Some(code) = reap(child)? {
+                        crate::trace::mark("init: command exited");
                         return Ok(code);
                     }
                 }

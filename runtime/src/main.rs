@@ -9,6 +9,7 @@ mod persistent;
 mod quota;
 mod seccomp;
 mod storage;
+mod trace;
 mod userns;
 
 use std::path::PathBuf;
@@ -126,6 +127,7 @@ struct CreateArgs {
 }
 
 fn main() -> Result<()> {
+    trace::start();
     match Cli::parse().command {
         Command::Run(args) => {
             validate_writable(&args.writable)?;

@@ -29,6 +29,7 @@ sudo target/debug/kiln exec "$id" -- cat /workspace/message
 sudo target/debug/kiln ls
 sudo target/debug/kiln rm "$id"
 sudo target/debug/kiln gc                 # clean state from crashed shims
+sudo KILN_TRACE=1 target/debug/kiln run -- true  # time each startup phase
 sudo kiln stats                          # running sandboxes, like docker stats
 sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 ```
