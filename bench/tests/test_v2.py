@@ -431,15 +431,24 @@ class SummaryTest(Tmp):
 class ShippedConfigTest(unittest.TestCase):
     def test_current_cases(self) -> None:
         cfg = v2.load_config(BENCH / "v2-config.json")
-        self.assertEqual(set(cfg.cases), {"kiln-none", "kiln-net", "docker-none", "docker-net", "runc-none", "crun-none"})
+        self.assertEqual(set(cfg.cases), {
+            "kiln-none", "kiln-net", "docker-none", "docker-net",
+            "podman-crun-none", "podman-crun-net", "podman-runc-none",
+            "nerdctl-none", "nerdctl-net", "runc-none", "crun-none",
+            "youki-none", "runsc-none",
+        })
         tiers = {n: c.tier for n, c in cfg.cases.items()}
-        for n in ("kiln-none", "kiln-net", "docker-none", "docker-net"):
+        for n in ("kiln-none", "kiln-net", "docker-none", "docker-net",
+                  "podman-crun-none", "podman-crun-net", "podman-runc-none",
+                  "nerdctl-none", "nerdctl-net"):
             self.assertEqual(tiers[n], "end-user-stack")
-        for n in ("runc-none", "crun-none"):
+        for n in ("runc-none", "crun-none", "youki-none"):
             self.assertEqual(tiers[n], "low-level")
             self.assertIn("{id}", cfg.cases[n].argv)
             self.assertIsNotNone(cfg.cases[n].memory)
-        for n in ("docker-none", "docker-net"):
+        self.assertEqual(tiers["runsc-none"], "strong-isolation")
+        for n in ("docker-none", "docker-net", "podman-crun-none", "podman-crun-net",
+                  "podman-runc-none", "nerdctl-none", "nerdctl-net"):
             argv = cfg.cases[n].argv
             self.assertEqual(argv[argv.index("--memory-swap") + 1], "512m")
             self.assertEqual(argv[argv.index("--memory") + 1], "512m")

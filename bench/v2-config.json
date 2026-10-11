@@ -1,11 +1,13 @@
 {
   "schema": "kiln-bench-v2-config/1",
-  "description": "Current cold-start cases. Every runtime starts the Alpine tree from bench/setup.sh with kiln's default limits: 512 MiB memory and no swap, 1 CPU, 128 PIDs.",
+  "description": "Runtime lifecycle cases. Every runtime starts the Alpine tree from bench/setup.sh with kiln's default limits: 512 MiB memory and no swap, 1 CPU, 128 PIDs. gVisor is reported separately as a stronger-isolation tier.",
   "vars": {
     "kiln": "/usr/local/bin/kiln",
     "bundle": "/var/lib/kiln-bench/bundle",
     "idle_bundle": "/var/lib/kiln-bench/idle",
-    "image": "kiln-alpine"
+    "image": "kiln-alpine",
+    "podman_image": "localhost/kiln-alpine:latest",
+    "nerdctl_image": "kiln-alpine:latest"
   },
   "artifacts": {
     "rootfs_tar": "/var/lib/kiln-bench/alpine-rootfs.tar"
@@ -102,6 +104,121 @@
         "stop_argv": ["docker", "rm", "-f", "{id}"]
       }
     },
+    "podman-crun-none": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "none",
+        "daemon": "none (conmon is per-container)",
+        "oci_runtime": "crun",
+        "rootfs": "Podman overlayfs image",
+        "user_namespace": false,
+        "seccomp": true,
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}", "--network", "none",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"],
+      "memory": {
+        "start_argv": ["podman", "--runtime", "crun", "run", "-d", "--name", "{id}", "--network", "none",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{podman_image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["podman", "rm", "-f", "--time", "0", "{id}"]
+      }
+    },
+    "podman-crun-net": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "Podman bridge (netavark)",
+        "daemon": "none (conmon is per-container)",
+        "oci_runtime": "crun",
+        "rootfs": "Podman overlayfs image",
+        "user_namespace": false,
+        "seccomp": true,
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["podman", "--runtime", "crun", "run", "--rm", "--name", "{id}",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"],
+      "memory": {
+        "start_argv": ["podman", "--runtime", "crun", "run", "-d", "--name", "{id}",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{podman_image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["podman", "rm", "-f", "--time", "0", "{id}"]
+      }
+    },
+    "podman-runc-none": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "none",
+        "daemon": "none (conmon is per-container)",
+        "oci_runtime": "runc",
+        "rootfs": "Podman overlayfs image",
+        "user_namespace": false,
+        "seccomp": true,
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["podman", "--runtime", "runc", "run", "--rm", "--name", "{id}", "--network", "none",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{podman_image}", "{workload}"],
+      "version_argv": ["podman", "--version"],
+      "memory": {
+        "start_argv": ["podman", "--runtime", "runc", "run", "-d", "--name", "{id}", "--network", "none",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{podman_image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["podman", "rm", "-f", "--time", "0", "{id}"]
+      }
+    },
+    "nerdctl-none": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "none",
+        "daemon": "containerd",
+        "oci_runtime": "runc",
+        "rootfs": "containerd overlayfs snapshot",
+        "user_namespace": false,
+        "seccomp": "nerdctl/containerd default (not independently verified)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}", "--net", "none",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"],
+      "memory": {
+        "start_argv": ["nerdctl", "run", "-d", "--name", "{id}", "--net", "none",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{nerdctl_image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["nerdctl", "rm", "-f", "{id}"]
+      }
+    },
+    "nerdctl-net": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "CNI bridge",
+        "daemon": "containerd",
+        "oci_runtime": "runc",
+        "rootfs": "containerd overlayfs snapshot",
+        "user_namespace": false,
+        "seccomp": "nerdctl/containerd default (not independently verified)",
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["nerdctl", "run", "--rm", "--name", "{id}",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{nerdctl_image}", "{workload}"],
+      "version_argv": ["nerdctl", "version"],
+      "memory": {
+        "start_argv": ["nerdctl", "run", "-d", "--name", "{id}",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{nerdctl_image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["nerdctl", "rm", "-f", "{id}"]
+      }
+    },
     "runc-none": {
       "tier": "low-level",
       "capabilities": {
@@ -138,6 +255,45 @@
         "start_argv": ["crun", "run", "-d", "--bundle", "{idle_bundle}", "{id}"],
         "sandbox_id_from": "id",
         "stop_argv": ["crun", "delete", "-f", "{id}"]
+      }
+    },
+    "youki-none": {
+      "tier": "low-level",
+      "capabilities": {
+        "network": "none (new network namespace, loopback only)",
+        "daemon": "none",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "user_namespace": false,
+        "seccomp": false,
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "argv": ["youki", "run", "--bundle", "{bundle}", "{id}"],
+      "version_argv": ["youki", "--version"],
+      "memory": {
+        "start_argv": ["youki", "run", "-d", "--bundle", "{idle_bundle}", "{id}"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["youki", "delete", "-f", "{id}"]
+      }
+    },
+    "runsc-none": {
+      "tier": "strong-isolation",
+      "capabilities": {
+        "network": "none (bundle's network namespace)",
+        "daemon": "none",
+        "rootfs": "OCI bundle mediated by gVisor's userspace kernel",
+        "user_namespace": false,
+        "seccomp": "gVisor syscall interception boundary",
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "isolation_note": "gVisor has a stronger userspace-kernel boundary and is not a like-for-like shared-kernel comparison",
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "argv": ["runsc", "run", "-bundle", "{bundle}", "{id}"],
+      "version_argv": ["runsc", "--version"],
+      "memory": {
+        "start_argv": ["runsc", "run", "-detach", "-bundle", "{idle_bundle}", "{id}"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["runsc", "delete", "-force", "{id}"]
       }
     }
   }

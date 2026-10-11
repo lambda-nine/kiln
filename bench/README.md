@@ -1,7 +1,9 @@
 # Benchmark harness v2
 
-`bench/v2.py` measures kiln against Docker, runc and crun with a randomized,
-reproducible schedule and keeps every raw measurement. It replaces the
+`bench/v2.py` measures kiln against Docker, Podman, nerdctl/containerd and
+bare OCI runtimes (runc, crun and youki), with gVisor/runsc in a separate
+stronger-isolation tier. Its schedule is randomized and reproducible, and it
+keeps every raw measurement. It replaces the
 hyperfine-based scripts (`coldstart.sh`, `compare.sh`, `idle.sh`) for new
 measurements; those stay as they are for the results already in
 `docs/benchmarks.md`.
@@ -11,7 +13,7 @@ Python 3.12 or newer, standard library only. Cases live in
 
 ## Quick start
 
-Inside the VM, after `sudo bench/setup.sh` (the Docker image and OCI bundles):
+Inside the VM, after `sudo bench/setup.sh` (runtime images and OCI bundles):
 
 ```sh
 # Latency: 100 measured rounds, 10 warmup rounds, at 0 ms and 100 ms gaps
@@ -162,34 +164,36 @@ an unknown `{name}` is an error when the config loads.
 
 `artifacts` names regular files whose path, size and SHA-256 are copied into
 the manifest. The shipped config records the exact rootfs tar imported by the
-other runtimes. `tier` and `capabilities` are free-form metadata copied into the manifest:
-`end-user-stack` for kiln and Docker (a complete CLI with images or rootfs
-management, networking and cleanup), `low-level` for runc and crun (an OCI
-runtime handed a prepared bundle).
+other runtimes. `tier` and `capabilities` are free-form metadata copied into
+the manifest: `end-user-stack` for kiln, Docker, Podman and nerdctl (a complete
+CLI with images or rootfs management, networking and cleanup), `low-level` for
+runc, crun and youki (an OCI runtime handed a prepared bundle), and
+`strong-isolation` for gVisor/runsc.
 
 ## Fairness boundaries
 
 Every case starts the same Alpine tree with the same limits: 512 MiB memory
-with no swap (Docker: `--memory 512m --memory-swap 512m`), 1 CPU, 128 PIDs. They
-still don't do the same work, and comparisons should stay within what each case
-does:
+with no swap (image CLIs: `--memory 512m --memory-swap 512m`), 1 CPU, 128
+PIDs. They still don't do the same work, and comparisons should stay within
+what each case does:
 
-- **Tiers.** runc and crun get a ready bundle: no image lookup, no overlay, no
-  seccomp profile, no user namespace, no network setup beyond an empty network
+- **Tiers.** runc, crun and youki get a ready bundle: no image lookup, no
+  overlay, no seccomp profile, no user namespace, no network setup beyond an empty network
   namespace, and their command is fixed by the bundle's `config.json`
   (`bench/setup.sh` writes `true`; `{workload}` doesn't apply). They're a floor
   for what a container runtime costs, not a like-for-like competitor to an
-  end-user stack. Compare kiln with Docker as stacks, and with runc/crun as the
-  low-level floor.
+  end-user stack. Compare kiln with Docker, Podman and nerdctl as stacks, and
+  with runc/crun/youki as the low-level floor. runsc is shown separately because
+  its userspace-kernel boundary is stronger than the shared-kernel cases.
 - **Daemons.** Docker's latency includes the client-to-dockerd round trips and
-  containerd; its memory includes a containerd shim per container, but dockerd
-  and containerd themselves are a fixed cost outside the slope. kiln-net relies
-  on the kiln-dns service the same way.
+  containerd; nerdctl also uses containerd; their shared daemons are a fixed
+  cost outside the per-sandbox memory slope. Podman is daemonless but keeps
+  conmon per container. kiln-net relies on the shared kiln-dns service for DNS.
 - **Isolation differs.** kiln runs in a user namespace with seccomp and an
   overlay; Docker has seccomp and an overlay but no user namespace by default.
   The `capabilities` metadata lists what each case does.
-- **Networking.** `-none` cases have no network; `kiln-net` and `docker-net`
-  set up a veth pair and NAT. Compare `-net` with `-net`.
+- **Networking.** `-none` cases have no network; the `-net` end-user cases set
+  up their configured bridge/NAT path. Compare `-net` with `-net`.
 - **Harness overhead.** Python's spawn cost is in every number. It's small
   next to a container lifecycle and the same for every case, but it's there.
 - **Concurrency start spread.** Commands in a batch start within
@@ -222,9 +226,10 @@ invocations, never confidence intervals.
 
 ## Root
 
-kiln, runc and crun need root to create sandboxes, and Docker needs root or
-the `docker` group, so measuring runs go under `sudo`. The harness itself never
-escalates. Dropping the page cache in `memory` needs root; without it the
+kiln and the bare OCI runtimes need root to create sandboxes, and the image
+CLIs need root or an appropriate runtime group, so measuring runs go under
+`sudo`. The harness itself never escalates. Dropping the page cache in `memory`
+needs root; without it the
 run continues and records that the drop was skipped. `summarize` and the tests
 need no privileges.
 

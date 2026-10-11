@@ -17,10 +17,19 @@ python3 -I rootfs-tar.py "$IMAGE" "$BENCH/alpine-rootfs.tar" "$ID_BASE"
 docker image rm -f kiln-alpine >/dev/null 2>&1 || true
 docker import "$BENCH/alpine-rootfs.tar" kiln-alpine >/dev/null
 
+if command -v podman >/dev/null 2>&1; then
+    podman image rm -f localhost/kiln-alpine:latest >/dev/null 2>&1 || true
+    podman import "$BENCH/alpine-rootfs.tar" localhost/kiln-alpine:latest >/dev/null
+fi
+if command -v nerdctl >/dev/null 2>&1; then
+    nerdctl image rm -f kiln-alpine:latest >/dev/null 2>&1 || true
+    nerdctl image import "$BENCH/alpine-rootfs.tar" kiln-alpine:latest >/dev/null
+fi
+
 tar -xf "$BENCH/alpine-rootfs.tar" -C "$BENCH/bundle/rootfs" --numeric-owner
 (cd "$BENCH" && runc spec && mv config.json spec-template.json)
 python3 -I oci-config.py "$BENCH/spec-template.json" "$BENCH/bundle" -- true
 python3 -I oci-config.py "$BENCH/spec-template.json" "$BENCH/idle" \
     --root "$BENCH/bundle/rootfs" -- sleep infinity
 
-echo "docker image kiln-alpine, OCI bundles and $BENCH/alpine-rootfs.tar are ready"
+echo "runtime images, OCI bundles and $BENCH/alpine-rootfs.tar are ready"
