@@ -1,6 +1,6 @@
 #!/bin/sh
-# Regression checks from the second independent review: host ports closed to
-# sandboxes, DNS forwarder concurrency bounded, inode quota enforced, and no
+# Security and lifecycle regression checks: host ports closed to sandboxes,
+# bounded shared services, quota enforcement, concurrent network reuse, and no
 # leftovers. Run inside the VM after installing: scripts/review-regressions.sh
 set -eu
 KILN=${KILN:-/usr/local/bin/kiln}
@@ -166,7 +166,26 @@ sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
 wait "$first"
 echo "PASS"
 
-echo "11. Cleanup"
+echo "11. Concurrent network reuse"
+wave=0
+failed=0
+while [ "$wave" -lt 10 ]; do
+    pids=
+    i=0
+    while [ "$i" -lt 16 ]; do
+        sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true &
+        pids="$pids $!"
+        i=$((i + 1))
+    done
+    for pid in $pids; do
+        wait "$pid" || failed=1
+    done
+    wave=$((wave + 1))
+done
+[ "$failed" -eq 0 ] || { echo "FAIL: concurrent network start failed"; exit 1; }
+echo "PASS"
+
+echo "12. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]
