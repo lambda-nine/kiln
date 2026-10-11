@@ -100,7 +100,7 @@ reconcile.
 | Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
-| Supervisor crash leaves orphans  | Partial: pdeathsig kills the sandbox; cgroup, run dir and lease leak until kilnd reconcile |
+| Supervisor crash leaves orphans  | Partial: pdeathsig kills the sandbox; leases reconcile on the next allocation, while cgroup and run dir await kilnd |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |

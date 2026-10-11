@@ -55,7 +55,19 @@ created=$(
 echo "Created under 1 MiB quota: $created"
 [ "$created" -lt 5000 ] || { echo "FAIL: no effective inode limit"; exit 1; }
 
-echo "4. Cleanup"
+echo "4. Stale lease reconciliation"
+stale=10.88.0.2
+sudo install -d /run/kiln/net/leases /run/kiln/net/dns
+printf '%s' '0-4294967295' | sudo tee "/run/kiln/net/leases/$stale" >/dev/null
+printf '%s\n' '*' | sudo tee "/run/kiln/net/dns/$stale" >/dev/null
+assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c \
+    'ip -4 -o addr show dev eth0 | sed "s/.* inet //; s/ .*//"')
+echo "Address after stale lease: $assigned"
+[ "$assigned" = "$stale/16" ] || { echo "FAIL: stale lease was not reclaimed"; exit 1; }
+[ ! -e "/run/kiln/net/dns/$stale" ] || { echo "FAIL: stale DNS policy remains"; exit 1; }
+echo "PASS"
+
+echo "5. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

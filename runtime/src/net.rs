@@ -386,12 +386,16 @@ fn set(items: impl Iterator<Item = String>) -> String {
     format!("{{ {} }}", items.collect::<Vec<_>>().join(", "))
 }
 
+fn network_lock() -> Result<Flock<File>> {
+    fs::create_dir_all(STATE_DIR).with_context(|| format!("create {STATE_DIR}"))?;
+    let lock_file = File::create(Path::new(STATE_DIR).join("lock")).context("create lock")?;
+    Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e).context("lock")
+}
+
 /// Creates the bridge and base ruleset if this boot doesn't have them yet.
 /// Held under a lock so two sandboxes starting at once don't both create them.
 pub fn ensure_bridge() -> Result<()> {
-    fs::create_dir_all(STATE_DIR).with_context(|| format!("create {STATE_DIR}"))?;
-    let lock_file = File::create(Path::new(STATE_DIR).join("lock")).context("create lock")?;
-    let _lock = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e).context("lock")?;
+    let _lock = network_lock()?;
 
     if !Path::new("/sys/class/net").join(BRIDGE).exists() {
         run(
@@ -417,8 +421,10 @@ pub fn ensure_bridge() -> Result<()> {
 /// atomic, so concurrent sandboxes can't get the same IP without a lock. The
 /// file holds the run ID, so `kiln metrics` can tell whose IP it is.
 fn lease(run_id: &str) -> Result<Network> {
+    let _lock = network_lock()?;
     let dir = Path::new(STATE_DIR).join("leases");
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    reconcile_leases(&dir);
     let first = u32::from(GATEWAY) + 1;
     let last = u32::from(NETWORK) + (1 << (32 - PREFIX)) - 2; // skip broadcast
     for n in first..=last {
@@ -435,6 +441,52 @@ fn lease(run_id: &str) -> Result<Network> {
         }
     }
     bail!("no free addresses in {NETWORK}/{PREFIX}")
+}
+
+/// Removes leases left by a supervisor that died before `Network::drop` ran.
+/// A run is stale only when every independent sign of life is gone. Requiring
+/// all four avoids reclaiming a lease during setup, while its supervisor is
+/// alive but the veth and nft map element do not exist yet.
+fn reconcile_leases(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
+        let Ok(run_id) = fs::read_to_string(entry.path()) else { continue };
+        let run_id = run_id.trim();
+        let cgroup = Path::new("/sys/fs/cgroup/kiln").join(run_id).exists();
+        let veth = Path::new("/sys/class/net").join(host_if(ip)).exists();
+        let mapped = nft_has_map_entry(ip);
+        if cgroup || veth || mapped || supervisor_alive(run_id) {
+            continue;
+        }
+
+        let _ = fs::remove_file(dns_policy_path(ip));
+        let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
+        let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
+        if fs::remove_file(entry.path()).is_ok() {
+            eprintln!("kiln: reclaimed stale network lease {ip} from {run_id}");
+        }
+    }
+}
+
+fn nft_has_map_entry(ip: Ipv4Addr) -> bool {
+    Command::new("nft")
+        .args(["get", "element", "inet", "kiln", "egress", &format!("{{ {ip} }}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn supervisor_alive(run_id: &str) -> bool {
+    let Some((_, pid)) = run_id.rsplit_once('-') else { return false };
+    let Ok(pid) = pid.parse::<u32>() else { return false };
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
+    cmdline
+        .split(|&b| b == 0)
+        .next()
+        .and_then(|arg0| Path::new(std::str::from_utf8(arg0).ok()?).file_name())
+        .is_some_and(|name| name == "kiln")
 }
 
 fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<()> {

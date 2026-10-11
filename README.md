@@ -206,10 +206,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 - **Sandbox-to-sandbox traffic never hits the firewall.** Frames between two
   ports of the same bridge are switched, not routed, so the inet forward hook
   never sees them. kiln sets `isolated on` for each bridge port instead.
-- **IP leases need no lock.** A lease is a file in `/run/kiln/net/leases`
-  created with `O_EXCL`, which is atomic. `/run` is a tmpfs, so leases vanish
-  on reboot along with the bridge and rules, which kiln rebuilds on the next
-  run.
+- **IP leases are reconciled under the network lock.** A lease is a file in
+  `/run/kiln/net/leases` created with `O_EXCL`. Before allocation, kiln removes
+  a stale lease only when its run has no cgroup, veth, nft map entry or live
+  supervisor. `/run` is a tmpfs, so all leases also vanish on reboot.
 - **DNS inside the sandbox.** systemd-resolved's `127.0.0.53` only exists in the
   host's namespace, so kiln writes the upstream resolvers into the sandbox's
   `/etc/resolv.conf` as real root, which makes it read-only for sandbox root.
