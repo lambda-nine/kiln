@@ -1,0 +1,141 @@
+{
+  "schema": "kiln-bench-v2-config/1",
+  "description": "Current cold-start cases. Every runtime starts the Alpine tree from bench/setup.sh with kiln's default limits: 512 MiB memory and no swap, 1 CPU, 128 PIDs.",
+  "vars": {
+    "kiln": "/usr/local/bin/kiln",
+    "bundle": "/var/lib/kiln-bench/bundle",
+    "idle_bundle": "/var/lib/kiln-bench/idle",
+    "image": "kiln-alpine"
+  },
+  "workload": ["true"],
+  "defaults": {
+    "timeout_s": 120,
+    "output_limit_bytes": 4096,
+    "env": {}
+  },
+  "memory": {
+    "settle_s": 2
+  },
+  "cases": {
+    "kiln-none": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "none",
+        "daemon": "none",
+        "rootfs": "overlayfs over the shared image, XFS quota",
+        "user_namespace": true,
+        "seccomp": true,
+        "limits": "512M memory, 1 CPU, 128 PIDs (kiln defaults)"
+      },
+      "argv": ["{kiln}", "run", "--", "{workload}"],
+      "version_argv": null,
+      "version_note": "kiln has no --version; the manifest identifies the build by the binary's SHA-256 and the repo commit.",
+      "memory": {
+        "start_argv": ["{kiln}", "create"],
+        "sandbox_id_from": "stdout",
+        "stop_argv": ["{kiln}", "rm", "{sandbox}"]
+      }
+    },
+    "kiln-net": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "full (veth, NAT, kiln-dns)",
+        "daemon": "kiln-dns for name resolution",
+        "rootfs": "overlayfs over the shared image, XFS quota",
+        "user_namespace": true,
+        "seccomp": true,
+        "limits": "512M memory, 1 CPU, 128 PIDs (kiln defaults)"
+      },
+      "argv": ["{kiln}", "run", "--net", "full", "--", "{workload}"],
+      "version_argv": null,
+      "version_note": "kiln has no --version; the manifest identifies the build by the binary's SHA-256 and the repo commit.",
+      "memory": {
+        "start_argv": ["{kiln}", "create", "--net", "full"],
+        "sandbox_id_from": "stdout",
+        "stop_argv": ["{kiln}", "rm", "{sandbox}"]
+      }
+    },
+    "docker-none": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "none",
+        "daemon": "dockerd + containerd",
+        "rootfs": "overlayfs (image kiln-alpine)",
+        "user_namespace": false,
+        "seccomp": true,
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["docker", "run", "--rm", "--name", "{id}", "--network", "none",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"],
+      "memory": {
+        "start_argv": ["docker", "run", "-d", "--name", "{id}", "--network", "none",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["docker", "rm", "-f", "{id}"]
+      }
+    },
+    "docker-net": {
+      "tier": "end-user-stack",
+      "capabilities": {
+        "network": "bridge (docker0, NAT)",
+        "daemon": "dockerd + containerd",
+        "rootfs": "overlayfs (image kiln-alpine)",
+        "user_namespace": false,
+        "seccomp": true,
+        "limits": "512m memory, 512m memory+swap, 1 CPU, 128 PIDs"
+      },
+      "argv": ["docker", "run", "--rm", "--name", "{id}",
+               "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+               "{image}", "{workload}"],
+      "version_argv": ["docker", "version", "--format", "client {{.Client.Version}} server {{.Server.Version}}"],
+      "memory": {
+        "start_argv": ["docker", "run", "-d", "--name", "{id}",
+                       "--memory", "512m", "--memory-swap", "512m", "--cpus", "1", "--pids-limit", "128",
+                       "{image}", "sleep", "infinity"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["docker", "rm", "-f", "{id}"]
+      }
+    },
+    "runc-none": {
+      "tier": "low-level",
+      "capabilities": {
+        "network": "none (new network namespace, loopback only)",
+        "daemon": "none",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "user_namespace": false,
+        "seccomp": false,
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "argv": ["runc", "run", "--bundle", "{bundle}", "{id}"],
+      "version_argv": ["runc", "--version"],
+      "memory": {
+        "start_argv": ["runc", "run", "-d", "--bundle", "{idle_bundle}", "{id}"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["runc", "delete", "-f", "{id}"]
+      }
+    },
+    "crun-none": {
+      "tier": "low-level",
+      "capabilities": {
+        "network": "none (new network namespace, loopback only)",
+        "daemon": "none",
+        "rootfs": "read-only bind of the unpacked tree, no overlay",
+        "user_namespace": false,
+        "seccomp": false,
+        "limits": "512M memory and swap limit, 1 CPU, 128 PIDs (bench/oci-config.py)",
+        "workload_note": "the command is fixed by the bundle's config.json (bench/setup.sh writes `true`); {workload} is not used"
+      },
+      "argv": ["crun", "run", "--bundle", "{bundle}", "{id}"],
+      "version_argv": ["crun", "--version"],
+      "memory": {
+        "start_argv": ["crun", "run", "-d", "--bundle", "{idle_bundle}", "{id}"],
+        "sandbox_id_from": "id",
+        "stop_argv": ["crun", "delete", "-f", "{id}"]
+      }
+    }
+  }
+}
