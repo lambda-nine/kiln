@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::net::Ipv4Addr;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, chown, symlink};
@@ -176,6 +177,9 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     listener: Option<UnixListener>, ready: Option<&OwnedFd>) -> Result<i32> {
     let cgroup = Cgroup::create(id, &cfg.limits)?;
     trace::mark("host: cgroup");
+    // Leased before the clone, so the child knows its own address.
+    let network = net::prepare(id, &cfg.net)?;
+    let ip = network.as_ref().map(|n| n.ip());
     let persistent = listener.is_some();
 
     // Two one-byte handshakes over a pair of pipes. Parent → child: "your
@@ -228,7 +232,7 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         0 => {
             // In the child. _exit, not exit: the parent's atexit handlers and
             // buffered output belong to the parent.
-            let code = init(cfg, layers, &to_child_rx, &to_parent_tx, listener.as_ref()).unwrap_or_else(|e| {
+            let code = init(cfg, layers, ip, &to_child_rx, &to_parent_tx, listener.as_ref()).unwrap_or_else(|e| {
                 eprintln!("kiln: {e:#}");
                 1
             });
@@ -244,12 +248,12 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     drop(to_parent_tx);
     trace::mark("host: clone");
 
-    let mut network = None;
     let setup = (|| -> Result<()> {
-        // Plug its network namespace in from the outside before it runs
-        // anything, then let it go.
-        network = net::setup(pid, id, &cfg.net)?;
-        trace::mark("host: network");
+        // Plug its network namespace into the bridge from the outside before
+        // it runs anything, then let it go.
+        if let Some(network) = &network {
+            network.plug(pid, &cfg.net)?;
+        }
         write(&to_child_tx, b"1").context("signal child")?;
 
         // The child does its mounts as real root, then creates its user
@@ -336,15 +340,17 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
 
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
 /// then becomes its init and returns the command's exit code.
-fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedFd,
+fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &OwnedFd, to_parent: &OwnedFd,
     listener: Option<&UnixListener>) -> Result<i32> {
     let mut keep = vec![from_parent.as_raw_fd(), to_parent.as_raw_fd()];
     if let Some(listener) = listener { keep.push(listener.as_raw_fd()); }
     close_fds_except(&keep)?;
 
-    // Wait for the parent to plug in our network.
+    // Wait for the parent to plug in our network, then configure our side.
     wait_for_parent(from_parent)?;
     trace::mark("init: released by parent");
+    net::configure_inside(ip).context("configure sandbox network")?;
+    trace::mark("init: network");
 
     // A cgroup namespace makes our current cgroup look like the root, so the
     // sandbox sees /sys/fs/cgroup as just its own limits and nothing above.

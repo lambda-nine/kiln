@@ -214,8 +214,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   rule grants it beneath some directory.
 - **The network namespace is created before the user namespace**, like the
   others, so sandbox root can't run `ip link set eth0 down`, change its address
-  or routes, or touch the firewall. The host configures it from outside with
-  `nsenter --target <pid> --net ip -batch -`.
+  or routes, or touch the firewall. The host creates the veth pair with one
+  end directly in the sandbox's namespace (`IFLA_NET_NS_PID`), and kiln-init
+  sets up its side (loopback, eth0's address, the default route) while it's
+  still real root. Both speak rtnetlink (`netlink.rs`), the protocol `ip`
+  itself uses, instead of spawning `ip` and `nsenter`.
 - **Two sysctls make root-in-a-userns feel normal.** Binding ports below 1024
   needs `CAP_NET_BIND_SERVICE` in the user namespace that *owns* the network
   namespace, which sandbox root isn't. Setting

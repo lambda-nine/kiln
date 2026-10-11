@@ -5,6 +5,7 @@ mod init;
 mod landlock;
 mod metrics;
 mod net;
+mod netlink;
 mod persistent;
 mod quota;
 mod seccomp;

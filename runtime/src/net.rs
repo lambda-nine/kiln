@@ -9,8 +9,10 @@
 //! ```
 //!
 //! The namespace is created before the sandbox's user namespace, so sandbox
-//! root can't change its own address, routes or firewall. All configuration is
-//! done from the host side with `ip` and `nft`, the same tools you'd type.
+//! root can't change its own address, routes or firewall. Links, addresses
+//! and routes are set over netlink (netlink.rs): the host end of the veth
+//! from the host, the sandbox's end by kiln-init while it's still real root.
+//! Firewall rules go through `nft`, the same tool you'd type.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -24,6 +26,7 @@ use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Pid;
 
+use crate::netlink::{self, Netlink};
 use crate::trace;
 
 const BRIDGE: &str = "kiln0";
@@ -284,67 +287,64 @@ impl Drop for Network {
         // Usually already gone: deleting the sandbox's namespace destroys its
         // end of the pair, which takes this end with it.
         if Path::new("/sys/class/net").join(&host_if).exists() {
-            let _ = run("ip", &["link", "del", &host_if], None);
+            let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if));
         }
         let _ = fs::remove_file(&self.lease);
     }
 }
 
-/// Configures the network namespace of `pid` (a freshly cloned sandbox that
-/// is still waiting on its parent). Returns `None` for `--net none`.
-pub fn setup(pid: Pid, run_id: &str, plan: &Plan) -> Result<Option<Network>> {
-    // Inside the namespace: loopback up (it starts down).
-    let mut inside = String::from("link set lo up\n");
+/// Leases an IP for a sandbox about to be cloned, so its init knows its
+/// address from the start. Returns `None` for `--net none`.
+pub fn prepare(run_id: &str, plan: &Plan) -> Result<Option<Network>> {
+    if matches!(plan.mode, Mode::None) {
+        return Ok(None);
+    }
+    ensure_bridge()?;
+    trace::mark("host: net: bridge and base ruleset");
+    let forwarder = SocketAddr::from((GATEWAY, 53));
+    if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
+        eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
+    }
+    let network = lease(run_id)?;
+    let policy_file = dns_policy_path(network.ip);
+    fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
+    fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
+    trace::mark("host: net: DNS check and lease");
+    Ok(Some(network))
+}
 
-    let network = if matches!(plan.mode, Mode::None) {
-        None
-    } else {
-        ensure_bridge()?;
-        trace::mark("host: net: bridge and base ruleset");
-        let forwarder = SocketAddr::from((GATEWAY, 53));
-        if TcpStream::connect_timeout(&forwarder, Duration::from_millis(200)).is_err() {
-            eprintln!("kiln: no DNS forwarder on {forwarder}, so name lookups will fail (sudo systemctl start kiln-dns)");
-        }
-        let network = lease(run_id)?;
-        trace::mark("host: net: DNS check and lease");
-        let policy_file = dns_policy_path(network.ip);
-        fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
-        fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
-        let host_if = network.host_if();
-        let ip = network.ip;
-
-        run(
-            "ip",
-            &["-batch", "-"],
-            Some(&format!(
-                "link add {host_if} type veth peer name eth0 netns {pid}\n\
-                 link set {host_if} master {BRIDGE}\n\
-                 link set dev {host_if} type bridge_slave isolated on\n\
-                 link set {host_if} up\n"
-            )),
-        )
-        .context("create veth pair")?;
+impl Network {
+    /// Plugs the network namespace of `pid` (a freshly cloned sandbox that is
+    /// still waiting on its parent) into the bridge and applies its policy.
+    pub fn plug(&self, pid: Pid, plan: &Plan) -> Result<()> {
+        let host_if = self.host_if();
+        let mut nl = Netlink::open()?;
+        let bridge = netlink::index(BRIDGE)?;
+        nl.add_veth(&host_if, bridge, "eth0", pid.as_raw())?;
+        // Isolated before it's up, so it never forwards to another sandbox.
+        nl.isolate_bridge_port(&host_if)?;
+        nl.set_up(&host_if)?;
         trace::mark("host: net: veth pair");
 
-        inside.push_str(&format!(
-            "addr add {ip}/{PREFIX} dev eth0\n\
-             link set eth0 up\n\
-             route add default via {GATEWAY}\n"
-        ));
-
-        run("nft", &["-f", "-"], Some(&policy(&network, plan))).context("apply egress policy")?;
+        run("nft", &["-f", "-"], Some(&policy(self, plan))).context("apply egress policy")?;
         trace::mark("host: net: egress policy");
-        Some(network)
-    };
+        Ok(())
+    }
+}
 
-    let pid_s = pid.to_string();
-    run(
-        "nsenter",
-        &["--target", &pid_s, "--net", "--", "ip", "-batch", "-"],
-        Some(&inside),
-    )
-    .context("configure sandbox network namespace")?;
-    Ok(network)
+/// Run by kiln-init inside its new network namespace, as real root, before
+/// it creates its user namespace: loopback up (it starts down), and with a
+/// network, eth0's address and the default route via the bridge. The host
+/// end is already plugged in by then.
+pub fn configure_inside(ip: Option<Ipv4Addr>) -> Result<()> {
+    let mut nl = Netlink::open()?;
+    nl.set_up("lo")?;
+    if let Some(ip) = ip {
+        nl.add_address("eth0", ip, PREFIX)?;
+        nl.set_up("eth0")?;
+        nl.add_default_route(GATEWAY)?;
+    }
+    Ok(())
 }
 
 /// The sandbox's own nftables chain, reached through the `egress` map.
@@ -400,16 +400,10 @@ pub fn ensure_bridge() -> Result<()> {
     let _lock = network_lock()?;
 
     if !Path::new("/sys/class/net").join(BRIDGE).exists() {
-        run(
-            "ip",
-            &["-batch", "-"],
-            Some(&format!(
-                "link add {BRIDGE} type bridge\n\
-                 addr add {GATEWAY}/{PREFIX} dev {BRIDGE}\n\
-                 link set {BRIDGE} up\n"
-            )),
-        )
-        .context("create bridge")?;
+        let mut nl = Netlink::open()?;
+        nl.add_bridge(BRIDGE)?;
+        nl.add_address(BRIDGE, GATEWAY, PREFIX)?;
+        nl.set_up(BRIDGE)?;
     }
     // Without this the kernel drops packets instead of routing them out.
     fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
@@ -541,7 +535,7 @@ pub fn remove_run(run_id: &str) {
         let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {ip} }}")], None);
         let _ = run("nft", &["destroy", "element", "inet", "kiln", "connlimit", &format!("{{ {ip} }}")], None);
         let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
-        let _ = run("ip", &["link", "del", &host_if(ip)], None);
+        let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if(ip)));
         let _ = fs::remove_file(dns_policy_path(ip));
         let _ = fs::remove_file(entry.path());
     }
