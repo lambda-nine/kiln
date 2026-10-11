@@ -203,6 +203,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   `reject with icmpx admin-prohibited` rather than `drop`, so blocked
   connections fail in milliseconds ("Host is unreachable") instead of hanging.
   Look at it with `sudo nft list table inet kiln`.
+- **The shared firewall is reconciled, not merely detected.** Under the network
+  lock, kiln restores the private-address set and replaces any noncanonical
+  input, forward or NAT hook chain in one nft transaction. Active sandbox
+  chains and verdict-map entries remain in place.
 - **Sandbox-to-sandbox traffic never hits the firewall.** Frames between two
   ports of the same bridge are switched, not routed, so the inet forward hook
   never sees them. kiln sets `isolated on` for each bridge port instead.

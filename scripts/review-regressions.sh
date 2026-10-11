@@ -67,7 +67,16 @@ echo "Address after stale lease: $assigned"
 [ ! -e "/run/kiln/net/dns/$stale" ] || { echo "FAIL: stale DNS policy remains"; exit 1; }
 echo "PASS"
 
-echo "5. Cleanup"
+echo "5. Base nftables reconciliation"
+sudo nft add rule inet kiln forward counter accept comment '"review stale rule"'
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true
+if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
+    echo "FAIL: stale base rule survived reconciliation"
+    exit 1
+fi
+echo "PASS"
+
+echo "6. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

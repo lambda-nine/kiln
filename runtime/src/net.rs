@@ -32,45 +32,29 @@ const PREFIX: u8 = 16;
 /// the nftables rules they refer to.
 const STATE_DIR: &str = "/run/kiln/net";
 
-/// Created once per boot. `egress` maps each sandbox's IP to its own chain.
-const BASE_RULESET: &str = r#"
-table inet kiln {
-    # Destinations blocked in --net full mode: private networks (including the
-    # VM's LAN and the Mac behind it), link-local and cloud metadata.
-    set private {
-        type ipv4_addr; flags interval
-        elements = { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16,
-                     172.16.0.0/12, 192.168.0.0/16 }
-    }
-    map egress { type ipv4_addr : verdict; }
+const PRIVATE_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
 
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        # Every packet from a sandbox goes through its current policy, even on
-        # an established connection. Leases reuse IPs, and conntrack entries
-        # outlive sandboxes, so accepting "established" first would let a new
-        # sandbox continue flows only the previous one was allowed.
-        iifname "kiln0" ip saddr vmap @egress
-        iifname "kiln0" counter reject with icmpx admin-prohibited
-        oifname "kiln0" ct state established,related accept
-        oifname "kiln0" counter drop
-    }
-    # Sandboxes may not talk to the host itself (sshd, later kilnd's API),
-    # except kiln's DNS forwarder on the bridge address.
-    chain input {
-        type filter hook input priority filter; policy accept;
-        iifname "kiln0" ct state established,related accept
-        iifname "kiln0" ip daddr 10.88.0.1 meta l4proto { tcp, udp } th dport 53 accept
-        iifname "kiln0" counter reject with icmpx admin-prohibited
-    }
-    # NAT works in inet tables too (Linux 5.2+), so one table holds it all
-    # and the existence check in ensure_bridge covers everything.
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 10.88.0.0/16 oifname != "kiln0" masquerade
-    }
-}
-"#;
+const FORWARD_RULES: &[&str] = &[
+    "type filter hook forward priority filter; policy accept;",
+    // Every outbound packet goes through the current policy. Conntrack entries
+    // outlive leases, so an established-first rule would cross IP reuse.
+    "iifname \"kiln0\" ip saddr vmap @egress",
+    "iifname \"kiln0\" counter reject with icmpx admin-prohibited",
+    "oifname \"kiln0\" ct state established,related accept",
+    "oifname \"kiln0\" counter drop",
+];
+
+const INPUT_RULES: &[&str] = &[
+    "type filter hook input priority filter; policy accept;",
+    "iifname \"kiln0\" ct state established,related accept",
+    "iifname \"kiln0\" ip daddr 10.88.0.1 meta l4proto { tcp, udp } th dport 53 accept",
+    "iifname \"kiln0\" counter reject with icmpx admin-prohibited",
+];
+
+const POSTROUTING_RULES: &[&str] = &[
+    "type nat hook postrouting priority srcnat; policy accept;",
+    "ip saddr 10.88.0.0/16 oifname != \"kiln0\" masquerade",
+];
 
 /// What a sandbox may reach.
 pub enum Mode {
@@ -392,8 +376,8 @@ fn network_lock() -> Result<Flock<File>> {
     Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_, e)| e).context("lock")
 }
 
-/// Creates the bridge and base ruleset if this boot doesn't have them yet.
-/// Held under a lock so two sandboxes starting at once don't both create them.
+/// Creates the bridge and reconciles the complete shared ruleset. Held under a
+/// lock so two sandboxes starting at once cannot repair the same objects.
 pub fn ensure_bridge() -> Result<()> {
     let _lock = network_lock()?;
 
@@ -411,10 +395,64 @@ pub fn ensure_bridge() -> Result<()> {
     }
     // Without this the kernel drops packets instead of routing them out.
     fs::write("/proc/sys/net/ipv4/ip_forward", "1").context("enable ip_forward")?;
-    if run("nft", &["list", "table", "inet", "kiln"], None).is_err() {
-        run("nft", &["-f", "-"], Some(BASE_RULESET)).context("create base ruleset")?;
-    }
+    reconcile_ruleset().context("reconcile base ruleset")?;
     Ok(())
+}
+
+/// Repairs base objects in one nft transaction while preserving active
+/// per-sandbox chains and `egress` map elements. Hook chains are replaced only
+/// when their stateless listing differs, so their counters survive normal runs.
+fn reconcile_ruleset() -> Result<()> {
+    let mut nft = String::from(
+        "add table inet kiln\n\
+         add set inet kiln private { type ipv4_addr; flags interval; }\n\
+         flush set inet kiln private\n",
+    );
+    nft += &format!("add element inet kiln private {{ {PRIVATE_RANGES} }}\n");
+    nft += "add map inet kiln egress { type ipv4_addr : verdict; }\n";
+    nft += "add counter inet kiln egress_rejected\n";
+    for (name, rules) in [
+        ("forward", FORWARD_RULES),
+        ("input", INPUT_RULES),
+        ("postrouting", POSTROUTING_RULES),
+    ] {
+        if chain_matches(name, rules) {
+            continue;
+        }
+        if nft_object_exists("chain", name) {
+            nft += &format!("delete chain inet kiln {name}\n");
+        }
+        nft += &format!("add chain inet kiln {name} {{ {} }}\n", rules[0]);
+        for rule in &rules[1..] {
+            nft += &format!("add rule inet kiln {name} {rule}\n");
+        }
+    }
+    run("nft", &["-f", "-"], Some(&nft))
+}
+
+fn nft_object_exists(kind: &str, name: &str) -> bool {
+    Command::new("nft")
+        .args(["list", kind, "inet", "kiln", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn chain_matches(name: &str, expected: &[&str]) -> bool {
+    let Ok(out) = Command::new("nft").args(["-s", "list", "chain", "inet", "kiln", name]).output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let actual: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "{" && *line != "}" && !line.starts_with("table ") && !line.starts_with("chain "))
+        .collect();
+    actual == expected
 }
 
 /// Leases the lowest free address. Creating the lease file with O_EXCL is
