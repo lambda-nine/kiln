@@ -152,7 +152,21 @@ sudo "$KILN" gc
 [ ! -e "/run/kiln/net/leases/$ip" ]
 echo "PASS"
 
-echo "10. Cleanup"
+echo "10. Bridge ports isolated"
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sleep 5 &
+first=$!
+i=0
+while [ -z "$(ls /run/kiln/net/leases 2>/dev/null)" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+peer=$(ls /run/kiln/net/leases)
+port=$(bridge -d link show master kiln0)
+echo "$port" | grep -q 'isolated on' || { echo "FAIL: sandbox bridge port is not isolated"; exit 1; }
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
+    if ping -c 1 -W 1 $peer >/dev/null 2>&1; then echo 'FAIL: reached sandbox $peer'; exit 1; fi
+"
+wait "$first"
+echo "PASS"
+
+echo "11. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]
