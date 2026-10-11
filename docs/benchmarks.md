@@ -121,22 +121,24 @@ Results are in `bench/results/<label>/` (raw hyperfine JSON plus
 | docker-net | 141.3 | 141.8 | 156.1 | 160.6 |
 
 `bench/results/final` and `final-session-baseline`, measured back to back in
-one session. The baseline run from the start of this work
-(`bench/results/baseline`) agrees within 1 ms.
+one session. A separate run of the baseline build against all runtimes
+(`bench/results/baseline`; p50 kiln 29.6 and 88.0 ms, crun 12.9, runc 33.2,
+Docker 86.7 and 140.4) agrees within 1 ms for kiln and 3 ms for the others.
 
 ### Back to back (no pause)
 
 | case | before: p50 | p95 | now: p50 | p95 |
 |---|---:|---:|---:|---:|
-| kiln-none | 2.7 | 7.0 | **1.8** | 2.0 |
-| crun-none | 2.1 | 2.3 | 2.0 | 2.2 |
-| runc-none | 12.0 | 16.6 | 11.2 | 16.7 |
-| docker-none | 91.1 | 398.4 | 76.9 | 87.2 |
-| kiln-net | 46.8 | 58.8 | **28.5** | 43.3 |
-| docker-net | 134.5 | 162.5 | 132.3 | 142.5 |
+| kiln-none | 2.7 | 4.3 | **1.8** | 2.0 |
+| crun-none | 2.0 | 2.1 | 2.0 | 2.2 |
+| runc-none | 11.2 | 16.8 | 11.2 | 16.7 |
+| docker-none | 76.6 | 94.1 | 76.9 | 87.2 |
+| kiln-net | 45.6 | 56.7 | **28.5** | 43.3 |
+| docker-net | 131.2 | 148.2 | 132.3 | 142.5 |
 
-`bench/results/baseline-b2b` and `final-b2b`. Docker's long tail (p99 250-600
-ms) comes and goes between sessions. kiln-net is slower back to back than cold
+`bench/results/baseline-b2b` (the baseline build, rebuilt from db1947b) and
+`final-b2b`. Docker's p99 occasionally jumps (247 ms for docker-none in the
+final run). kiln-net is slower back to back than cold
 (28.5 vs 22.2 ms): the next run gets the same IP while the kernel is still
 removing the previous sandbox's veth, so it deletes it itself (see change 8).
 
