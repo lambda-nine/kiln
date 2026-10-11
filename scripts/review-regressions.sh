@@ -76,7 +76,11 @@ if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
 fi
 echo "PASS"
 
-echo "6. Cleanup"
+echo "6. Alpine release signature"
+scripts/fetch-alpine.sh --verify-only
+echo "PASS"
+
+echo "7. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

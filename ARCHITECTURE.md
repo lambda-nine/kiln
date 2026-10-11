@@ -104,6 +104,7 @@ reconcile.
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Open: reconcile on startup              |
+| Compromised image download       | Reduced: pinned Alpine signature, strict basename and atomic staged install |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
 | Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
 | Reaching the host or LAN         | Handled: only kiln's DNS forwarder on 10.88.0.1:53 is reachable |

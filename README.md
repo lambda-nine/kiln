@@ -27,6 +27,11 @@ sudo kiln stats                          # running sandboxes, like docker stats
 sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 ```
 
+`fetch-alpine.sh` accepts only a strict minirootfs basename, checks the
+published SHA-256, and verifies the detached release signature against the
+pinned Alpine release key. It builds the image in a same-filesystem staging
+directory and atomically exchanges it with the installed image.
+
 ## Layers
 
 1. **Namespaces** (done): `clone()` with new UTS, PID, mount and IPC
