@@ -550,10 +550,10 @@ fn reconcile_leases(dir: &Path) {
         let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
         let Ok(run_id) = fs::read_to_string(entry.path()) else { continue };
         let run_id = run_id.trim();
-        let cgroup = Path::new("/sys/fs/cgroup/kiln").join(run_id).exists();
-        let veth = Path::new("/sys/class/net").join(host_if(ip)).exists();
-        let mapped = nft_has_map_entry(ip);
-        if cgroup || veth || mapped || supervisor_alive(run_id) {
+        // Cheapest checks first; `nft get` starts a process.
+        let cgroup = || Path::new("/sys/fs/cgroup/kiln").join(run_id).exists();
+        let veth = || Path::new("/sys/class/net").join(host_if(ip)).exists();
+        if cgroup() || veth() || supervisor_alive(run_id) || nft_has_map_entry(ip) {
             continue;
         }
 
