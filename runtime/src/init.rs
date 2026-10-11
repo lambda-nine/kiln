@@ -8,6 +8,9 @@
 //! forward signals and reap children, like `tini` does for Docker.
 
 use std::ffi::CString;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixListener;
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
@@ -49,6 +52,55 @@ pub fn run(argv: &[CString]) -> Result<i32> {
                 sig if FORWARDED.contains(&sig) => {
                     let _ = kill(child, sig);
                 }
+                _ => {}
+            }
+        },
+    }
+}
+
+/// Serves commands for a persistent sandbox. The listener was opened by the
+/// host shim before pivot_root; accepted sockets and passed stdio descriptors
+/// are the only host objects exposed after lockdown.
+pub fn serve(listener: &UnixListener) -> Result<i32> {
+    loop {
+        let (mut stream, _) = listener.accept().context("accept exec request")?;
+        let (op, argv, fds) = match crate::persistent::receive(&mut stream) {
+            Ok(request) => request,
+            Err(e) => { eprintln!("kiln: bad exec request: {e:#}"); continue; }
+        };
+        if op == 2 {
+            stream.write_all(&0i32.to_ne_bytes())?;
+            return Ok(0);
+        }
+        if op != 1 || fds.len() != 3 {
+            eprintln!("kiln: exec request needs stdin, stdout and stderr");
+            continue;
+        }
+        let code = run_with_stdio(&argv, &fds)?;
+        stream.write_all(&code.to_ne_bytes())?;
+    }
+}
+
+fn run_with_stdio(argv: &[CString], fds: &[std::os::fd::OwnedFd]) -> Result<i32> {
+    let all = SigSet::all();
+    all.thread_block().context("block signals")?;
+    // SAFETY: PID 1 is single-threaded.
+    match unsafe { fork() }.context("fork")? {
+        ForkResult::Child => {
+            for (target, source) in fds.iter().enumerate() {
+                if unsafe { libc::dup2(source.as_raw_fd(), target as i32) } < 0 {
+                    std::process::exit(126);
+                }
+            }
+            let _ = SigSet::empty().thread_set_mask();
+            let err = execvp(&argv[0], argv).unwrap_err();
+            eprintln!("kiln: exec {}: {err}", argv[0].to_string_lossy());
+            std::process::exit(127);
+        }
+        ForkResult::Parent { child } => loop {
+            match all.wait().context("sigwait")? {
+                Signal::SIGCHLD => if let Some(code) = reap(child)? { return Ok(code); },
+                sig if FORWARDED.contains(&sig) => { let _ = kill(child, sig); }
                 _ => {}
             }
         },

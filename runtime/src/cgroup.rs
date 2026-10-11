@@ -133,6 +133,18 @@ pub fn sandboxes() -> Vec<(String, PathBuf)> {
     found
 }
 
+/// Kills and removes a cgroup left behind by a crashed persistent shim.
+pub fn remove(name: &str) {
+    let path = parent_dir().join(name);
+    if !path.is_dir() { return; }
+    let _ = fs::write(path.join("cgroup.kill"), "1");
+    for _ in 0..100 {
+        if fs::remove_dir(&path).is_ok() { return; }
+        sleep(Duration::from_millis(10));
+    }
+    eprintln!("kiln: gave up removing busy cgroup {}", path.display());
+}
+
 /// A single-value file like `memory.current` or `pids.max`. `None` if it's
 /// missing or says "max" (no limit).
 pub fn read_value(dir: &Path, file: &str) -> Option<u64> {

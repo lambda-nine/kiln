@@ -5,6 +5,7 @@ mod init;
 mod landlock;
 mod metrics;
 mod net;
+mod persistent;
 mod quota;
 mod seccomp;
 mod storage;
@@ -26,6 +27,20 @@ struct Cli {
 enum Command {
     /// Run a command inside a new sandbox.
     Run(Box<RunArgs>),
+    /// Create a persistent sandbox and print its ID.
+    Create(Box<CreateArgs>),
+    /// Run a command in a persistent sandbox.
+    Exec {
+        id: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        cmd: Vec<String>,
+    },
+    /// List persistent sandboxes.
+    Ls,
+    /// Remove a persistent sandbox.
+    Rm { id: String },
+    /// Remove state left by crashed sandbox shims.
+    Gc,
     /// Serve DNS to sandboxes on 10.88.0.1:53 (run by the kiln-dns service).
     Dns,
     /// Serve running sandboxes' resource use as Prometheus metrics.
@@ -86,12 +101,34 @@ struct RunArgs {
     cmd: Vec<String>,
 }
 
+#[derive(clap::Args)]
+struct CreateArgs {
+    #[arg(long, default_value = "kiln")]
+    hostname: String,
+    #[arg(long, default_value = "alpine")]
+    image: String,
+    #[arg(long, default_value = "512M")]
+    memory: String,
+    #[arg(long, default_value = "1")]
+    cpus: String,
+    #[arg(long, default_value = "128")]
+    pids: String,
+    #[arg(long, default_value = "1G")]
+    disk: String,
+    #[arg(long)]
+    read_only: bool,
+    #[arg(long, value_name = "PATH", requires = "read_only")]
+    writable: Vec<PathBuf>,
+    #[arg(long, default_value = "none")]
+    net: String,
+    #[arg(long, value_name = "DEST")]
+    allow: Vec<String>,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => {
-            if let Some(p) = args.writable.iter().find(|p| !p.is_absolute()) {
-                bail!("--writable needs an absolute path, got {}", p.display());
-            }
+            validate_writable(&args.writable)?;
             let cfg = container::Config {
                 limits: cgroup::Limits {
                     memory: parse_size(&args.memory)?,
@@ -110,6 +147,31 @@ fn main() -> Result<()> {
             };
             std::process::exit(container::run(&cfg)?);
         }
+        Command::Create(args) => {
+            validate_writable(&args.writable)?;
+            let cfg = container::Config {
+                limits: cgroup::Limits {
+                    memory: parse_size(&args.memory)?,
+                    cpus: parse_cpus(&args.cpus)?,
+                    pids: parse_max(&args.pids)?,
+                },
+                disk: parse_size(&args.disk)?,
+                net: net::Plan::new(&args.net, &args.allow)?,
+                hostname: args.hostname,
+                image: args.image,
+                keep: true,
+                read_only: args.read_only,
+                writable: args.writable,
+                stats: false,
+                cmd: Vec::new(),
+            };
+            println!("{}", persistent::create(&cfg)?);
+            Ok(())
+        }
+        Command::Exec { id, cmd } => std::process::exit(persistent::exec(&id, &cmd)?),
+        Command::Ls => persistent::list(),
+        Command::Rm { id } => persistent::remove(&id),
+        Command::Gc => persistent::gc(),
         Command::Dns => dns::serve(),
         Command::Metrics { listen } => metrics::serve_metrics(&listen),
         Command::Stats => {
@@ -117,6 +179,13 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn validate_writable(paths: &[PathBuf]) -> Result<()> {
+    if let Some(p) = paths.iter().find(|p| !p.is_absolute()) {
+        bail!("--writable needs an absolute path, got {}", p.display());
+    }
+    Ok(())
 }
 
 fn parse_cpus(s: &str) -> Result<Option<f64>> {

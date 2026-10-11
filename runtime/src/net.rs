@@ -521,6 +521,26 @@ fn reconcile_leases(dir: &Path) {
     }
 }
 
+/// Removes network state for a run whose persistent shim is gone. The normal
+/// path uses `Network::drop`; `kiln gc` calls this crash-recovery path.
+pub fn remove_run(run_id: &str) {
+    let Ok(_lock) = network_lock() else { return };
+    let dir = Path::new(STATE_DIR).join("leases");
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(owner) = fs::read_to_string(entry.path()) else { continue };
+        if owner.trim() != run_id { continue; }
+        let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
+        let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
+        let _ = run("nft", &["delete", "element", "inet", "kiln", "egress", &format!("{{ {ip} }}")], None);
+        let _ = run("nft", &["destroy", "element", "inet", "kiln", "connlimit", &format!("{{ {ip} }}")], None);
+        let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
+        let _ = run("ip", &["link", "del", &host_if(ip)], None);
+        let _ = fs::remove_file(dns_policy_path(ip));
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
 fn nft_has_map_entry(ip: Ipv4Addr) -> bool {
     Command::new("nft")
         .args(["get", "element", "inet", "kiln", "egress", &format!("{{ {ip} }}")])

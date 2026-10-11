@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, chown, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,43 @@ pub fn run(cfg: &Config) -> Result<i32> {
     result
 }
 
+/// Runs the long-lived init for a persistent sandbox. This function is called
+/// by its detached host shim, which stays alive to own cleanup resources.
+pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<()> {
+    validate_image(cfg)?;
+    storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
+    let run_dir = run_dir(id);
+    let layers = Layers {
+        lower: Path::new(KILN_ROOT).join("images").join(&cfg.image),
+        upper: run_dir.join("upper"),
+        work: run_dir.join("work"),
+        merged: run_dir.join("merged"),
+    };
+    fs::create_dir_all(&run_dir)
+        .with_context(|| format!("create {} (are you root?)", run_dir.display()))?;
+    prepare(cfg, &run_dir, &layers)?;
+    let socket = run_dir.join("control.sock");
+    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    fs::write(run_dir.join("shim.pid"), std::process::id().to_string())?;
+    let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
+    let _ = fs::remove_dir_all(&run_dir);
+    result.map(|_| ())
+}
+
+pub fn validate_image(cfg: &Config) -> Result<()> {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
+    if cfg.image.is_empty() || cfg.image.starts_with('.') || !cfg.image.chars().all(safe) {
+        bail!("invalid image name {:?}", cfg.image);
+    }
+    let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
+    if !lower.is_dir() || lower.metadata()?.uid() != userns::ID_BASE {
+        bail!("image {:?} is missing or isn't owned by the sandbox ID range", cfg.image);
+    }
+    Ok(())
+}
+
+pub fn new_id() -> String { run_id() }
+
 fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     // The quota goes on the run dir while it's still empty, so upper/ and
     // work/ (and everything the sandbox writes) inherit its project.
@@ -114,7 +152,13 @@ fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
 }
 
 fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
+    spawn_and_wait_mode(cfg, id, layers, None, None)
+}
+
+fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
+    listener: Option<UnixListener>, ready: Option<&OwnedFd>) -> Result<i32> {
     let cgroup = Cgroup::create(id, &cfg.limits)?;
+    let persistent = listener.is_some();
 
     // Two one-byte handshakes over a pair of pipes. Parent → child: "you're in
     // your cgroup" and later "your ID maps are written". Child → parent: "I've
@@ -145,7 +189,7 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
         | CloneFlags::CLONE_NEWIPC;
 
     let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx) {
+    let child = Box::new(|| match init(cfg, layers, &to_child_rx, &to_parent_tx, listener.as_ref()) {
         Ok(code) => code as isize,
         Err(e) => {
             eprintln!("kiln: {e:#}");
@@ -180,6 +224,15 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
         }
         userns::write_maps(pid)?;
         write(&to_child_tx, b"1").context("signal child")?;
+        if persistent {
+            if read(&to_parent_rx, &mut buf).context("wait for persistent init")? == 0 {
+                return Ok(());
+            }
+        }
+        if let Some(ready) = ready {
+            fs::write(run_dir(id).join("init.pid"), pid.to_string())?;
+            write(ready, b"1").context("signal create")?;
+        }
         Ok(())
     })();
     drop(to_child_tx);
@@ -240,8 +293,11 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
 
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
 /// then becomes its init and returns the command's exit code.
-fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedFd) -> Result<i32> {
-    close_fds_except(&[from_parent.as_raw_fd(), to_parent.as_raw_fd()])?;
+fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedFd,
+    listener: Option<&UnixListener>) -> Result<i32> {
+    let mut keep = vec![from_parent.as_raw_fd(), to_parent.as_raw_fd()];
+    if let Some(listener) = listener { keep.push(listener.as_raw_fd()); }
+    close_fds_except(&keep)?;
 
     // Wait for the parent to put us in our cgroup.
     wait_for_parent(from_parent)?;
@@ -346,6 +402,11 @@ fn init(cfg: &Config, layers: &Layers, from_parent: &OwnedFd, to_parent: &OwnedF
         landlock::restrict_writes(&cfg.writable)?;
     }
     seccomp::install()?;
+
+    if let Some(listener) = listener {
+        write(to_parent, b"1").context("signal persistent init ready")?;
+        return init::serve(listener);
+    }
 
     let argv: Vec<CString> = cfg
         .cmd
