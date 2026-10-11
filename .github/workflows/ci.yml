@@ -1,0 +1,70 @@
+# Unprivileged checks only. The privileged regression checks
+# (scripts/review-regressions.sh) need root and a prepared host, and are run
+# by hand in the Lima VM.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup default 1.88.0
+          rustc --version
+          cargo clippy --version
+
+      - name: Benchmark harness tests
+        run: python3 -I -m unittest discover -s bench/tests -v
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Shell syntax
+        run: |
+          git ls-files -z '*.sh' | while IFS= read -r -d '' f; do
+            case $(head -n 1 "$f") in
+              *bash*) bash -n "$f" ;;
+              *) sh -n "$f" ;;
+            esac || { echo "::error file=$f::shell syntax error"; exit 1; }
+          done
+
+      - name: JSON validity
+        run: |
+          git ls-files -z '*.json' | python3 -I -c '
+          import json, sys
+          bad = 0
+          for name in filter(None, sys.stdin.buffer.read().split(b"\0")):
+              path = name.decode()
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      json.load(f)
+              except (ValueError, UnicodeDecodeError) as e:
+                  print(f"::error file={path}::{e}")
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          '
+
+      - name: Whitespace
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

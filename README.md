@@ -3,10 +3,36 @@
 A small Linux sandbox runtime, written in Rust, for running AI agent tool calls.
 Built layer by layer to learn how containers actually work.
 
+## Security status
+
+kiln is an **experimental, shared-kernel** runtime. Every sandbox runs on the
+host's kernel, so a kernel bug reachable from inside a sandbox can compromise
+the host. The design and code have been reviewed adversarially by AI models
+(see [From the first review](#from-the-first-review) and
+[From the second review](#from-the-second-review)), but **not audited by a
+professional security firm**. Do not use kiln as a security boundary for
+hostile multi-tenant workloads.
+
+Known limits:
+
+- All sandboxes share one host UID/GID range (2000000000-2000065535), so the
+  user ID does not separate one sandbox from another.
+- The seccomp filter is a denylist of risky syscalls, not an allowlist.
+- kiln runs as root, and so do its host services, `kiln dns` and
+  `kiln metrics`. The optional Prometheus and Grafana stack also runs on the
+  host. A bug in any of them is a bug on the host.
+- The supported and dogfooded environment is Ubuntu 24.04 with Linux 6.8 or
+  newer, in the Lima VM below. Other distributions and kernels are untested.
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
 ## Dev setup (macOS)
 
 macOS has no namespaces or cgroups, so kiln builds and runs inside a Linux VM.
-This folder is mounted read-write into the VM at the same path.
+[`lima.yaml`](lima.yaml) mounts `~/Projects/kiln` on the Mac read-write into
+the VM at the same path. If you cloned kiln somewhere else, edit the one
+`mounts` entry in `lima.yaml` before `limactl create`, and run the commands
+below from the clone inside the VM.
 
 ```sh
 brew install lima
@@ -38,6 +64,20 @@ sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
 published SHA-256, and verifies the detached release signature against the
 pinned Alpine release key. It builds the image in a same-filesystem staging
 directory and atomically exchanges it with the installed image.
+
+### Tests
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on Ubuntu
+24.04 x86_64 for every push and pull request: the Python benchmark-harness
+tests, `cargo test`, `cargo clippy` with warnings as errors, shell syntax
+checks, JSON validation and `git diff --check`. None of it needs root.
+
+The privileged namespace, network, quota and lifecycle regression checks are
+still manual. Run them in the Lima VM after `scripts/install.sh`:
+
+```sh
+scripts/review-regressions.sh
+```
 
 ## Layers
 
@@ -409,3 +449,14 @@ in their code and service configuration:
   to Grafana through a systemd drop-in, and resets it on existing installs.
   Read it with `sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p'
   /etc/grafana/kiln-admin.env`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately as
+described in [SECURITY.md](SECURITY.md), not in public issues. Changes are
+listed in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Copyright 2026 Stephen Estrada. Licensed under the
+[Apache License, Version 2.0](LICENSE).
