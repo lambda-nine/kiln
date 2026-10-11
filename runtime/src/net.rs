@@ -36,6 +36,9 @@ const PRIVATE_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.
 
 const FORWARD_RULES: &[&str] = &[
     "type filter hook forward priority filter; policy accept;",
+    // The conntrack table is host-wide. Keep one sandbox from filling it with
+    // distinct UDP or TCP tuples; the dynamic count follows its source IP.
+    "iifname \"kiln0\" ct state new add @connlimit { ip saddr ct count over 256 } counter name \"conntrack_rejected\" counter reject with icmpx admin-prohibited",
     // Every outbound packet goes through the current policy. Conntrack entries
     // outlive leases, so an established-first rule would cross IP reuse.
     "iifname \"kiln0\" ip saddr vmap @egress",
@@ -216,6 +219,9 @@ pub struct Rejected {
     pub egress_total: u64,
     /// Packets from sandboxes to the host itself (the input chain).
     pub host_total: u64,
+    /// New flows refused because their source IP already has 256 conntrack
+    /// entries. This protects the host-wide table from one sandbox.
+    pub conntrack_total: u64,
 }
 
 pub fn rejected() -> Rejected {
@@ -234,6 +240,7 @@ pub fn rejected() -> Rejected {
         let packets = sum_packets(line);
         match block.split_once(' ') {
             Some(("counter", "egress_rejected")) => found.egress_total += packets,
+            Some(("counter", "conntrack_rejected")) => found.conntrack_total += packets,
             Some(("chain", "input")) => found.host_total += packets,
             Some(("chain", name)) => {
                 if let Some(ip) = name.strip_prefix("sb_").and_then(|n| n.replace('_', ".").parse().ok()) {
@@ -411,6 +418,8 @@ fn reconcile_ruleset() -> Result<()> {
     nft += &format!("add element inet kiln private {{ {PRIVATE_RANGES} }}\n");
     nft += "add map inet kiln egress { type ipv4_addr : verdict; }\n";
     nft += "add counter inet kiln egress_rejected\n";
+    nft += "add set inet kiln connlimit { type ipv4_addr; flags dynamic; }\n";
+    nft += "add counter inet kiln conntrack_rejected\n";
     for (name, rules) in [
         ("forward", FORWARD_RULES),
         ("input", INPUT_RULES),

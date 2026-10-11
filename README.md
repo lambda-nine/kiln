@@ -212,6 +212,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   lock, kiln restores the private-address set and replaces any noncanonical
   input, forward or NAT hook chain in one nft transaction. Active sandbox
   chains and verdict-map entries remain in place.
+- **Conntrack is bounded per sandbox IP.** Before egress policy, a dynamic nft
+  set rejects new flows once an IP has 256 conntrack entries. The count remains
+  across IP reuse until old flows expire, so restarting sandboxes cannot reset
+  the host protection. `kiln metrics` reports the rejected packets.
 - **Sandbox-to-sandbox traffic never hits the firewall.** Frames between two
   ports of the same bridge are switched, not routed, so the inet forward hook
   never sees them. kiln sets `isolated on` for each bridge port instead.

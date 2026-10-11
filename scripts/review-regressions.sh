@@ -80,7 +80,23 @@ echo "6. Alpine release signature"
 scripts/fetch-alpine.sh --verify-only
 echo "PASS"
 
-echo "7. Cleanup"
+echo "7. Per-sandbox conntrack limit"
+before=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
+sudo "$KILN" run --net full --memory 64M --pids 256 --disk 16M -- sh -c '
+    i=0
+    while [ "$i" -lt 320 ]; do
+        (printf x | nc -u -w 1 1.1.1 "$((10000 + i))" >/dev/null 2>&1) &
+        i=$((i + 1))
+        [ $((i % 70)) -eq 0 ] && wait
+    done
+    wait
+'
+after=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
+echo "Conntrack-limit rejects: before=$before after=$after"
+[ "$after" -gt "$before" ] || { echo "FAIL: conntrack limit did not reject excess flows"; exit 1; }
+echo "PASS"
+
+echo "8. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

@@ -328,6 +328,7 @@ fn render() -> String {
     total("kiln_all_cpu_seconds_total", "counter", "CPU time used by all sandboxes since boot, exited ones included (cpu.stat usage_usec of the parent cgroup).", all.cpu_stat.get("usage_usec").map(|&v| micros(v)));
     total("kiln_all_egress_rejected_packets_total", "counter", "Packets rejected by any sandbox's egress policy since boot (nftables named counter egress_rejected).", Some(all.rejected.egress_total as f64));
     total("kiln_all_host_rejected_packets_total", "counter", "Packets from sandboxes to the host itself that were rejected (nftables input chain).", Some(all.rejected.host_total as f64));
+    total("kiln_all_conntrack_limit_rejected_packets_total", "counter", "New flows rejected because a sandbox reached its per-IP conntrack limit.", Some(all.rejected.conntrack_total as f64));
     io_families(&mut m, "kiln_all", all.io.iter().map(|io| (None, io)));
 
     m.finish()

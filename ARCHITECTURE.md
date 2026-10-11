@@ -109,6 +109,7 @@ reconcile.
 | Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
 | Reaching the host or LAN         | Handled: only kiln's DNS forwarder on 10.88.0.1:53 is reachable |
 | Reused IP inheriting old flows   | Handled: policy checked on every outbound packet, not just new flows |
+| Conntrack table exhaustion       | Handled: nft dynamic count limits each sandbox IP to 256 tracked flows |
 | Partial or modified base firewall| Handled: shared nft objects and hook chains reconcile under the network lock |
 | Sandbox-to-sandbox traffic       | Handled: bridge port isolation |
 | Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start. Next step: the DNS forwarder adds the IPs it resolves to the sandbox's nft set |
