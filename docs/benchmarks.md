@@ -10,7 +10,7 @@ the same VM and the same root filesystem:
 | **Cold start**, no network (p50) | **13.2 ms** | 13.4 ms | 34.2 ms | 84.0 ms |
 | **Cold start**, with network (p50) | **22.2 ms** | | | 141.8 ms |
 | **Warm start**: run `true` in an existing sandbox (p50) | **3.5 ms** | 9.7 ms | 24.1 ms | 53.7 ms |
-| **Memory per extra idle sandbox** | **~0.4 MiB** | 0.2-0.4 MiB | 0.6-0.8 MiB | 5.3-5.6 MiB |
+| **Memory per extra idle sandbox** | **~0.4 MiB** | 0.2-0.4 MiB | 0.6-0.7 MiB | 5.2-5.5 MiB |
 | **Daemons that must run** | none | none | none | dockerd + containerd, ~160 MiB |
 | **Steady state** (CPU-bound / I/O-bound) | same | same | same | same |
 
@@ -337,7 +337,7 @@ one:
 
 `/sys/kernel/rcu_expedited` makes every grace period an expedited one (IPIs
 to all CPUs instead of waiting for them to pass a quiescent state), which
-shows how much of each build's time was grace periods (p50, ms;
+shows how much of each build's time was grace periods (p50 of 50 runs, ms;
 `bench/results/rcu-expedited`):
 
 | | normal RCU | expedited RCU |

@@ -1,0 +1,595 @@
+% kiln white paper. Numbers come from data/values.tex and the charts from
+% data/*.dat, both generated from bench/results:
+%   python3 -I gen-data.py ../../bench/results data && tectonic kiln-whitepaper.tex
+\documentclass[10pt,letterpaper]{article}
+
+\usepackage{fontspec}
+\setmainfont{XCharter}[Extension=.otf, UprightFont=*-Roman, BoldFont=*-Bold,
+  ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic, Numbers=Lining]
+\setmonofont{Inconsolatazi4}[Extension=.otf, UprightFont=*-Regular,
+  BoldFont=*-Bold, Scale=0.9]
+\usepackage[letterpaper,margin=0.9in]{geometry}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[font=small,labelfont=bf,skip=4pt]{caption}
+\usepackage{titlesec}
+\usepackage{float}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[hidelinks]{hyperref}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{12pt plus 2pt minus 2pt}{4pt}
+\titlespacing*{\subsection}{0pt}{8pt plus 2pt minus 1pt}{3pt}
+\setlength{\parskip}{4pt plus 1pt}
+\setlength{\parindent}{0pt}
+\setlength{\emergencystretch}{2.5em}
+\setlist{itemsep=1pt,topsep=2pt,parsep=0pt,leftmargin=1.3em}
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\textfraction}{0.1}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\us}{\char`\_}
+\input{data/values.tex}
+% \V{name}: a number from bench/results (see gen-data.py).
+\newcommand{\V}[1]{\ifcsname v@#1\endcsname\csname v@#1\endcsname\else\textbf{??#1??}\fi}
+\newcommand{\ms}[1]{\V{#1}\,ms}
+
+\definecolor{kiln}{HTML}{2A78D6}
+\definecolor{other}{HTML}{9A998F}
+\definecolor{before}{HTML}{EB6834}
+\definecolor{crunc}{HTML}{1BAF7A}
+\definecolor{dockerc}{HTML}{7A5AC8}
+
+\pgfplotsset{
+  kilnbars/.style={width=0.48\linewidth, height=42mm, xbar, bar width=7pt,
+    xmin=0, axis x line*=bottom, axis y line*=left, ytick=data,
+    tick label style={font=\footnotesize}, label style={font=\footnotesize},
+    title style={font=\footnotesize\bfseries}, enlarge y limits=0.2,
+    bar shift=0pt, every axis plot/.append style={draw=none},
+    xmajorgrids, grid style={gray!20}},
+}
+
+\tikzset{
+  box/.style={draw, rounded corners=2pt, align=center, fill=white, inner sep=3pt, font=\footnotesize},
+  arr/.style={-{Stealth[length=2mm]}, semithick},
+}
+
+\title{\vspace{-1.4em}\textbf{kiln: a container runtime for short-lived,\\untrusted AI agent workloads}\\[3pt]
+\large White paper}
+\author{Stephen Estrada}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1em}
+
+\begin{abstract}
+\noindent AI agents run code as a long series of short tool calls: a shell
+command, a test run, a script the model just wrote. Each call is untrusted, each
+one blocks the agent, and between calls the sandbox sits idle. kiln is a Linux
+container runtime built for exactly that pattern. On the same VM and root
+filesystem as crun, runc and Docker, it starts a sandbox in \ms{final/kiln-none/p50}
+cold (p50), the same as crun and \V{ratio/docker-none-over-kiln}$\times$ faster
+than Docker; with networking, \ms{final/kiln-net/p50} against Docker's
+\ms{final/docker-net/p50}. It runs a command in an existing sandbox in
+\ms{warm/exec-kiln/p50}, against \ms{warm/exec-crun/p50} for crun,
+\ms{warm/exec-runc/p50} for runc and \ms{warm/exec-docker/p50} for Docker. An
+idle sandbox costs the host about 0.4\,MiB and needs no daemon. It does this
+with a user namespace, a seccomp filter, a per-sandbox disk quota and an
+egress policy turned on by default. Once code is running, every runtime is
+equally fast, because it is the same kernel; kiln's advantage is entirely in the
+cost around the code, and this paper claims nothing beyond what was measured.
+\end{abstract}
+
+\begin{table}[H]
+\centering\small
+\caption{Summary. Times are p50 of 100 runs (ms); memory is the growth of host
+memory per extra idle sandbox (KiB, two runs of 50). Details and conditions in
+\S\ref{sec:results} and \S\ref{sec:fair}.}
+\label{tab:summary}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & kiln & crun & runc & Docker \\
+\midrule
+Cold start, no network & \textbf{\V{final/kiln-none/p50}} & \V{final/crun-none/p50} & \V{final/runc-none/p50} & \V{final/docker-none/p50} \\
+Cold start, with network & \textbf{\V{final/kiln-net/p50}} & --- & --- & \V{final/docker-net/p50} \\
+Warm start (exec \code{true}) & \textbf{\V{warm/exec-kiln/p50}} & \V{warm/exec-crun/p50} & \V{warm/exec-runc/p50} & \V{warm/exec-docker/p50} \\
+Memory per idle sandbox (KiB) & \V{idle-run1/fifty/kiln/per}--\V{idle-run2/fifty/kiln/per} & \V{idle-run2/fifty/crun/per}--\V{idle-run1/fifty/crun/per} & \V{idle-run1/fifty/runc/per}--\V{idle-run2/fifty/runc/per} & \V{idle-run1/fifty/docker/per}--\V{idle-run2/fifty/docker/per} \\
+Daemons that must run & none & none & none & ${\approx}$\V{idle-run1/docker-daemons-pss-mib}\,MiB \\
+User namespace, seccomp, disk quota & all three & none & none & seccomp \\
+Steady-state CPU and I/O & \multicolumn{4}{c}{the same within noise} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{The problem: agents pay the overhead on every step}
+
+An agent works in a loop: the model decides on an action, a tool runs it, the
+result goes back to the model, and the model decides again. Tools that touch the
+system (run a command, install a package, execute generated code) need a
+sandbox, because the code was written by a model or downloaded from somewhere
+nobody checked. Three properties of this workload decide what a sandbox runtime
+should optimize:
+
+\begin{enumerate}
+\item \textbf{Latency multiplies by the number of steps.} The loop blocks on
+every tool call, so whatever the runtime adds is paid per step, not per session.
+For illustration only: a session of 50 tool calls run with \code{docker exec}
+spends 50 $\times$ \ms{warm/exec-docker/p50} $\approx$ 2.7\,s in the runtime
+alone; with \code{kiln exec}, 50 $\times$ \ms{warm/exec-kiln/p50} $\approx$
+0.18\,s.
+\item \textbf{Sandboxes are mostly idle.} Between calls the model is thinking,
+often for seconds. What a sandbox costs while idle, times the number of
+concurrent sessions, is what a host pays.
+\item \textbf{The code is untrusted.} Isolation has to be the default, not a
+flag someone remembers, and it should not have to be traded for latency.
+\end{enumerate}
+
+What does \emph{not} differ between runtimes is how fast the code runs once
+started: a container is a set of kernel features around ordinary processes, so a
+CPU-bound or I/O-bound workload runs on the same kernel whichever runtime set it
+up (\S\ref{sec:steady}). A runtime can only win on the cost around the code:
+starting, idling, running the next command and tearing down.
+
+% ---------------------------------------------------------------------------
+\section{Why general-purpose runtimes pay for things agents don't need}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=4mm, lab/.style={font=\scriptsize, above}]
+  \node[font=\footnotesize\bfseries, anchor=west] at (0,0) {Start (\code{run})};
+  \node[box, anchor=west] (d1) at (0,-0.6) {docker CLI};
+  \node[box, right=of d1] (d2) {dockerd};
+  \node[box, right=of d2] (d3) {containerd};
+  \node[box, right=of d3] (d4) {shim};
+  \node[box, right=of d4] (d5) {runc};
+  \node[box, right=of d5, fill=gray!10] (d6) {container};
+  \foreach \a/\b in {d1/d2,d2/d3,d3/d4,d4/d5,d5/d6} \draw[arr] (\a) -- (\b);
+  \node[font=\scriptsize, right=2mm of d6] {Docker \ms{final/docker-none/p50}};
+  \node[box, anchor=west] (r1) at (0,-1.35) {runc / crun};
+  \node[box, right=of r1, fill=gray!10] (r2) {container};
+  \draw[arr] (r1) -- (r2);
+  \node[font=\scriptsize, right=2mm of r2] {runc \ms{final/runc-none/p50}, crun \ms{final/crun-none/p50}};
+  \node[box, anchor=west, fill=kiln!12] (k1) at (0,-2.1) {kiln};
+  \node[box, right=14mm of k1, fill=kiln!12] (k2) {sandbox, born in its cgroup};
+  \draw[arr] (k1) -- node[lab] {\code{clone3}} (k2);
+  \node[font=\scriptsize, right=2mm of k2] {kiln \ms{final/kiln-none/p50}};
+  \node[font=\footnotesize\bfseries, anchor=west] at (0,-2.95) {Next command (\code{exec})};
+  \node[box, anchor=west] (e1) at (0,-3.8) {new host process};
+  \node[box, right=56mm of e1, fill=gray!10] (e2) {container};
+  \draw[arr] (e1) -- node[lab] {\code{setns} into 6 namespaces, cgroup, caps, seccomp} (e2);
+  \node[font=\scriptsize, right=2mm of e2] {crun \ms{warm/exec-crun/p50}, runc \ms{warm/exec-runc/p50}, Docker \ms{warm/exec-docker/p50}};
+  \node[box, anchor=west, fill=kiln!12] (x1) at (0,-4.6) {\code{kiln exec}};
+  \node[box, right=27mm of x1, fill=kiln!12] (x2) {PID 1};
+  \node[box, right=9mm of x2, fill=kiln!12] (x3) {command};
+  \draw[arr] (x1) -- node[lab] {socket + stdio fds} (x2);
+  \draw[arr] (x2) -- node[lab] {fork} (x3);
+  \node[font=\scriptsize, right=2mm of x3] {inherits every restriction: kiln \ms{warm/exec-kiln/p50}};
+\end{tikzpicture}
+\caption{The path from a request to running code. Docker crosses an API and two
+daemons; runc and crun are single processes. For the next command in an existing
+sandbox, the others start a host process that joins the container from outside;
+kiln asks the sandbox's own PID 1 to fork it. Times are cold p50.}
+\label{fig:paths}
+\end{figure}
+
+General-purpose runtimes are built for long-running services managed by people
+and orchestrators, and their costs follow from that (Figure~\ref{fig:paths}).
+
+\textbf{Daemon layers.} \code{docker run} goes from the CLI to \code{dockerd}
+over its API, to \code{containerd}, to a per-container shim, and finally to runc,
+which does the actual work. Those layers buy remote management, logging
+drivers, restart policies and a stable API, none of which a sandbox for one tool
+call uses. They show up as start time (\ms{final/docker-none/p50} for Docker
+against \ms{final/runc-none/p50} for runc, which Docker uses underneath, though
+Docker also prepares an overlay snapshot and a seccomp profile), as resident
+memory (\code{dockerd} and \code{containerd} together use about
+\V{idle-run1/docker-daemons-pss-mib}\,MiB PSS whether one container runs or
+none), and as about 11\,MiB of private memory per container for its Go shim
+and PID~1 together (\V{idle-run1/one/docker/uss}\,KiB USS).
+
+\textbf{Generic image handling.} Docker and containerd manage OCI images:
+content-addressed layers, snapshotters, registries. That machinery exists to
+distribute images between machines. An agent sandbox starts from one image that
+is already on the host, so kiln uses that image directly as the read-only lower
+layer of an overlay, with a per-sandbox writable layer on top.
+
+\textbf{Joining from outside.} To run another command in an existing container,
+\code{runc exec} and \code{crun exec} start a new host process that enters the
+container's namespaces one by one with \code{setns}, joins its cgroup, sets
+capabilities and seccomp, and only then executes the command. runc, a Go
+program, joins the cgroup by writing to \code{cgroup.procs}, which migrates a
+running process and waits for an RCU grace period; crun creates the process
+inside the cgroup with \code{clone3}. Docker adds its daemon path on top of runc.
+
+\textbf{Grace periods on the critical path.} Making the kernel's RCU grace
+periods expedited, a host-wide setting, cut runc's cold start from
+\ms{rcu/0/runc-none/p50} to \ms{rcu/1/runc-none/p50} and kiln's former build's
+from \ms{rcu/0/kiln-before-none/p50} to \ms{rcu/1/kiln-before-none/p50}: both
+were waiting for grace periods. Current kiln and crun are unaffected
+(\ms{rcu/0/kiln-now-none/p50} vs \ms{rcu/1/kiln-now-none/p50}; crun
+\ms{rcu/0/crun-none/p50} vs \ms{rcu/1/crun-none/p50}).
+
+% ---------------------------------------------------------------------------
+\section{Design choices that buy speed}
+
+\textbf{No daemon.} \code{kiln run} is one process that sets up the sandbox,
+waits for it and removes it. All state lives in the kernel and a few
+directories, named by a run ID. A persistent sandbox (\code{kiln create}) gets a
+small supervisor of its own, a shim, which owns its cleanup; the shim and the
+sandbox's PID 1 run the same binary and share almost all their pages, so the
+two together cost \V{idle-run1/one/kiln/uss}\,KiB of private memory
+(USS) against Docker's \V{idle-run1/one/docker/uss}\,KiB for its shim and PID 1.
+
+\textbf{Born in the cgroup.} kiln creates the sandbox with
+\code{clone3(CLONE\us{}INTO\us{}CGROUP)}, so the child exists inside its cgroup from
+its first instruction and no running process is ever migrated. The older
+approach, writing the PID to \code{cgroup.procs}, cost 5--15\,ms of grace-period
+waiting on every cold start and was the largest single step in kiln's own
+before-and-after (Figure~\ref{fig:steps}).
+
+\textbf{Talking to the kernel directly.} Starting a helper program costs
+milliseconds before it does anything: a cold \code{nft} takes 3.9\,ms just to
+load its libraries. kiln configures links, addresses and routes with its own
+rtnetlink client instead of \code{ip} and \code{nsenter}, runs exactly one
+\code{nft} per networked start (its policy batch ends with a listing that is
+checked against the shared base ruleset, and repairs are committed only on
+drift), sends teardown deletions as one nfnetlink batch whose socket is closed
+by a short-lived child so kiln does not wait for the kernel's deferred
+freeing, and leaves the host end of the veth pair to the dying network
+namespace.
+
+\textbf{Exec through PID 1.} A persistent sandbox's PID 1 holds a Unix socket,
+opened before the sandbox's root was swapped. \code{kiln exec} sends the
+arguments and passes its stdin, stdout and stderr as file descriptors; PID 1
+forks the command onto them and returns its exit code. The command is born with
+every namespace, the cgroup, the seccomp filter and the Landlock policy, because
+it inherits them. Nothing joins from outside, so there is nothing to re-apply.
+
+\textbf{Security on by default, inside the measured time.} Every number in this
+paper includes what kiln sets up by default and the others, as benchmarked, did
+not (Table~\ref{tab:setup}): a user namespace that makes sandbox root an
+unprivileged host UID, a seccomp filter with \code{no\us{}new\us{}privs}, a
+per-sandbox XFS disk quota, and an init process that forwards signals and reaps
+orphans. Networked sandboxes get an nftables egress policy (no private ranges
+with \code{--net full}; only listed destinations with \code{--allow}) and a DNS
+forwarder that resolves only allowed names. A Landlock read-only mode is
+available as an option; it was not part of the benchmark runs.
+
+\begin{table}[t]
+\centering\small
+\caption{What each runtime sets up in the benchmarks (from \code{docs/benchmarks.md}).}
+\label{tab:setup}
+\begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+ & kiln & \code{docker run --rm} & runc / crun (bare spec) \\
+\midrule
+Path to the kernel & one process & CLI, dockerd, containerd, shim, runc & one process \\
+Root filesystem & overlay on XFS, per-run quota & overlay snapshot & unpacked tree, read-only \\
+Namespaces & PID, mount, UTS, IPC, net, cgroup, \textbf{user} & same, no user ns & same, no user ns \\
+cgroup limits & memory, swap, CPU, PIDs, OOM group kill & memory, swap, CPU, PIDs & memory, swap, CPU, PIDs \\
+Syscall filter & seccomp denylist, \code{no\us{}new\us{}privs} & default seccomp profile & none \\
+PID 1 & kiln-init (signals, reaping) & the command & the command \\
+Network (networked cases) & veth, bridge, nft chain, DNS policy & veth on docker0, iptables NAT & loopback only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+\textbf{Method.} Each number is the wall time of one command measured with
+hyperfine without a shell: 10 warm-up runs, then 100 timed runs, with 100\,ms of
+idle before each (``cold''; back-to-back runs reuse warm kernel paths and hide
+real costs). Every runtime starts the same Alpine 3.24.2 minirootfs with kiln's
+default limits (512\,MiB memory without swap, 1 CPU, 128 PIDs). The workload is
+\code{true}, so the time is the runtime's own. Environment: MacBook Air (Apple
+M2), Lima VM (vz, 4 vCPU, 4\,GiB), Ubuntu 24.04, Linux 6.8.0-146 aarch64;
+Docker 29.1.3 with runc 1.3.4, runc 1.3.4, crun 1.14.1, kiln release build.
+
+\subsection{Cold start}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[kilnbars, title={No network}, xlabel={ms (p50; whisker to p95)},
+  yticklabels={Docker, runc, crun, kiln}, xmax=115]
+  \addplot+[fill=other, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/cold-none.dat};
+  \addplot+[fill=kiln, restrict y to domain=3:3, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/cold-none.dat};
+  \addplot[only marks, mark=none, nodes near coords, point meta=explicit,
+    nodes near coords style={font=\scriptsize, anchor=west, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
+    table[x=p95, y=y, meta=p50] {data/cold-none.dat};
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[kilnbars, title={With network}, xlabel={ms (p50; whisker to p95)},
+  yticklabels={Docker (bridge), kiln (\code{--net full})}, xmax=195, height=30mm]
+  \addplot+[fill=other, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/cold-net.dat};
+  \addplot+[fill=kiln, restrict y to domain=1:1, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/cold-net.dat};
+  \addplot[only marks, mark=none, nodes near coords, point meta=explicit,
+    nodes near coords style={font=\scriptsize, anchor=west, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
+    table[x=p95, y=y, meta=p50] {data/cold-net.dat};
+\end{axis}
+\end{tikzpicture}
+\caption{Cold start of \code{true}, 100 runs each. runc and crun were measured
+only without a network: their bare configuration has loopback only.}
+\label{fig:cold}
+\end{figure}
+
+Without a network, kiln and crun tie: p50 \ms{final/kiln-none/p50} and
+\ms{final/crun-none/p50}, p95 \ms{final/kiln-none/p95} and
+\ms{final/crun-none/p95}, p99 \ms{final/kiln-none/p99} and
+\ms{final/crun-none/p99}. runc takes \ms{final/runc-none/p50}
+(\V{ratio/runc-none-over-kiln}$\times$) and Docker \ms{final/docker-none/p50}
+(\V{ratio/docker-none-over-kiln}$\times$), Figure~\ref{fig:cold}. With a
+network, kiln takes \ms{final/kiln-net/p50} (p95 \ms{final/kiln-net/p95})
+against Docker's \ms{final/docker-net/p50} (p95 \ms{final/docker-net/p95}),
+\V{ratio/docker-net-over-kiln}$\times$ faster, while installing a per-sandbox
+firewall chain and DNS policy.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.62\linewidth, height=52mm, xmode=log, xmin=2, xmax=200,
+  ymin=0, ymax=1, xlabel={ms (log scale)}, ylabel={fraction of runs},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize},
+  legend style={font=\scriptsize, at={(1.03,0.5)}, anchor=west, draw=none}, legend cell align=left,
+  xmajorgrids, ymajorgrids, grid style={gray!20},
+  log ticks with fixed point, xtick={2,5,10,20,50,100,200}]
+  \addplot[const plot, very thick, kiln] table[x=ms, y=frac] {data/cdf-kiln-none.dat};
+  \addplot[const plot, thick, crunc] table[x=ms, y=frac] {data/cdf-crun-none.dat};
+  \addplot[const plot, thick, before] table[x=ms, y=frac] {data/cdf-runc-none.dat};
+  \addplot[const plot, thick, dockerc] table[x=ms, y=frac] {data/cdf-docker-none.dat};
+  \addplot[const plot, very thick, kiln, dashed] table[x=ms, y=frac] {data/cdf-kiln-net.dat};
+  \addplot[const plot, thick, dockerc, dashed] table[x=ms, y=frac] {data/cdf-docker-net.dat};
+  \legend{kiln, crun, runc, Docker, kiln \code{--net full}, Docker bridge}
+\end{axis}
+\end{tikzpicture}
+\caption{Distribution of the cold-start runs. A few runs of the fastest
+runtimes finished in a few milliseconds (\V{final/kiln-none/under6} of 100 for
+kiln, \V{final/crun-none/under6} for crun, under 6\,ms): the 100\,ms pause did
+not always let the system go fully idle. Reported figures are percentiles of
+all 100 runs.}
+\label{fig:cdf}
+\end{figure}
+
+\textbf{Where kiln's time went.} Before this work, kiln took
+\ms{final-session-baseline/kiln-none/p50} cold without a network and
+\ms{final-session-baseline/kiln-net/p50} with one; back to back, the same build
+took \ms{baseline-b2b/kiln-none/p50}, which is why measuring cold mattered.
+Figure~\ref{fig:steps} shows each change, all builds measured in one session. Two
+causes explain almost all of the old time: waiting for RCU grace periods
+(migrating into the cgroup, closing nftables sockets after deleting commits,
+deleting the veth) and starting helper processes. What remains without a network
+is mostly creating the namespaces (1.6\,ms), the sandbox's mounts (2.5\,ms),
+starting the binary, and about 5\,ms between the command exiting and the host
+seeing the sandbox gone; a network adds one \code{nft} process and the veth
+(Table~\ref{tab:trace}).
+
+\begin{table}[H]
+\centering\small
+\caption{Where a cold start's time goes: \code{KILN\us{}TRACE} phases, medians of
+15 cold runs in ms, before and after this work (from \code{docs/benchmarks.md}).}
+\label{tab:trace}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{\code{--net none}} & \multicolumn{2}{c}{\code{--net full}} \\
+Phase & before & now & before & now \\
+\midrule
+Image check, storage, quota, overlay directories & 1.2 & 1.5 & 1.5 & 1.3 \\
+cgroup create & 0.6 & 0.9 & 0.8 & 0.9 \\
+Clone with five namespaces & 1.3 & 1.6 & 1.6 & 1.6 \\
+\textbf{Move the child into its cgroup} & \textbf{8.6} & gone & \textbf{9.9} & gone \\
+Network setup on the host & 4.5 & --- & \textbf{42.3} & 7.5 \\
+Child setup (mounts, \code{pivot\us{}root}, \code{/proc}, user ns) & ${\sim}$2 & ${\sim}$2.5 & ${\sim}$2 & ${\sim}$2.4 \\
+Command runs and exits & 1.4 & 1.6 & 0.9 & 1.0 \\
+Sandbox exit seen by the host & 5.0 & 5.3 & 5.1 & 5.3 \\
+\textbf{Network cleanup} & 0.1 & 0.1 & \textbf{21.4} & 0.3 \\
+cgroup and run directory cleanup & 0.3 & 0.3 & 0.2 & 0.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.82\linewidth, height=55mm, ymin=0, ymax=95,
+  xtick={0,...,9}, xticklabels={baseline, trace, clone3, netlink, one listing,
+  1-txn teardown, lazy leases, one nft, nfnetlink, leave veth},
+  x tick label style={font=\scriptsize, rotate=30, anchor=north east},
+  ylabel={ms, cold p50}, label style={font=\footnotesize}, tick label style={font=\footnotesize},
+  legend style={font=\scriptsize, at={(0.98,0.97)}, anchor=north east},
+  ymajorgrids, grid style={gray!20}, nodes near coords,
+  nodes near coords style={font=\tiny, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
+  \addplot[very thick, kiln, mark=*, mark size=1.5pt, dashed, nodes near coords style={anchor=south west}] table[x=step, y=p50] {data/steps-net-full.dat};
+  \addplot[very thick, kiln, mark=*, mark size=1.5pt, nodes near coords style={anchor=north}] table[x=step, y=p50] {data/steps-net-none.dat};
+  \legend{\code{--net full}, \code{--net none}}
+\end{axis}
+\end{tikzpicture}
+\caption{Cold-start p50 after each change, every build measured in the same
+session (\code{bench/results/steps}). Some changes only show in combination;
+\code{docs/benchmarks.md} explains each.}
+\label{fig:steps}
+\end{figure}
+
+\subsection{Warm start: the next command}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[kilnbars, width=0.6\linewidth, xlabel={ms to run \code{true} in a running sandbox (p50; whisker to p95)},
+  yticklabels={\code{docker exec}, \code{runc exec}, \code{crun exec}, \code{kiln exec}}, xmax=75]
+  \addplot+[fill=other, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/warm.dat};
+  \addplot+[fill=kiln, restrict y to domain=3:3, error bars/.cd, x dir=plus, x explicit, error bar style={black}]
+    table[x=p50, y=y, x error=err] {data/warm.dat};
+  \addplot[only marks, mark=none, nodes near coords, point meta=explicit,
+    nodes near coords style={font=\scriptsize, anchor=west, /pgf/number format/fixed, /pgf/number format/fixed zerofill, /pgf/number format/precision=1}]
+    table[x=p95, y=y, meta=p50] {data/warm.dat};
+\end{axis}
+\end{tikzpicture}
+\caption{Warm start, 100 runs each with 100\,ms idle before each run. kiln: a
+\code{kiln create} sandbox; others: a container running \code{sleep infinity}.}
+\label{fig:warm}
+\end{figure}
+
+For an agent session the sandbox is created once and each tool call runs in it,
+so warm start is the latency the agent sees on almost every step.
+\code{kiln exec} takes \ms{warm/exec-kiln/p50} (p99 \ms{warm/exec-kiln/p99}),
+against \ms{warm/exec-crun/p50} for crun (p99 \ms{warm/exec-crun/p99}),
+\ms{warm/exec-runc/p50} for runc (p99 \ms{warm/exec-runc/p99}) and
+\ms{warm/exec-docker/p50} for Docker (p99 \ms{warm/exec-docker/p99}),
+Figure~\ref{fig:warm}: \V{ratio/warm-crun-over-kiln}$\times$,
+\V{ratio/warm-runc-over-kiln}$\times$ and \V{ratio/warm-docker-over-kiln}$\times$
+kiln's time. With a network the numbers barely move (kiln
+\ms{warm/exec-kiln-net/p50}, Docker \ms{warm/exec-docker-net/p50}). The
+difference is the path in Figure~\ref{fig:paths}: a fork inside the sandbox
+against a new process joining from outside.
+
+\subsection{Idle overhead}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.6\linewidth, height=45mm, ybar, bar width=8pt, ymin=0, ymax=7600,
+  /pgf/number format/1000 sep={},
+  symbolic x coords={kiln,crun,runc,docker}, xtick=data,
+  xticklabels={kiln, crun, runc, Docker},
+  ylabel={KiB per idle sandbox}, label style={font=\footnotesize}, tick label style={font=\footnotesize},
+  nodes near coords, nodes near coords style={font=\tiny, rotate=90, anchor=west},
+  legend style={font=\scriptsize, at={(0.02,0.97)}, anchor=north west},
+  ymajorgrids, grid style={gray!20}, enlarge x limits=0.18]
+  \addplot[fill=kiln!70, draw=none] table[x=rt, y=run1] {data/idle.dat};
+  \addplot[fill=kiln!30, draw=none] table[x=rt, y=run2] {data/idle.dat};
+  \legend{run 1, run 2}
+\end{axis}
+\end{tikzpicture}
+\caption{Growth of host memory in use (\code{MemTotal $-$ MemAvailable}, page
+cache dropped) per sandbox when 50 idle sandboxes are started, two runs. Coarse
+(about $\pm$200\,KiB) but clear in order of magnitude. Not shown: Docker's
+daemons, about \V{idle-run1/docker-daemons-pss-mib}\,MiB PSS, paid once.}
+\label{fig:idle}
+\end{figure}
+
+Fifty idle sandboxes grew the host's memory use by \V{idle-run1/fifty/kiln/per}
+and \V{idle-run2/fifty/kiln/per}\,KiB per sandbox for kiln in two runs, against
+\V{idle-run1/fifty/crun/per} and \V{idle-run2/fifty/crun/per} for crun,
+\V{idle-run1/fifty/runc/per} and \V{idle-run2/fifty/runc/per} for runc, and
+\V{idle-run1/fifty/docker/per} and \V{idle-run2/fifty/docker/per} for Docker
+(Figure~\ref{fig:idle}). This counts kernel objects too: namespaces, mounts,
+page tables and the cgroup. kiln keeps a supervisor per persistent sandbox and
+still lands with crun and runc, which keep none: after start, their container is
+reparented to the host's init and nothing is left to clean up after it or to
+serve exec. Docker needs \code{dockerd} and \code{containerd} running in
+addition, about \V{idle-run1/docker-daemons-pss-mib}\,MiB PSS; kiln needs no
+daemon to start a sandbox (its DNS forwarder, \V{idle-run1/daemon/kiln-dns/pss}\,KiB
+PSS, is needed only for name lookups from networked sandboxes).
+
+\subsection{Steady state: the same everywhere}
+\label{sec:steady}
+
+Two single-threaded workloads under the same 1-CPU limit, timed inside the
+sandbox so start-up is excluded, \V{steady/cpu/kiln/n} runs each, interleaved:
+hashing 512\,MiB of zeros, and writing 1\,GiB to the sandbox's writable layer
+with \code{fsync}. CPU time is identical; I/O overlaps across all four with wide
+ranges, because the VM's disk is a file on the Mac's SSD (Table~\ref{tab:steady}).
+Where writes land differs by configuration (kiln's upper layer is on XFS in a
+loop device for its disk quota; Docker's on an overlay snapshot; runc's and
+crun's straight into the unpacked tree), which is a storage choice, not a
+runtime one.
+
+\begin{table}[H]
+\centering\small
+\caption{Steady state: median seconds (min--max) over \V{steady/cpu/kiln/n} runs.}
+\label{tab:steady}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & kiln & crun & runc & Docker \\
+\midrule
+CPU-bound & \V{steady/cpu/kiln/median} (\V{steady/cpu/kiln/min}--\V{steady/cpu/kiln/max}) & \V{steady/cpu/crun/median} (\V{steady/cpu/crun/min}--\V{steady/cpu/crun/max}) & \V{steady/cpu/runc/median} (\V{steady/cpu/runc/min}--\V{steady/cpu/runc/max}) & \V{steady/cpu/docker/median} (\V{steady/cpu/docker/min}--\V{steady/cpu/docker/max}) \\
+I/O-bound & \V{steady/io/kiln/median} (\V{steady/io/kiln/min}--\V{steady/io/kiln/max}) & \V{steady/io/crun/median} (\V{steady/io/crun/min}--\V{steady/io/crun/max}) & \V{steady/io/runc/median} (\V{steady/io/runc/min}--\V{steady/io/runc/max}) & \V{steady/io/docker/median} (\V{steady/io/docker/min}--\V{steady/io/docker/max}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------
+\section{Fairness and limitations}
+\label{sec:fair}
+
+\begin{itemize}
+\item \textbf{One machine, one VM.} Every number comes from a Lima VM (4 vCPU,
+4\,GiB) on an M2 MacBook Air: aarch64, Linux 6.8, Ubuntu 24.04. The Mac was
+otherwise in normal use, and results from different sessions differ by a few
+milliseconds; tables that compare kiln builds were measured in one session. The
+VM's vCPUs sleep when idle, so cold runs include waking them. Nothing was measured
+on x86-64 or on bare metal, and the benchmarks were run by kiln's author.
+\item \textbf{Not identical work.} Table~\ref{tab:setup} lists what each runtime
+sets up. kiln does more isolation than the bare runc and crun configurations
+(user namespace, seccomp, overlay with quota, an init process), and Docker more
+management. The networked comparison is kiln's nftables policy against Docker's
+iptables NAT; runc and crun had no networked case. Docker was configured with
+\code{ip-forward-no-drop} so its FORWARD policy would not drop kiln's traffic.
+\item \textbf{Bimodal cold runs.} A few cold runs of kiln and crun completed in
+a few milliseconds (Figure~\ref{fig:cdf}); percentiles over all 100 runs are
+reported, and the p50 is not affected by them.
+\item \textbf{Coarse memory.} Host-wide memory growth is good to about
+$\pm$200\,KiB per sandbox; per-process RSS, PSS and USS for one sandbox are in
+\code{docs/benchmarks.md}. Steady state used \V{steady/cpu/kiln/n} runs per case.
+\item \textbf{A trivial workload.} \code{true} isolates the runtime's cost. A
+real tool call adds its own run time, the same under every runtime.
+\item \textbf{Scope.} kiln has no OCI image or runtime-spec compatibility, runs
+on a single host, and has no orchestrator integration yet. Its isolation is a
+shared-kernel container's: a kernel bug reachable through an allowed syscall is
+still an escape.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Future work}
+
+\begin{itemize}
+\item \textbf{Pre-warmed pools.} A daemon that creates sandboxes ahead of time
+and hands one out on request would turn a cold start into an exec:
+\ms{warm/exec-kiln/p50} instead of \ms{final/kiln-none/p50}--\V{final/kiln-net/p50}\,ms.
+Networked pool members could have their veth pair and firewall chain prepared
+ahead too. This needs the planned daemon and a policy for pool size.
+\item \textbf{Smaller steps already measured.} Loading libnftables in-process
+instead of starting \code{nft} measured 0.55\,ms to load and 1.2\,ms to apply a
+policy, against 4--6\,ms for the process: 3--4\,ms per networked start. Returning
+the exit code before teardown would save most of the 5\,ms exit phase, at the
+cost of cleanup finishing after \code{kiln run} returns.
+\item \textbf{Snapshot and restore} of a prepared sandbox (installed packages,
+warm files) so a session can start from where a previous one left off; the
+overlay's upper layer already records exactly what a session changed.
+\item \textbf{Multiple hosts}: a daemon per node and a Kubernetes operator that
+places sandboxes, with the same per-node design.
+\item \textbf{Broader measurements}: x86-64, bare metal, more concurrency, and
+real agent workloads rather than \code{true}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Conclusion}
+
+A sandbox for agents is judged on the cost around the code: how fast it starts,
+how fast it runs the next command, and what it costs while it waits. Measured on
+the same VM and root filesystem, kiln starts as fast as crun, runs the next
+command \V{ratio/warm-crun-over-kiln}$\times$ faster than crun and
+\V{ratio/warm-docker-over-kiln}$\times$ faster than Docker, and idles at a few
+hundred KiB with no daemon, while turning on a user namespace, seccomp, a disk
+quota and an egress policy by default. It does not make code run faster once
+started; no runtime can, because the kernel does that part.
+
+\end{document}
