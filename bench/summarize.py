@@ -1,6 +1,6 @@
 """Prints a Markdown table (mean, p50, p95, p99 in ms) from hyperfine JSON.
 
-Each row is named after its file, or after the command when a file holds
+Each row is named after its file, plus the command when a file holds
 several (hyperfine run with more than one command).
 
 usage: python3 -I summarize.py results/<label>/*.json
@@ -27,6 +27,6 @@ for path in sys.argv[1:]:
         ms = sorted(t * 1000 for t in result["times"])
         name = os.path.basename(path).removesuffix(".json")
         if len(results) > 1:
-            name = result["command"]
+            name += ": " + result["command"]
         stats = [sum(ms) / len(ms)] + [percentile(ms, p) for p in (50, 95, 99)]
         print(f"| {name} | {len(ms)} | " + " | ".join(f"{s:.1f}" for s in stats) + " |")
