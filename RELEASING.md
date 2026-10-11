@@ -62,6 +62,7 @@ Build in the Lima VM (Ubuntu 24.04, aarch64):
 ```sh
 cargo build --release --locked
 file target/release/kiln      # ELF 64-bit LSB ... ARM aarch64
+target/release/kiln --version # release commit, clean
 sudo install -m 0755 target/release/kiln /usr/local/bin/kiln
 ```
 
@@ -91,7 +92,9 @@ release. **Never commit rootfs tarballs to Git.**
 | `workload_rootfs_tar` | `/var/lib/kiln-bench/workload-rootfs.tar` | 117867520 | `89e1b9c5ed208195b2779515491468ac0da36fa3158f7a5f7bdd7f3192193359` |
 
 ```sh
-cp /var/lib/kiln-bench/alpine-rootfs.tar /var/lib/kiln-bench/workload-rootfs.tar "$out/"
+sudo install -m 0644 /var/lib/kiln-bench/alpine-rootfs.tar \
+  /var/lib/kiln-bench/workload-rootfs.tar "$out/"
+sudo chown "$(id -u):$(id -g)" "$out/alpine-rootfs.tar" "$out/workload-rootfs.tar"
 (cd "$out" && sha256sum alpine-rootfs.tar workload-rootfs.tar)
 ```
 

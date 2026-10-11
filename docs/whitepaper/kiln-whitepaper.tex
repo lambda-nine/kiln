@@ -98,7 +98,9 @@ for an HTTP GET, as fixed overhead was amortized. Non-networked starts need no
 shared daemon. kiln provides a user namespace, seccomp, a per-sandbox
 disk quota and optional egress policy by default. These are product-level
 comparisons of the tested stacks, not component benchmarks; \code{true} measures
-runtime overhead, not end-to-end agent speed.
+runtime overhead, not end-to-end agent speed. kiln is experimental defense in
+depth for a trusted operator, not a hostile multi-tenant boundary: sandboxes
+share the host kernel and one host UID/GID range.
 \end{abstract}
 
 \begin{table}[H]
@@ -271,8 +273,9 @@ namespace.
 
 \textbf{Exec through PID 1.} A persistent sandbox's PID 1 holds a Unix socket,
 opened before the sandbox's root was swapped. \code{kiln exec} sends the
-arguments and passes its stdin, stdout and stderr as file descriptors; PID 1
-forks the command onto them and returns its exit code. The command is born with
+arguments and passes redirected stdin, stdout and stderr as file descriptors;
+terminal descriptors are refused until kiln has a controlled PTY mode. PID 1
+forks the command onto the descriptors and returns its exit code. The command is born with
 every namespace, the cgroup, the seccomp filter and the Landlock policy, because
 it inherits them. Nothing joins from outside, so there is nothing to re-apply.
 

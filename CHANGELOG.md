@@ -22,6 +22,8 @@ boundary for hostile multi-tenant workloads; see [SECURITY.md](SECURITY.md).
 - Sandbox root mapped to an unprivileged host UID range, `no_new_privs`, a
   seccomp-bpf denylist that also blocks namespace creation, and an optional
   Landlock read-only mode (`--read-only`, `--writable`).
+- Terminal-injection ioctls are denied. Persistent `kiln exec` refuses raw
+  terminal descriptors until kiln has a controlled PTY mode.
 - Networking: no network by default; `--net full` or `--allow` allowlists over
   a bridge, veth pair and nftables egress policy that blocks the host, private
   ranges and other sandboxes, with per-IP conntrack limits and a filtering DNS
@@ -32,6 +34,7 @@ boundary for hostile multi-tenant workloads; see [SECURITY.md](SECURITY.md).
   setup.
 - Setup scripts for a Lima Ubuntu 24.04 VM, the Alpine image (pinned release
   key, checksum and signature), XFS storage, services and monitoring.
+- `kiln --version` reports the package version and source commit provenance.
 
 ### Reviews and tests
 

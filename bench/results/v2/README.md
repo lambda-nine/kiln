@@ -11,6 +11,11 @@ For publication, the author's absolute checkout path in each manifest's
 privacy-only metadata edit: the recorded config SHA-256, raw measurements,
 commands and all generated statistics are unchanged.
 
+The recorded `lima_config` SHA-256 identifies the historical file used for the
+campaign. The current `lima.yaml` replaces that file's author-specific mount
+source with `{{.Home}}/Projects/kiln`, so it intentionally has a different
+hash; do not rewrite the manifests to match it.
+
 ## Layout
 
 - `boot-01-latency` through `boot-05-latency`: randomized lifecycle latency

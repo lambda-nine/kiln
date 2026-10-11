@@ -504,8 +504,9 @@ exec. runc (a Go program) joins the cgroup by writing to `cgroup.procs`, the
 same RCU wait as in [section 1](#1-rcu-grace-periods); crun (C) creates the
 process inside it with `clone3(CLONE_INTO_CGROUP)`, as seen with `strace`.
 Docker adds its API path (CLI → dockerd → containerd → shim) on top of runc. `kiln exec` doesn't enter from outside at all: it connects to a
-root-only Unix socket held by the sandbox's PID 1, passes its stdin, stdout
-and stderr over it (`SCM_RIGHTS`), and PID 1 forks the command. The child is
+root-only Unix socket held by the sandbox's PID 1, passes its redirected stdin,
+stdout and stderr over it (`SCM_RIGHTS`), and PID 1 forks the command. Terminal
+descriptors are refused until kiln has a controlled PTY mode. The child is
 born with every namespace, the cgroup, the seccomp filter and the Landlock
 policy already in place, because it inherits them.
 

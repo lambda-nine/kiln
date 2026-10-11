@@ -81,7 +81,9 @@ Docker's paired median ratio was 25.84$\times$ kiln's (95\% session-bootstrap
 interval 23.82--27.82$\times$). These are runtime-overhead measurements, not
 end-to-end agent speed. This paper describes each layer and the
 design decision behind it, where start-up time went, what two model-assisted
-adversarial reviews found, and what is still missing.
+adversarial reviews found, and what is still missing. kiln is experimental
+defense in depth for a trusted operator, not a hostile multi-tenant boundary:
+sandboxes share the host kernel and one host UID/GID range.
 \end{abstract}
 
 % ---------------------------------------------------------------------------
@@ -477,7 +479,8 @@ instead. Before cloning, the shim binds a Unix socket in the run directory. The
 child keeps that one descriptor when it closes all others, completes the full
 lockdown, sends a third handshake byte, and loops on \code{accept}. \code{kiln
 exec} connects, sends the argument vector as a length-prefixed message, and
-passes its own stdin, stdout and stderr as \code{SCM\us{}RIGHTS} descriptors. PID 1
+passes redirected stdin, stdout and stderr as \code{SCM\us{}RIGHTS} descriptors.
+It refuses terminal descriptors until kiln has a controlled PTY mode. PID 1
 forks, duplicates them onto 0--2, and \code{exec}s: the command inherits every
 namespace, limit, filter and rule simply by being PID 1's child. PID 1 reaps it
 and writes the exit status back, so \code{kiln exec} exits with the command's
@@ -1100,8 +1103,9 @@ so sandbox root's capabilities do not reach them.}
 \qa{How does \code{kiln exec} get into a running sandbox?}
 {It doesn't enter; it asks. PID 1 holds a Unix socket the shim opened before
 \code{pivot\us{}root}. \code{kiln exec} sends the arguments and passes its
-stdin, stdout and stderr with \code{SCM\us{}RIGHTS}; PID 1 forks the command onto
-those descriptors and returns its exit code. The command inherits every
+redirected stdin, stdout and stderr with \code{SCM\us{}RIGHTS}; terminal
+descriptors are refused until kiln has a controlled PTY mode. PID 1 forks the
+command onto those descriptors and returns its exit code. The command inherits every
 namespace, limit, seccomp filter and Landlock rule from PID 1, so there is no
 second, \code{setns}-based setup path to keep in sync.}
 
