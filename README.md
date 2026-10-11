@@ -77,7 +77,13 @@ directory and atomically exchanges it with the installed image.
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal
    (`journalctl -u kiln-dns -f`).
-7. Cold-start time: measure it, then make it fast.
+7. **Cold start** (done): `kiln run -- true` takes 13 ms cold (22 ms with
+   `--net full`), down from 29 ms (88 ms); crun takes 13 ms, runc 34 ms,
+   `docker run --rm` 84 ms (142 ms on its bridge). Most of the old time was
+   spent waiting for RCU grace periods (a `cgroup.procs` move, closing nft
+   sockets, deleting a veth) and starting `ip`, `nsenter` and `nft`. Method,
+   numbers and analysis: [docs/benchmarks.md](docs/benchmarks.md);
+   `KILN_TRACE=1` prints the time of each phase.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
    command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
    exits with the command's code. The host-side `kiln` survives Ctrl-C and
