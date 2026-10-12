@@ -165,7 +165,7 @@ sandboxes. All state is kernel objects plus the four directories at the bottom.}
 \label{fig:arch}
 \end{figure}
 
-\textbf{No shared daemon, no database.} A run's identity is its \emph{run ID}, the start
+\textbf{No central manager daemon, no database.} A run's identity is its \emph{run ID}, the start
 time in nanoseconds (hex) plus kiln's PID: unique, sortable, and used to name both
 its cgroup (\code{/sys/fs/cgroup/kiln/<id>}) and its run directory
 (\code{/var/lib/kiln/runs/<id>}). IP leases and DNS policies are files named

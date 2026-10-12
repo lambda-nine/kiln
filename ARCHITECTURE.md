@@ -116,14 +116,14 @@ reconcile.
 | Host reboot leaves run dirs      | Handled manually by `kiln gc`; automatic daemon startup reconciliation remains open |
 | Compromised image download       | Reduced: pinned Alpine signature, strict basename and atomic staged install |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
-| Data exfiltration over network   | Reduced: no network by default; allowlists constrain destinations, while `--net full` permits public hosts |
+| Data exfiltration over network   | Reduced: no network by default; with `--allow`, only allowed names and their subdomains resolve and egress is restricted to their resolved IPs; `--net full` permits public hosts |
 | Reaching the host or LAN         | Handled: only kiln's DNS forwarder on 10.88.0.1:53 is reachable |
 | Reused IP inheriting old flows   | Handled: policy checked on every outbound packet, not just new flows |
 | Conntrack table exhaustion       | Handled: nft dynamic count limits each sandbox IP to 256 tracked flows |
 | Partial or modified base firewall| Handled: shared nft objects and hook chains reconcile under the network lock |
 | Sandbox-to-sandbox traffic       | Handled: bridge port isolation |
 | Allowlist drift (CDN IPs change) | Open: hostnames resolve once at start. Next step: the DNS forwarder adds the IPs it resolves to the sandbox's nft set |
-| DNS tunneling                    | Handled with --allow (only allowed names resolve); logged but allowed with --net full |
+| DNS tunneling                    | Handled with `--allow` (only allowed names and their subdomains resolve); logged but allowed with `--net full` |
 | Kernel attack surface            | Reduced: seccomp denylist; an allowlist would be stricter |
 | Sandboxes attacking each other   | Partial: all share one host ID range; per-sandbox ranges need idmapped mounts |
 

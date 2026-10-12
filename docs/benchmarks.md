@@ -15,11 +15,12 @@ of that claim with randomized order and raw per-invocation records:
 
 The main result is architectural, not a single magic number. kiln tracks bare
 crun's lifecycle floor while providing more of the sandbox stack itself. At a
-defined 100 ms gap, across five fresh boots, Docker's non-networked one-shot
-`true` lifecycle was **25.84× kiln's** (95% session-bootstrap interval
-23.82–27.82×). But 100 ms is not a stable “cold” state: in a separate idle-gap
-sweep, kiln moved from 2.78 ms back to back to 14.88 ms after 5 seconds. Bare
-crun moved from 2.58 to 14.80 ms. At that 5-second point Docker took 140.90 ms.
+defined 100 ms gap across five fresh boots, the geometric mean of the per-boot
+Docker/kiln non-networked one-shot `true` lifecycle median ratios was
+**25.84×** (95% session-bootstrap interval 23.82–27.82×). But 100 ms is not a
+stable “cold” state: in a separate idle-gap sweep, kiln moved from 2.78 ms back
+to back to 14.88 ms after 5 seconds. Bare crun moved from 2.58 to 14.80 ms. At
+that 5-second point Docker took 140.90 ms.
 
 Those observations belong together: kiln is near the low-level runtime floor,
 and the absolute floor depends on how recently the VM and kernel paths ran.

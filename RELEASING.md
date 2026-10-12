@@ -200,11 +200,23 @@ Download the draft's assets and check them against `SHA256SUMS`.
 
 ## 9. Stop for approval
 
-Staging ends here. Do not run either of these without explicit approval from
-the maintainer for this release:
+Staging ends here. Do not publish the draft or expose the source publicly
+without explicit approval from the maintainer for this release.
 
-- making the repository public (`gh repo edit --visibility public ...`)
-- publishing the draft (`gh release edit v0.1.0 --draft=false`)
+At approval time, choose one public-source path:
+
+- **Current repository:** change its visibility to public. This is the simple
+  switch, but GitHub may retain pre-rewrite objects that are not reachable
+  from current `main` or its tags; anyone with an old object ID or activity
+  link may still be able to view them.
+- **Fresh repository:** create a new public repository from the reviewed
+  branches and tags only. This does not require a GitHub organization and
+  avoids publishing the current remote's unreachable objects, but historical
+  commit IDs cited by the benchmark corpus and papers must remain available or
+  be explained.
+
+After that choice, publishing the draft is a separate action
+(`gh release edit v0.1.0 --draft=false`) and still requires explicit approval.
 
 Before publishing, also resolve the rootfs redistribution gate in step 5 and
 state that the aarch64 binary was privileged-tested while x86_64 had only the

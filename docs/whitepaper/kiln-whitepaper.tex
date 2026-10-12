@@ -85,8 +85,9 @@ is misleading: after 5\,s idle, kiln and bare crun converged at
 \Vone{v2/gap/kiln-none/g5000/session-p50/median} and
 \Vone{v2/gap/crun-none/g5000/session-p50/median}\,ms, while Docker took
 \Vone{v2/gap/docker-none/g5000/session-p50/median}\,ms. In a separate campaign
-across five fresh boots, at a defined 100\,ms gap, Docker's lifecycle was
-\Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ kiln's (95\%
+across five fresh boots at a defined 100\,ms gap, the geometric mean of the
+per-boot Docker/kiln non-networked one-shot \code{true} lifecycle median ratios
+was \Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ (95\%
 session-bootstrap interval \Vone{v2/latency/ratio/docker-none/g100/ci-low}--\Vone{v2/latency/ratio/docker-none/g100/ci-high}$\times$).
 A fit over 0--100 idle sandboxes estimated kiln at
 \Vone{v2/memory/kiln-none/slope-median}\,KiB per sandbox against
@@ -384,11 +385,12 @@ and approximate scale, not a universal cold-start constant.
 
 \subsection{Replicated ratios at a defined 100\,ms gap}
 
-Across five fresh boots, Docker's non-networked lifecycle was
-\Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ kiln's (95\% CI
-\Vone{v2/latency/ratio/docker-none/g100/ci-low}--\Vone{v2/latency/ratio/docker-none/g100/ci-high}$\times$),
-Podman with crun was
-\Vone{v2/latency/ratio/podman-crun-none/g100/geomean}$\times$ and nerdctl was
+Across five fresh boots, the geometric mean of the per-boot Docker/kiln
+non-networked one-shot \code{true} lifecycle median ratios was
+\Vone{v2/latency/ratio/docker-none/g100/geomean}$\times$ (95\% CI
+\Vone{v2/latency/ratio/docker-none/g100/ci-low}--\Vone{v2/latency/ratio/docker-none/g100/ci-high}$\times$).
+The corresponding Podman-with-crun/kiln and nerdctl/kiln geometric means were
+\Vone{v2/latency/ratio/podman-crun-none/g100/geomean}$\times$ and
 \Vone{v2/latency/ratio/nerdctl-none/g100/geomean}$\times$. On the networked
 paths Docker was \Vone{v2/latency-net/ratio/docker-net/g100/geomean}$\times$
 (\Vone{v2/latency-net/ratio/docker-net/g100/ci-low}--\Vone{v2/latency-net/ratio/docker-net/g100/ci-high}$\times$)
