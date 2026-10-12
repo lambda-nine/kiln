@@ -125,6 +125,8 @@ echo "PASS"
 echo "9. Persistent sandbox lifecycle"
 persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 16M)
 sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
+[ "$(sudo stat -c %a "/var/lib/kiln/runs/$persistent")" = 700 ]
+[ "$(sudo stat -c %a "/var/lib/kiln/runs/$persistent/control.sock")" = 600 ]
 [ "$(cat "/sys/fs/cgroup/kiln/$persistent/pids.max")" = 16 ]
 # kiln exec refuses terminal stdio, so every call redirects all three fds.
 sudo "$KILN" exec "$persistent" -- sh -c 'echo persistent >/workspace/review-state' </dev/null >/dev/null 2>&1

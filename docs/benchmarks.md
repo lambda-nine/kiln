@@ -397,7 +397,7 @@ comparison is between end-user stacks as configured, not like for like:
 
 | | kiln | docker run --rm | runc / crun (bare `spec`) |
 |---|---|---|---|
-| Path to the kernel | one process, no shared daemon | CLI → dockerd → containerd → shim → runc | one process |
+| Path to the kernel | one process; no sandbox-manager daemon (`kiln-dns` serves networked cases) | CLI → dockerd → containerd → shim → runc | one process |
 | Root filesystem | overlayfs on XFS (loop device) with a per-run project quota (`--disk 1G`) | overlayfs snapshot (containerd) on ext4 | the unpacked tree on ext4, read-only, no overlay |
 | Namespaces | PID, mount, UTS, IPC, network, cgroup, **user** | PID, mount, UTS, IPC, network, cgroup | PID, mount, UTS, IPC, network, cgroup |
 | cgroup limits | memory, swap, CPU, PIDs, OOM group kill | memory, CPU, PIDs; swap at Docker's default (systemd driver) | memory, swap, CPU, PIDs |
@@ -759,9 +759,11 @@ The highest-value remaining work is:
 
 - **A second machine.** Repeat the headline campaign on the intended Mac Mini,
   then on x86-64 bare metal. Another operator should repeat it without help
-  from the author. The committed raw records reproduce the current analysis,
-  but an exact measurement rerun also needs the rootfs tarballs identified by
-  hash in the manifests; archive them as release artifacts first.
+  from the author. The committed raw records reproduce the current analysis.
+  A close measurement rerun also needs the rootfs tarballs identified by hash
+  in the manifests; archive them as release artifacts first. The original
+  resolved Lima instance configuration was not archived, so a byte-for-byte
+  environment replay is not possible.
 - **Replicate the exploratory modes.** Run concurrency and memory on several
   fresh boots so their host-level estimates get session confidence intervals.
 - **Matched storage where possible.** Put each runtime over the same filesystem

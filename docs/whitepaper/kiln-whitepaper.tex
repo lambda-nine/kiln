@@ -744,9 +744,11 @@ x86-64 bare-metal host; replicate concurrency and memory across boots; match
 the storage and overlay path where possible; add package installation, larger
 images and long-lived exec-heavy agent traces; and run Firecracker and Kata on
 a host that exposes KVM. An independent operator should reproduce at least the
-headline campaign. The committed traces reproduce the current analysis, but a
-byte-for-byte measurement rerun also needs the rootfs tarballs identified by
-hash in the manifests; publish them as release artifacts first.
+headline campaign. The committed traces reproduce the current analysis. A close
+measurement rerun also needs the rootfs tarballs identified by hash in the
+manifests; publish them as release artifacts first. The original resolved Lima
+instance configuration was not archived, so a byte-for-byte environment replay
+is not possible.
 \end{itemize}
 
 % ---------------------------------------------------------------------------

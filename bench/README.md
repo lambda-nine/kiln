@@ -197,9 +197,12 @@ an unknown `{name}` is an error when the config loads.
 
 `artifacts` names regular files whose path, size and SHA-256 are copied into
 the manifest. The shipped config records the exact rootfs tar imported by the
-other runtimes and the Lima VM configuration. The manifest identifies those
-files but does not archive them; an exact rerun requires retaining or
-publishing the files separately. `tier` and `capabilities` are
+other runtimes and the repository's `lima.yaml` at run time. That hash
+identifies the file, not the resolved configuration that originally created an
+already-running VM; live host properties are recorded separately in the
+manifest and `host.json`. The manifest identifies artifact files but does not
+archive them, so a close rerun requires retaining or publishing them
+separately. `tier` and `capabilities` are
 free-form metadata copied into the manifest: `end-user-stack` for kiln,
 Docker, Podman and nerdctl (a complete
 CLI with images or rootfs management, networking and cleanup), `low-level` for

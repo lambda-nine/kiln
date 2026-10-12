@@ -52,12 +52,32 @@ fn from_checkout(dir: &Path) -> Option<String> {
     }
     for name in watch {
         if let Some(p) = git(dir, &["rev-parse", "--git-path", &name]) {
-            let p = dir.join(p);
-            // A missing path would make cargo rerun this on every build.
-            if p.exists() {
-                println!("cargo:rerun-if-changed={}", p.display());
-            }
+            watch_path(dir.join(p));
         }
+    }
+
+    // Do not borrow provenance from an unrelated repository that merely
+    // contains an unpacked kiln source tree in an ignored subdirectory.
+    let expected_root = dir.parent()?.canonicalize().ok()?;
+    let discovered_root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
+    if discovered_root.canonicalize().ok()? != expected_root {
+        return None;
+    }
+    let identity = git_output(
+        dir,
+        &[
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            "Cargo.toml",
+            "build.rs",
+            "src/main.rs",
+            "../Cargo.toml",
+            "../Cargo.lock",
+        ],
+    )?;
+    if !identity.status.success() {
+        return None;
     }
 
     let commit = git(dir, &["rev-parse", "--verify", "HEAD"])?;
@@ -73,6 +93,23 @@ fn from_checkout(dir: &Path) -> Option<String> {
     }
     let state = if status.stdout.is_empty() { "clean" } else { "dirty" };
     Some(format!("git {}, {state}", &commit[..12]))
+}
+
+/// Cargo does not reliably notice a file that did not exist when a build
+/// script declared it. Watch the nearest existing ancestor instead, so a
+/// packed branch becoming a new loose ref invalidates the cached version.
+fn watch_path(path: PathBuf) {
+    let Some(path) = nearest_existing_ancestor(path) else { return };
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn nearest_existing_ancestor(mut path: PathBuf) -> Option<PathBuf> {
+    while !path.exists() {
+        if !path.pop() {
+            return None;
+        }
+    }
+    Some(path)
 }
 
 /// Runs git in `dir` and returns its trimmed stdout, or None if it failed
@@ -93,4 +130,103 @@ fn git_output(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("kiln-build-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn commit_all(root: &Path) {
+        git_ok(root, &["add", "-A"]);
+        git_ok(
+            root,
+            &[
+                "-c",
+                "user.name=Kiln Test",
+                "-c",
+                "user.email=kiln@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+    }
+
+    #[test]
+    fn missing_ref_watches_existing_ancestor() {
+        let root = scratch("watch");
+        let existing = root.join("refs/heads");
+        fs::create_dir_all(&existing).unwrap();
+        let missing = existing.join("feature/release");
+        let watched = nearest_existing_ancestor(missing).unwrap();
+        assert_eq!(watched, existing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_source_does_not_borrow_outer_repository() {
+        let outer = scratch("outer");
+        git_ok(&outer, &["init", "-q"]);
+        let source = outer.join("nested/kiln");
+        fs::create_dir_all(source.join("runtime/src")).unwrap();
+        for path in [
+            source.join("Cargo.toml"),
+            source.join("Cargo.lock"),
+            source.join("runtime/Cargo.toml"),
+            source.join("runtime/build.rs"),
+            source.join("runtime/src/main.rs"),
+        ] {
+            fs::write(path, "tracked by the outer repository\n").unwrap();
+        }
+        commit_all(&outer);
+        let runtime = source.join("runtime");
+        assert_eq!(from_checkout(&runtime), None);
+        fs::remove_dir_all(outer).unwrap();
+    }
+
+    #[test]
+    fn untracked_source_does_not_borrow_matching_repository() {
+        let root = scratch("untracked");
+        git_ok(&root, &["init", "-q"]);
+        fs::write(root.join("README.md"), "unrelated tracked content\n").unwrap();
+        commit_all(&root);
+        let runtime = root.join("runtime");
+        fs::create_dir_all(runtime.join("src")).unwrap();
+        for path in [
+            root.join("Cargo.toml"),
+            root.join("Cargo.lock"),
+            runtime.join("Cargo.toml"),
+            runtime.join("build.rs"),
+            runtime.join("src/main.rs"),
+        ] {
+            fs::write(path, "untracked\n").unwrap();
+        }
+        assert_eq!(from_checkout(&runtime), None);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

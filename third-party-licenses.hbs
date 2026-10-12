@@ -1,0 +1,26 @@
+# Third-party licenses
+
+This file is generated from `Cargo.lock` with cargo-about. It covers the Rust
+dependencies included in Kiln's Linux release binary.
+
+## Components
+
+{{#each crates}}
+- {{package.name}} {{package.version}} — {{license}}
+{{/each}}
+
+## License texts and notices
+
+{{#each licenses}}
+
+### {{name}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+<pre>
+{{text}}
+</pre>
+{{~/each}}

@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::net::Ipv4Addr;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, chown, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, chown, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -90,8 +90,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
         work: run_dir.join("work"),
         merged: run_dir.join("merged"),
     };
-    fs::create_dir_all(&run_dir)
-        .with_context(|| format!("create {} (are you root?)", run_dir.display()))?;
+    create_run_dir(&run_dir)?;
 
     let result = prepare(cfg, &run_dir, &layers).and_then(|()| spawn_and_wait(cfg, &id, &layers));
 
@@ -118,11 +117,10 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<(
         work: run_dir.join("work"),
         merged: run_dir.join("merged"),
     };
-    fs::create_dir_all(&run_dir)
-        .with_context(|| format!("create {} (are you root?)", run_dir.display()))?;
+    create_run_dir(&run_dir)?;
     prepare(cfg, &run_dir, &layers)?;
     let socket = run_dir.join("control.sock");
-    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    let listener = bind_control_socket(&socket)?;
     fs::write(run_dir.join("shim.pid"), std::process::id().to_string())?;
     fs::write(run_dir.join("shim.start"), process_start_time(std::process::id())?)?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
@@ -143,6 +141,29 @@ pub fn validate_image(cfg: &Config) -> Result<()> {
 }
 
 pub fn new_id() -> String { run_id() }
+
+/// Create a fresh per-run directory that only host root can traverse. Using
+/// an explicit 0700 mode makes this independent of the invoking root shell's
+/// umask; `create`, rather than `create_dir_all`, also rejects a collision or
+/// a path an untrusted host user prepared in advance.
+fn create_run_dir(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .with_context(|| format!("create fresh {} (are you root?)", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", path.display()))
+}
+
+/// Bind the persistent exec socket and make its root-only boundary explicit,
+/// in addition to the containing directory's 0700 mode.
+fn bind_control_socket(path: &Path) -> Result<UnixListener> {
+    let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    Ok(listener)
+}
 
 fn process_start_time(pid: u32) -> Result<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).context("read shim start time")?;
@@ -591,4 +612,30 @@ pub fn run_started(id: &str) -> Option<f64> {
 /// /var/lib/kiln/runs/<id>: the run's overlay layers, under its disk quota.
 pub fn run_dir(id: &str) -> PathBuf {
     Path::new(KILN_ROOT).join("runs").join(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_directory_and_control_socket_are_root_only() {
+        let root = std::env::temp_dir().join(format!(
+            "kiln-permissions-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let run = root.join("run");
+        create_run_dir(&run).unwrap();
+        assert_eq!(run.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(create_run_dir(&run).is_err(), "an existing run path must be rejected");
+
+        let socket = run.join("control.sock");
+        let listener = bind_control_socket(&socket).unwrap();
+        assert_eq!(socket.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

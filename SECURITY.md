@@ -46,6 +46,15 @@ relying on it:
 - **seccomp denylist.** The filter blocks a list of risky syscalls and
   namespace creation. Everything else is allowed; an allowlist would be
   stricter.
+- **One-shot terminal passthrough.** `kiln run` preserves the caller's
+  standard streams and controlling terminal for interactive use. It blocks
+  the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the
+  sandbox can still read terminal input while it runs, change terminal
+  settings and print escape sequences. Redirecting the three standard streams
+  alone does not remove `/dev/tty`; invoke kiln from a noninteractive service
+  that allocates no controlling terminal for fully untrusted one-shot
+  workloads. Persistent `kiln exec` refuses terminal descriptors until kiln
+  has a controlled PTY mode.
 - **Rootful host services.** `kiln` runs as root, and so do the `kiln dns` and
   `kiln metrics` services. The optional Prometheus and Grafana stack also runs
   on the host. Bugs in any of them are host bugs.

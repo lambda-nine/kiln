@@ -24,6 +24,8 @@ boundary for hostile multi-tenant workloads; see [SECURITY.md](SECURITY.md).
   Landlock read-only mode (`--read-only`, `--writable`).
 - Terminal-injection ioctls are denied. Persistent `kiln exec` refuses raw
   terminal descriptors until kiln has a controlled PTY mode.
+- Per-run directories and persistent control sockets have explicit root-only
+  permissions, independent of the invoking shell's umask.
 - Networking: no network by default; `--net full` or `--allow` allowlists over
   a bridge, veth pair and nftables egress policy that blocks the host, private
   ranges and other sandboxes, with per-IP conntrack limits and a filtering DNS
@@ -53,7 +55,7 @@ boundary for hostile multi-tenant workloads; see [SECURITY.md](SECURITY.md).
 ### Project
 
 - Apache License 2.0, security policy, contributing guide, release checklist
-  and CI on Ubuntu 24.04 x86_64.
+  and CI on Ubuntu 24.04 x86_64, plus generated third-party dependency notices.
 - `lima.yaml` mounts `{{.Home}}/Projects/kiln` instead of one user's absolute
   path. The VM it creates is unchanged for a clone at that location, but the
   file's SHA-256 no longer matches the `lima_config` hash recorded in the

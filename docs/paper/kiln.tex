@@ -77,8 +77,8 @@ netlink (with the \code{nft} tool for firewall rules), with no container
 libraries. On one ARM Lima VM, an idle-gap sweep put kiln and bare crun's
 one-shot \code{true} lifecycle at 14.9 and 14.8\,ms after 5\,s idle, against
 140.9\,ms for Docker. Across five fresh boots at a defined 100\,ms gap,
-Docker's paired median ratio was 25.84$\times$ kiln's (95\% session-bootstrap
-interval 23.82--27.82$\times$). These are runtime-overhead measurements, not
+the paired geometric mean of Docker/kiln per-boot median ratios was
+25.84$\times$ (95\% session-bootstrap interval 23.82--27.82$\times$). These are runtime-overhead measurements, not
 end-to-end agent speed. This paper describes each layer and the
 design decision behind it, where start-up time went, what two model-assisted
 adversarial reviews found, and what is still missing. kiln is experimental
@@ -101,8 +101,9 @@ resource use unpredictable.
 itself against the kernel interface: \code{clone}, \code{mount}, cgroupfs
 files, \code{ioctl}s, raw BPF, \code{nft} rules. (2)~Every limit has a
 measurable failure mode that was triggered on purpose (an OOM kill, a fork bomb,
-a full disk, a rejected packet). (3)~No mandatory shared daemon and no database: all state lives in
-the kernel and a few directories, so the system can be inspected with
+a full disk, a rejected packet). (3)~No central sandbox-manager daemon and no
+database: core state lives in the kernel and a few directories, non-networked
+starts need no shared service, and the system can be inspected with
 \code{cat}, \code{nft list} and \code{findmnt}. (4)~Defaults are closed: no
 network unless asked, limits on by default.
 
@@ -906,9 +907,10 @@ result is inconclusive because storage differed. Firecracker and Kata could not
 run because the VM exposed no \code{/dev/kvm}. Next measurements are a second
 host (the intended Mac Mini), x86-64 bare metal, replicated concurrency and
 memory, matched storage, larger images and KVM-based isolation. The committed
-traces reproduce the current analysis; a byte-for-byte measurement rerun also
-needs the rootfs tarballs identified by hash in the manifests, which should be
-published as release artifacts first.
+traces reproduce the current analysis. A close measurement rerun also needs the
+rootfs tarballs identified by hash in the manifests, which should be published
+as release artifacts first. The original resolved Lima instance configuration
+was not archived, so a byte-for-byte environment replay is not possible.
 
 % ---------------------------------------------------------------------------
 \section{Adversarial model review: what it found and taught}
@@ -917,7 +919,7 @@ published as release artifacts first.
 kiln went through two model-assisted adversarial review rounds. After
 networking landed, four independent model reviewers attacked it with the goal
 of breaking isolation. After the metrics layer, a separate security-focused
-model (``Daybreak'') examined the whole system, including the host-side
+model examined the whole system, including the host-side
 services. These rounds were useful engineering review, not a professional
 security audit. The second found five concrete issues and four it rated
 theoretical; all nine are fixed. The focused regression suite exercises the
@@ -1051,8 +1053,9 @@ storage with overlayfs, bridge networking with NAT, disk quotas, an egress
 policy, metrics) in one binary. It has no OCI image or runtime-spec support and
 no image distribution. In one idle-gap sweep, after 5\,s idle, its one-shot
 \code{true} lifecycle took 14.9\,ms (p50) against 140.9\,ms for the Docker CLI
-stack as configured. Across five boots at a 100\,ms gap, Docker's paired median
-ratio was 25.84$\times$ (95\% bootstrap interval 23.82--27.82$\times$). Part of
+stack as configured. Across five boots at a 100\,ms gap, the paired geometric
+mean of Docker/kiln per-boot median ratios was 25.84$\times$ (95\% bootstrap
+interval 23.82--27.82$\times$). Part of
 that gap is the daemon path, though the two also differ in storage and
 isolation.}
 
@@ -1075,11 +1078,13 @@ exit path. Rust also has no runtime threads, so \code{clone} and \code{fork} beh
 as in C. Go's multi-threaded runtime is why runc does its namespace setup in a
 small C shim before Go starts.}
 
-\qa{Persistent sandboxes exist. Why is there still no daemon?}
+\qa{Persistent sandboxes exist. Why is there still no central sandbox-manager daemon?}
 {A sandbox that outlives a command needs a long-lived owner, but that owner
 does not have to be central: each sandbox gets its own shim, so there is no
 single process whose crash takes every sandbox down, and state still lives only
-in the kernel and the run directory. A daemon is the next step for what a shim
+in the kernel and the run directory. The fixed DNS service used for networked
+sandboxes and the optional metrics service do not own sandbox lifecycle. A
+manager daemon is the next step for what a shim
 cannot do: an API for the harness, run records, automatic reconcile at
 startup, and a pool of pre-created sandboxes. Because run IDs name cgroups and run directories, it can rebuild its
 view by scanning them, as \code{kiln gc} already does.}
@@ -1182,8 +1187,9 @@ consumed by \code{sigwait} and lead to a normal cleanup.}
 {It depends on idle state. In a one-boot sweep, a one-shot \code{true} (setup,
 command and teardown) took 2.78\,ms p50 back to back and 14.88\,ms after 5\,s
 idle; bare crun took 2.58 and 14.80\,ms, and Docker 141.54 and 140.90\,ms.
-Across five fresh boots at a defined 100\,ms gap, Docker's paired median ratio
-was 25.84$\times$ kiln's (95\% interval 23.82--27.82$\times$). The original
+Across five fresh boots at a defined 100\,ms gap, the paired geometric mean of
+Docker/kiln per-boot median ratios was 25.84$\times$ (95\% interval
+23.82--27.82$\times$). The original
 build took 28.9 and 87.9\,ms in the legacy no-network/network series; removing
 RCU waits and helper processes produced the current path. A command in an
 existing sandbox took 3.5\,ms in an earlier one-session exec benchmark.}

@@ -13,6 +13,13 @@ mod storage;
 mod trace;
 mod userns;
 
+// Include the build-script helpers in the test target so provenance edge
+// cases are covered by the ordinary `cargo test` release gate.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build.rs"]
+mod build_script_tests;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};

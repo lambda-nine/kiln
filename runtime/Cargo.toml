@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "A small Linux sandbox runtime for AI agent tools"
 license = "Apache-2.0"
 repository = "https://github.com/stcrestrada/kiln"
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"

@@ -18,6 +18,10 @@ Known limits:
 - All sandboxes share one host UID/GID range (2000000000-2000065535), so the
   user ID does not separate one sandbox from another.
 - The seccomp filter is a denylist of risky syscalls, not an allowlist.
+- One-shot `kiln run` preserves the caller's terminal. The injection ioctls
+  are blocked, but untrusted interactive code can still read input, change
+  terminal settings and print escape sequences. Redirecting stdio alone does
+  not remove `/dev/tty`; see [SECURITY.md](SECURITY.md).
 - kiln runs as root, and so do its host services, `kiln dns` and
   `kiln metrics`. The optional Prometheus and Grafana stack also runs on the
   host. A bug in any of them is a bug on the host.
@@ -32,7 +36,9 @@ macOS has no namespaces or cgroups, so kiln builds and runs inside a Linux VM.
 [`lima.yaml`](lima.yaml) mounts `~/Projects/kiln` on the Mac read-write into
 the VM at the same path. If you cloned kiln somewhere else, edit the one
 `mounts` entry in `lima.yaml` before `limactl create`, and run the commands
-below from the clone inside the VM.
+below from the clone inside the VM. The checked-in template targets Apple
+silicon and uses Apple's Virtualization framework with virtiofs (macOS 13 or
+newer); other Mac architectures and VM backends are untested.
 
 ```sh
 brew install lima
@@ -122,8 +128,9 @@ scripts/review-regressions.sh
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous
    cleanup through CLI exit) was
    14.9 ms p50, essentially bare crun's 14.8 ms; Docker was 140.9 ms. Across
-   five fresh boots at a defined 100 ms gap, Docker's median lifecycle was
-   25.84× kiln's (95% session-bootstrap interval 23.82–27.82×). `true` is an
+   five fresh boots at a defined 100 ms gap, the paired geometric mean of
+   Docker/kiln per-boot median ratios was 25.84× (95% session-bootstrap
+   interval 23.82–27.82×). `true` is an
    overhead microbenchmark, and the stacks do different work on different
    storage paths. Across three boots the Docker/kiln ratio narrowed, as
    expected, to 4.67× for the Python workload, 3.81× for Node and 2.15× for an
@@ -315,7 +322,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 
 ### From the first review
 
-Four independent model reviewers attacked kiln at `bf66bdf`. This was an
+Four independent model reviewers attacked kiln after the networking commit
+`eebaf81`. This was an
 adversarial engineering review, not a professional security audit. What they
 found, and what each fix teaches:
 
@@ -424,8 +432,8 @@ found, and what each fix teaches:
 
 ### From the second review
 
-A separate security-focused model ("Daybreak") reviewed kiln after the
-metrics layer, including the host-side services. All five findings are fixed.
+A separate security-focused model reviewed kiln after the metrics layer,
+including the host-side services. All five findings are fixed.
 The regression suite directly exercises the DNS worker bound and inode quota;
 the metrics worker, journal escaping and Grafana password changes were checked
 in their code and service configuration:
@@ -461,4 +469,6 @@ listed in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 Copyright 2026 Stephen Estrada. Licensed under the
-[Apache License, Version 2.0](LICENSE).
+[Apache License, Version 2.0](LICENSE). Notices for Rust dependencies included
+in the release binary are in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).

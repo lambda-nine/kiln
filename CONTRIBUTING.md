@@ -40,6 +40,15 @@ CI also checks the syntax of every tracked shell script and validates every
 tracked JSON file. It does not run `cargo fmt`; the source isn't
 rustfmt-normalized, so don't reformat unrelated code.
 
+If dependencies change, install cargo-about 0.9.2 and regenerate the committed
+notices before opening the pull request:
+
+```sh
+cargo install cargo-about --version 0.9.2 --locked --features cli
+cargo about generate --locked --fail third-party-licenses.hbs \
+  --output-file THIRD-PARTY-LICENSES.md
+```
+
 The privileged namespace, network, quota and lifecycle regression checks
 need root and a prepared host, so they are not in CI. If your change touches
 sandbox setup, networking, storage or cleanup, run them manually in the Lima

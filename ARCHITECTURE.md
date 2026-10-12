@@ -36,10 +36,11 @@ sudo kiln run [--memory --cpus --pids --disk --net --allow --read-only] -- <cmd>
     rmdir cgroup, rm run dir
 ```
 
-No daemon and no database: all state is in the kernel and a few directories.
-`kiln metrics` (a separate, read-only service) reads that state for
-Prometheus; each IP lease file holds its run ID so traffic and rejected
-packets can be tied to a sandbox.
+No central sandbox-manager daemon and no database: core state is in the kernel
+and a few directories. Non-networked starts need no shared service; networked
+starts use the fixed `kiln dns` service, and the optional, read-only
+`kiln metrics` service reads state for Prometheus. Each IP lease file holds its
+run ID so traffic and rejected packets can be tied to a sandbox.
 The parent is the supervisor: if it's killed, `PR_SET_PDEATHSIG` kills the
 sandbox too, but its cgroup, run dir and lease are left for a future
 reconcile.
@@ -115,7 +116,7 @@ reconcile.
 | Host reboot leaves run dirs      | Handled manually by `kiln gc`; automatic daemon startup reconciliation remains open |
 | Compromised image download       | Reduced: pinned Alpine signature, strict basename and atomic staged install |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
-| Data exfiltration over network   | Handled: no network by default, allowlist or full-minus-private |
+| Data exfiltration over network   | Reduced: no network by default; allowlists constrain destinations, while `--net full` permits public hosts |
 | Reaching the host or LAN         | Handled: only kiln's DNS forwarder on 10.88.0.1:53 is reachable |
 | Reused IP inheriting old flows   | Handled: policy checked on every outbound packet, not just new flows |
 | Conntrack table exhaustion       | Handled: nft dynamic count limits each sandbox IP to 256 tracked flows |

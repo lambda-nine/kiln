@@ -11,10 +11,13 @@ For publication, the author's absolute checkout path in each manifest's
 privacy-only metadata edit: the recorded config SHA-256, raw measurements,
 commands and all generated statistics are unchanged.
 
-The recorded `lima_config` SHA-256 identifies the historical file used for the
-campaign. The current `lima.yaml` replaces that file's author-specific mount
-source with `{{.Home}}/Projects/kiln`, so it intentionally has a different
-hash; do not rewrite the manifests to match it.
+The recorded `lima_config` SHA-256 identifies the repository's historical
+`lima.yaml`, not the resolved configuration that created the already-running
+VM. The campaign VM came from an earlier template: its Lima backend, image,
+architecture, CPU, memory, disk and mount settings matched, but its provisioning
+package list differed. The current `lima.yaml` also replaces the recorded
+file's author-specific mount source with `{{.Home}}/Projects/kiln`, so it
+intentionally has a different hash; do not rewrite the manifests to match it.
 
 ## Layout
 
@@ -69,12 +72,14 @@ not run because this Lima VM had no `/dev/kvm`.
 ## Regeneration
 
 The committed records are sufficient to regenerate every v2 summary and v2
-paper value. A byte-for-byte measurement rerun also needs the two rootfs tarballs
-named by SHA-256 in the manifests. They are not stored in Git: the setup
+paper value. A close measurement rerun also needs the two rootfs tarballs named
+by SHA-256 in the manifests. They are not stored in Git: the setup
 scripts rebuild matched inputs for a new campaign, but Alpine's
 `latest-stable` release and package indexes can move. Publish the hashed
 tarballs as release artifacts (or replace them with immutable image references)
-before asking an independent operator to repeat this exact campaign.
+before asking an independent operator to repeat the campaign. A byte-for-byte
+environment replay is not possible because the original resolved Lima instance
+configuration was not archived.
 
 From the repository root:
 
