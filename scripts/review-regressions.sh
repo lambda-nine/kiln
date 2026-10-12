@@ -158,7 +158,7 @@ sudo "$KILN" rm "$persistent"
 [ ! -e "/var/lib/kiln/runs/$persistent" ]
 
 stale=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 16M)
-shim=$(cat "/var/lib/kiln/runs/$stale/shim.pid")
+shim=$(sudo cat "/var/lib/kiln/runs/$stale/shim.pid")
 ip=$(awk -v id="$stale" '$0 == id { sub(".*/", "", FILENAME); print FILENAME }' /run/kiln/net/leases/*)
 sudo kill -9 "$shim"
 i=0
