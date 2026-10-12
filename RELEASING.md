@@ -91,7 +91,8 @@ cp target/release/kiln LICENSE THIRD-PARTY-LICENSES.md README.md \
   cargo +1.88.0 -V
   ld --version | head -n 1
   uname -srmo
-  printf '%s\n' "RUSTFLAGS=$kiln_rustflags"
+  printf '%s\n' \
+    'RUSTFLAGS=--remap-path-prefix=<checkout>=/usr/src/kiln --remap-path-prefix=<cargo-home>=/usr/local/cargo'
 } >"$out/$name/BUILDINFO.txt"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     --mode='u=rwX,go=rX' \
