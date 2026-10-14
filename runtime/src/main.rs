@@ -184,7 +184,15 @@ fn main() -> Result<()> {
             println!("{}", persistent::create(&cfg)?);
             Ok(())
         }
-        Command::Exec { id, cmd } => std::process::exit(persistent::exec(&id, &cmd)?),
+        Command::Exec { id, cmd } => match persistent::exec(&id, &cmd) {
+            Ok(code) => std::process::exit(code),
+            // Like `docker exec`, kiln's own failure exits 125 so callers can
+            // tell it from the command exiting 1.
+            Err(e) => {
+                eprintln!("Error: {e:?}");
+                std::process::exit(persistent::EXEC_FAILED);
+            }
+        },
         Command::Ls => persistent::list(),
         Command::Rm { id } => persistent::remove(&id),
         Command::Gc => persistent::gc(),

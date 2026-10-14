@@ -148,12 +148,18 @@ set -e
 left=$(sudo timeout 10 "$KILN" exec "$persistent" -- sh -c 'pgrep sleep || echo none' </dev/null 2>&1)
 [ "$left" = none ] || { echo "FAIL: exec after a killed client returned: $left"; exit 1; }
 sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
+# kiln's own exec failures exit 125, distinct from the command's codes.
+set +e
+sudo "$KILN" exec 0000000000000000-0 -- true </dev/null >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -eq 125 ] || { echo "FAIL: exec into a missing sandbox returned $code, expected 125"; exit 1; }
 # With a terminal on stdio, exec must fail before reaching the sandbox.
 set +e
 tty_out=$(timeout 20 script -qec "sudo -n '$KILN' exec $persistent -- touch /workspace/tty-ran" /dev/null </dev/null 2>&1)
 code=$?
 set -e
-[ "$code" -eq 1 ] || { echo "FAIL: exec from a terminal returned $code, expected 1"; exit 1; }
+[ "$code" -eq 125 ] || { echo "FAIL: exec from a terminal returned $code, expected 125"; exit 1; }
 echo "$tty_out" | grep -q 'interactive (PTY) exec is not implemented' || {
     echo "FAIL: exec from a terminal did not explain the refusal: $tty_out"
     exit 1

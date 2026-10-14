@@ -15,6 +15,9 @@ use nix::unistd::{ForkResult, Pid, fork, pipe2, read, setsid};
 use crate::container::{self, Config};
 
 const MAX_REQUEST: usize = 1024 * 1024;
+/// Exit code of `kiln exec` when kiln itself fails (bad ID, sandbox gone,
+/// terminal stdio) rather than the command.
+pub const EXEC_FAILED: i32 = 125;
 
 pub fn create(cfg: &Config) -> Result<String> {
     container::validate_image(cfg)?;
