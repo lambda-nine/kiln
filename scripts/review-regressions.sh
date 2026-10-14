@@ -183,7 +183,58 @@ sudo "$KILN" gc
 [ ! -e "/run/kiln/net/leases/$ip" ]
 echo "PASS"
 
-echo "10. Bridge ports isolated"
+echo "10. pids.max refuses exec without destroying a persistent sandbox"
+limited=$(sudo "$KILN" create --memory 64M --pids 8 --disk 16M)
+cleanup_limited() {
+    if [ -n "${limited:-}" ] && sudo test -e "/var/lib/kiln/runs/$limited"; then
+        sudo timeout 10 "$KILN" rm "$limited" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup_limited EXIT HUP INT TERM
+# Leave seven processes behind after the request leader exits: five sleeps,
+# one helper that becomes a sleep, and one sleep the helper forks after the
+# leader frees the final cgroup slot. With PID 1, pids.current reaches 8.
+sudo "$KILN" exec "$limited" -- sh -c '
+    echo survived >/workspace/pids-max-marker
+    parent=$$
+    i=0
+    while [ "$i" -lt 5 ]; do
+        sleep 600 </dev/null >/dev/null 2>&1 &
+        i=$((i + 1))
+    done
+    (
+        while [ -d "/proc/$parent" ]; do :; done
+        sleep 600 </dev/null >/dev/null 2>&1 &
+        exec sleep 600 </dev/null >/dev/null 2>&1
+    ) &
+' </dev/null >/dev/null 2>&1
+i=0
+current=0
+while [ "$current" != 8 ] && [ "$i" -lt 100 ]; do
+    current=$(sudo cat "/sys/fs/cgroup/kiln/$limited/pids.current")
+    sleep 0.02
+    i=$((i + 1))
+done
+[ "$current" = 8 ] || { echo "FAIL: pids.current reached $current, expected 8"; exit 1; }
+init_pid=$(sudo cat "/var/lib/kiln/runs/$limited/init.pid")
+max_before=$(sudo awk '$1 == "max" { print $2 }' "/sys/fs/cgroup/kiln/$limited/pids.events")
+set +e
+sudo "$KILN" exec "$limited" -- true </dev/null >/dev/null 2>&1
+code=$?
+set -e
+[ "$code" -eq 125 ] || { echo "FAIL: refused exec returned $code, expected 125"; exit 1; }
+max_after=$(sudo awk '$1 == "max" { print $2 }' "/sys/fs/cgroup/kiln/$limited/pids.events")
+[ "$max_after" -gt "$max_before" ] || { echo "FAIL: pids.events max did not increase"; exit 1; }
+sudo kill -0 "$init_pid"
+sudo "$KILN" ls | grep -q "^$limited[[:space:]]\+running"
+sudo test -f "/var/lib/kiln/runs/$limited/upper/workspace/pids-max-marker"
+sudo timeout 10 "$KILN" rm "$limited"
+[ ! -e "/var/lib/kiln/runs/$limited" ]
+limited=
+trap - EXIT HUP INT TERM
+echo "PASS"
+
+echo "11. Bridge ports isolated"
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sleep 5 &
 first=$!
 i=0
@@ -197,7 +248,7 @@ sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
 wait "$first"
 echo "PASS"
 
-echo "11. Concurrent network reuse stress"
+echo "12. Concurrent network reuse stress"
 wave=0
 failed=0
 while [ "$wave" -lt 10 ]; do
@@ -216,7 +267,7 @@ done
 [ "$failed" -eq 0 ] || { echo "FAIL: concurrent network start failed"; exit 1; }
 echo "PASS"
 
-echo "12. Cleanup"
+echo "13. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

@@ -103,7 +103,7 @@ reconcile.
 | Failure                          | Status                                  |
 |----------------------------------|-----------------------------------------|
 | Memory hog                       | Handled: group OOM kill, reported       |
-| Fork bomb                        | Handled: `pids.max`                     |
+| Fork bomb                        | Handled: `pids.max`; a refused persistent exec leaves PID 1 and its overlay alive |
 | CPU hog                          | Handled: `cpu.max` throttling           |
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |

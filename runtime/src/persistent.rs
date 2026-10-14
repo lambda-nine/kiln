@@ -70,7 +70,7 @@ pub fn exec(id: &str, cmd: &[String]) -> Result<i32> {
     let mut status = [0u8; 4];
     stream
         .read_exact(&mut status)
-        .context("sandbox exited during exec")?;
+        .context("sandbox did not report an exec status")?;
     Ok(i32::from_ne_bytes(status))
 }
 

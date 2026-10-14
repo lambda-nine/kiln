@@ -80,11 +80,16 @@ pub fn serve(listener: &UnixListener) -> Result<i32> {
         }
         // A client that went away can't take the status; failing to send it
         // must not end PID 1 and with it the sandbox.
-        match run_with_stdio(&argv, &fds, &stream)? {
-            Some(code) => if let Err(e) = stream.write_all(&code.to_ne_bytes()) {
+        match run_with_stdio(&argv, &fds, &stream) {
+            Ok(Some(code)) => if let Err(e) = stream.write_all(&code.to_ne_bytes()) {
                 eprintln!("kiln: report exec status: {e}");
             },
-            None => eprintln!("kiln: exec client disconnected; stopped its command"),
+            Ok(None) => eprintln!("kiln: exec client disconnected; stopped its command"),
+            // A request-local failure such as fork() returning EAGAIN at
+            // pids.max must fail this exec, not unwind PID 1 and destroy the
+            // persistent sandbox. Dropping the stream makes the CLI report
+            // kiln's own failure code (125).
+            Err(e) => eprintln!("kiln: exec request failed: {e:#}"),
         }
     }
 }
@@ -116,37 +121,47 @@ fn run_with_stdio(argv: &[CString], fds: &[std::os::fd::OwnedFd], client: &UnixS
         ForkResult::Parent { child } => {
             // Set it from both sides so the group exists before either goes on.
             let _ = setpgid(child, child);
-            let mut client_gone = false;
-            loop {
-                let mut wait = [
-                    libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-                    libc::pollfd {
-                        fd: if client_gone { -1 } else { client.as_raw_fd() },
-                        events: libc::POLLRDHUP,
-                        revents: 0,
-                    },
-                ];
-                // SAFETY: `wait` is an array of two initialized pollfds.
-                if unsafe { libc::poll(wait.as_mut_ptr(), 2, -1) } < 0 {
-                    match Errno::last() {
-                        Errno::EINTR => continue,
-                        e => return Err(e).context("poll"),
-                    }
-                }
-                if wait[1].revents != 0 {
-                    client_gone = true;
-                    let _ = kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
-                }
-                while let Some(info) = signals.read_signal().context("read signalfd")? {
-                    match Signal::try_from(info.ssi_signo as i32) {
-                        Ok(Signal::SIGCHLD) => if let Some(code) = reap(child)? {
-                            return Ok((!client_gone).then_some(code));
+            let result = (|| -> Result<Option<i32>> {
+                let mut client_gone = false;
+                loop {
+                    let mut wait = [
+                        libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                        libc::pollfd {
+                            fd: if client_gone { -1 } else { client.as_raw_fd() },
+                            events: libc::POLLRDHUP,
+                            revents: 0,
                         },
-                        Ok(sig) if FORWARDED.contains(&sig) => { let _ = kill(child, sig); }
-                        _ => {}
+                    ];
+                    // SAFETY: `wait` is an array of two initialized pollfds.
+                    if unsafe { libc::poll(wait.as_mut_ptr(), 2, -1) } < 0 {
+                        match Errno::last() {
+                            Errno::EINTR => continue,
+                            e => return Err(e).context("poll"),
+                        }
+                    }
+                    if wait[1].revents != 0 {
+                        client_gone = true;
+                        let _ = kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
+                    }
+                    while let Some(info) = signals.read_signal().context("read signalfd")? {
+                        match Signal::try_from(info.ssi_signo as i32) {
+                            Ok(Signal::SIGCHLD) => if let Some(code) = reap(child)? {
+                                return Ok((!client_gone).then_some(code));
+                            },
+                            Ok(sig) if FORWARDED.contains(&sig) => { let _ = kill(child, sig); }
+                            _ => {}
+                        }
                     }
                 }
+            })();
+            if result.is_err() {
+                // Once fork succeeded, a supervisor error must not leave its
+                // command running while PID 1 accepts the next request.
+                let _ = kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
+                let _ = kill(child, Signal::SIGKILL);
+                let _ = waitpid(child, None);
             }
+            result
         }
     }
 }
