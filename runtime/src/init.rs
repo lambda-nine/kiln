@@ -10,13 +10,14 @@
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
 use nix::sys::signal::{SigSet, Signal, kill};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, execvp, fork};
+use nix::unistd::{ForkResult, Pid, execvp, fork, setpgid};
 
 /// Signals passed on to the command. SIGINT, SIGQUIT and SIGWINCH are left
 /// out on purpose: the terminal sends those to the whole foreground process
@@ -77,14 +78,27 @@ pub fn serve(listener: &UnixListener) -> Result<i32> {
             eprintln!("kiln: exec request needs stdin, stdout and stderr");
             continue;
         }
-        let code = run_with_stdio(&argv, &fds)?;
-        stream.write_all(&code.to_ne_bytes())?;
+        // A client that went away can't take the status; failing to send it
+        // must not end PID 1 and with it the sandbox.
+        match run_with_stdio(&argv, &fds, &stream)? {
+            Some(code) => if let Err(e) = stream.write_all(&code.to_ne_bytes()) {
+                eprintln!("kiln: report exec status: {e}");
+            },
+            None => eprintln!("kiln: exec client disconnected; stopped its command"),
+        }
     }
 }
 
-fn run_with_stdio(argv: &[CString], fds: &[std::os::fd::OwnedFd]) -> Result<i32> {
+/// Runs one exec request in its own process group. If the client hangs up
+/// first (killed, or timed out by a caller like kilnd), the whole group is
+/// killed so the sandbox is free for the next request, and None is returned.
+fn run_with_stdio(argv: &[CString], fds: &[std::os::fd::OwnedFd], client: &UnixStream) -> Result<Option<i32>> {
     let all = SigSet::all();
     all.thread_block().context("block signals")?;
+    // Blocked signals queue up on the signalfd, so one poll() waits for them
+    // and for the client hanging up.
+    let signals = SignalFd::with_flags(&all, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
+        .context("signalfd")?;
     // SAFETY: PID 1 is single-threaded.
     match unsafe { fork() }.context("fork")? {
         ForkResult::Child => {
@@ -93,18 +107,47 @@ fn run_with_stdio(argv: &[CString], fds: &[std::os::fd::OwnedFd]) -> Result<i32>
                     std::process::exit(126);
                 }
             }
+            let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
             let _ = SigSet::empty().thread_set_mask();
             let err = execvp(&argv[0], argv).unwrap_err();
             eprintln!("kiln: exec {}: {err}", argv[0].to_string_lossy());
             std::process::exit(127);
         }
-        ForkResult::Parent { child } => loop {
-            match all.wait().context("sigwait")? {
-                Signal::SIGCHLD => if let Some(code) = reap(child)? { return Ok(code); },
-                sig if FORWARDED.contains(&sig) => { let _ = kill(child, sig); }
-                _ => {}
+        ForkResult::Parent { child } => {
+            // Set it from both sides so the group exists before either goes on.
+            let _ = setpgid(child, child);
+            let mut client_gone = false;
+            loop {
+                let mut wait = [
+                    libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                    libc::pollfd {
+                        fd: if client_gone { -1 } else { client.as_raw_fd() },
+                        events: libc::POLLRDHUP,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: `wait` is an array of two initialized pollfds.
+                if unsafe { libc::poll(wait.as_mut_ptr(), 2, -1) } < 0 {
+                    match Errno::last() {
+                        Errno::EINTR => continue,
+                        e => return Err(e).context("poll"),
+                    }
+                }
+                if wait[1].revents != 0 {
+                    client_gone = true;
+                    let _ = kill(Pid::from_raw(-child.as_raw()), Signal::SIGKILL);
+                }
+                while let Some(info) = signals.read_signal().context("read signalfd")? {
+                    match Signal::try_from(info.ssi_signo as i32) {
+                        Ok(Signal::SIGCHLD) => if let Some(code) = reap(child)? {
+                            return Ok((!client_gone).then_some(code));
+                        },
+                        Ok(sig) if FORWARDED.contains(&sig) => { let _ = kill(child, sig); }
+                        _ => {}
+                    }
+                }
             }
-        },
+        }
     }
 }
 

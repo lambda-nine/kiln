@@ -140,6 +140,14 @@ sudo "$KILN" exec "$persistent" -- sh -c 'exit 37' </dev/null >/dev/null 2>&1
 code=$?
 set -e
 [ "$code" -eq 37 ] || { echo "FAIL: exec returned $code, expected 37"; exit 1; }
+# A client killed mid-exec must stop its command's process group and leave
+# the sandbox serving; callers such as kilnd time out execs this way.
+set +e
+sudo timeout -s KILL 1 "$KILN" exec "$persistent" -- sh -c 'sleep 30 & sleep 30' </dev/null >/dev/null 2>&1
+set -e
+left=$(sudo timeout 10 "$KILN" exec "$persistent" -- sh -c 'pgrep sleep || echo none' </dev/null 2>&1)
+[ "$left" = none ] || { echo "FAIL: exec after a killed client returned: $left"; exit 1; }
+sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
 # With a terminal on stdio, exec must fail before reaching the sandbox.
 set +e
 tty_out=$(timeout 20 script -qec "sudo -n '$KILN' exec $persistent -- touch /workspace/tty-ran" /dev/null </dev/null 2>&1)

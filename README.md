@@ -169,7 +169,10 @@ scripts/review-regressions.sh
     sandbox's existing namespaces, cgroup limits, seccomp filter and Landlock
     policy. It refuses terminal descriptors until kiln has a controlled PTY
     mode; redirect all three streams as in the example above. The overlay and
-    `/workspace` survive between commands.
+    `/workspace` survive between commands. Each command runs in its own
+    process group; if the `kiln exec` client goes away before it finishes
+    (killed, or timed out by a caller), PID 1 kills that group and keeps
+    serving, so the sandbox stays usable.
     `kiln ls` lists live and stale shims, `kiln rm` stops one and waits for its
     resources to be removed, and `kiln gc` removes cgroups, network state and
     run directories left by crashed shims. One-shot `kiln run` is unchanged.

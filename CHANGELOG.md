@@ -5,6 +5,13 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+### Runtime
+
+- `kiln exec`: if the client disconnects before its command finishes, PID 1
+  kills the command's process group and keeps serving. Before, the command
+  ran on, blocked later execs, and PID 1 then exited on the failed status
+  write, removing the whole sandbox.
+
 ### Project
 
 - Moved the project home to the Lambda IX GitHub organization and changed the
