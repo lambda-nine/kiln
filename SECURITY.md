@@ -14,7 +14,7 @@ are not patched.
 ## Reporting a vulnerability
 
 Report vulnerabilities privately through GitHub:
-<https://github.com/stcrestrada/kiln/security/advisories/new>
+<https://github.com/lambda-nine/kiln/security/advisories/new>
 
 Please don't open a public issue, pull request or discussion for a
 vulnerability. Include what you can of:

@@ -179,7 +179,7 @@ limactl copy --backend=rsync -r "kiln:GUEST_OUT/." "$mac_out/"
 ```sh
 git tag -a v0.1.0 -m "kiln v0.1.0"
 git show v0.1.0 --stat        # annotated, on the commit from step 1
-env -u GITHUB_TOKEN git push git@github.com:stcrestrada/kiln.git v0.1.0
+env -u GITHUB_TOKEN git push origin v0.1.0
 ```
 
 ## 8. Draft release

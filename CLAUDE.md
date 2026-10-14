@@ -21,8 +21,9 @@ ones. Read these before changing anything:
   cgroups. The VM is named `kiln` (Ubuntu 24.04, aarch64, 4 CPUs, 4 GiB) and
   mounts this checkout at the same path. Enter it with
   `limactl shell --workdir "$PWD" kiln`. `kiln` needs root: `sudo target/debug/kiln ...`.
-- **The VM only mounts `~/Projects/kiln`.** A worktree elsewhere isn't visible
-  inside it. Do VM work in this checkout, or add a mount to `lima.yaml`.
+- **The VM only mounts `~/Projects/lambda-nine/kiln`.** A worktree elsewhere
+  isn't visible inside it. Do VM work in this checkout, or add a mount to
+  `lima.yaml`.
 - **Checks before every commit** (all unprivileged, the same as CI):
   `python3 -I -m unittest discover -s bench/tests -v`, `cargo test --locked`,
   `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`.
@@ -57,9 +58,10 @@ ones. Read these before changing anything:
 
 ## Status (October 12, 2026)
 
-- **v0.1.0 is tagged and staged as a private draft release** on GitHub. The
-  repository is still private. Publishing the draft or making the repository
-  public needs Stephen's explicit approval for that release (RELEASING.md).
+- **v0.1.0 is tagged and staged as a private draft release** in the original
+  private archive on GitHub. The active repository is also private. Publishing
+  a release or making the repository public needs Stephen's explicit approval
+  for that release (RELEASING.md).
   Rootfs tarballs in the draft include GPL/LGPL Alpine packages and need a
   redistribution review before they're published.
 - **Done:** layers 1-11 in the README (namespaces through persistent
@@ -67,10 +69,10 @@ ones. Read these before changing anything:
   review rounds, cold-start work (`clone3(CLONE_INTO_CGROUP)`, netlink instead
   of `ip`/`nsenter`, batched nft), the v2 benchmark campaign, the design paper
   (`docs/paper/`) and the performance white paper (`docs/whitepaper/`).
-- **The agent harness lives in the idea-marathon project**
-  (`~/Projects/idea-marathon`), not here. kiln may later sandbox that
-  harness's tool calls. ARCHITECTURE.md's target diagram still shows the
-  harness on top of kiln; that's the long-term shape, not work for this repo.
+- **The reusable harness/control daemon will live beside this repository** as
+  `~/Projects/lambda-nine/kilnd`. Idea Marathon remains a separate product and
+  will consume that harness. ARCHITECTURE.md's target diagram shows the
+  long-term shape; the daemon is not part of this repository.
 
 ## Next, roughly in order
 

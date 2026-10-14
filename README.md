@@ -33,12 +33,12 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 ## Dev setup (macOS)
 
 macOS has no namespaces or cgroups, so kiln builds and runs inside a Linux VM.
-[`lima.yaml`](lima.yaml) mounts `~/Projects/kiln` on the Mac read-write into
-the VM at the same path. If you cloned kiln somewhere else, edit the one
-`mounts` entry in `lima.yaml` before `limactl create`, and run the commands
-below from the clone inside the VM. The checked-in template targets Apple
-silicon and uses Apple's Virtualization framework with virtiofs (macOS 13 or
-newer); other Mac architectures and VM backends are untested.
+[`lima.yaml`](lima.yaml) mounts `~/Projects/lambda-nine/kiln` on the Mac
+read-write into the VM at the same path. If you cloned kiln somewhere else,
+edit the one `mounts` entry in `lima.yaml` before `limactl create`, and run the
+commands below from the clone inside the VM. The checked-in template targets
+Apple silicon and uses Apple's Virtualization framework with virtiofs (macOS
+13 or newer); other Mac architectures and VM backends are untested.
 
 ```sh
 brew install lima

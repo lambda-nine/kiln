@@ -7,7 +7,7 @@ images:
   - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
     arch: aarch64
 mounts:
-  - location: "{{.Home}}/Projects/kiln"
+  - location: "{{.Home}}/Projects/lambda-nine/kiln"
     writable: true
 mountType: virtiofs
 containerd:
