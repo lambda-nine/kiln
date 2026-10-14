@@ -21,9 +21,9 @@ ones. Read these before changing anything:
   cgroups. The VM is named `kiln` (Ubuntu 24.04, aarch64, 4 CPUs, 4 GiB) and
   mounts this checkout at the same path. Enter it with
   `limactl shell --workdir "$PWD" kiln`. `kiln` needs root: `sudo target/debug/kiln ...`.
-- **The VM only mounts `~/Projects/lambda-nine/kiln`.** A worktree elsewhere
-  isn't visible inside it. Do VM work in this checkout, or add a mount to
-  `lima.yaml`.
+- **The VM only mounts `~/Projects/lambda-nine/kiln` and
+  `~/Projects/lambda-nine/kilnd`.** A worktree elsewhere isn't visible inside
+  it. Do VM work in these checkouts, or add a mount to `lima.yaml`.
 - **Checks before every commit** (all unprivileged, the same as CI):
   `python3 -I -m unittest discover -s bench/tests -v`, `cargo test --locked`,
   `cargo clippy --locked --all-targets -- -D warnings`, `git diff --check`.

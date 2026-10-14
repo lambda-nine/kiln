@@ -9,6 +9,9 @@ images:
 mounts:
   - location: "{{.Home}}/Projects/lambda-nine/kiln"
     writable: true
+  # kilnd, the control daemon, is a sibling checkout built and tested here too.
+  - location: "{{.Home}}/Projects/lambda-nine/kilnd"
+    writable: true
 mountType: virtiofs
 containerd:
   system: false

@@ -16,6 +16,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 - Moved the project home to the Lambda IX GitHub organization and changed the
   default macOS checkout path to `~/Projects/lambda-nine/kiln`.
+- `lima.yaml` also mounts the sibling `~/Projects/lambda-nine/kilnd` checkout
+  so the control daemon builds and tests in the same VM.
 
 ## 0.1.0 - 2026-10-11
 
