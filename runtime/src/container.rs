@@ -16,7 +16,7 @@ use nix::sys::signal::{SigSet, Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 
-use crate::cgroup::{Cgroup, Limits};
+use crate::cgroup::{Cgroup, ExecCgroup, Limits};
 use crate::init;
 use crate::landlock;
 use crate::net;
@@ -197,11 +197,15 @@ fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
 fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     listener: Option<UnixListener>, ready: Option<&OwnedFd>) -> Result<i32> {
     let cgroup = Cgroup::create(id, &cfg.limits)?;
+    let persistent = listener.is_some();
+    // A persistent sandbox's PID 1 runs each exec in a child cgroup it can
+    // kill and wait on as a whole. It's set up here, before the clone, so
+    // PID 1 inherits host-opened handles to it. One-shot runs don't need it.
+    let exec_scope = if persistent { Some(cgroup.create_exec_scope()?) } else { None };
     trace::mark("host: cgroup");
     // Leased before the clone, so the child knows its own address.
     let network = net::prepare(id, &cfg.net)?;
     let ip = network.as_ref().map(|n| n.ip());
-    let persistent = listener.is_some();
 
     // Two one-byte handshakes over a pair of pipes. Parent → child: "your
     // network is plugged in" and later "your ID maps are written". Child →
@@ -253,16 +257,19 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
         0 => {
             // In the child. _exit, not exit: the parent's atexit handlers and
             // buffered output belong to the parent.
-            let code = init(cfg, layers, ip, &to_child_rx, &to_parent_tx, listener.as_ref()).unwrap_or_else(|e| {
-                eprintln!("kiln: {e:#}");
-                1
-            });
+            let code = init(cfg, layers, ip, &to_child_rx, &to_parent_tx, listener.as_ref(), exec_scope.as_ref())
+                .unwrap_or_else(|e| {
+                    eprintln!("kiln: {e:#}");
+                    1
+                });
             // SAFETY: ends this process immediately; nothing is shared.
             unsafe { libc::_exit(code) }
         }
         child => Pid::from_raw(child as i32),
     };
     drop(cgroup_dir);
+    // PID 1 has its own copies; the host has no use for them.
+    drop(exec_scope);
 
     // Our copy of the child's write end must go, or we'd never see EOF if the
     // child dies before writing.
@@ -362,9 +369,10 @@ fn print_stats(cgroup: &Cgroup, upper: &Path) {
 /// Runs inside the child, already in the new namespaces. Sets up the sandbox,
 /// then becomes its init and returns the command's exit code.
 fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &OwnedFd, to_parent: &OwnedFd,
-    listener: Option<&UnixListener>) -> Result<i32> {
+    listener: Option<&UnixListener>, exec_scope: Option<&ExecCgroup>) -> Result<i32> {
     let mut keep = vec![from_parent.as_raw_fd(), to_parent.as_raw_fd()];
     if let Some(listener) = listener { keep.push(listener.as_raw_fd()); }
+    if let Some(scope) = exec_scope { keep.extend(scope.raw_fds()); }
     close_fds_except(&keep)?;
 
     // Wait for the parent to plug in our network, then configure our side.
@@ -458,6 +466,14 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // leave it running unsupervised. Set after become_root, because changing
     // credentials clears it.
     nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).context("set pdeathsig")?;
+    // Not dumpable: sandbox processes run as the same user as PID 1, and
+    // this is what stops them from ptracing it or opening /proc/1/fd, where
+    // a persistent sandbox's PID 1 keeps the exec cgroup's handles. A command
+    // becomes dumpable again when it execs.
+    // SAFETY: plain prctl with integer arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(Errno::last()).context("clear dumpable");
+    }
 
     // Start from a clean environment so host variables don't leak in.
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".into());
@@ -483,8 +499,10 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     trace::mark("init: credentials, env, seccomp");
 
     if let Some(listener) = listener {
+        // Without the exec cgroup nothing could contain an exec's processes.
+        let scope = exec_scope.context("persistent sandbox has no exec cgroup")?;
         write(to_parent, b"1").context("signal persistent init ready")?;
-        return init::serve(listener);
+        return init::serve(listener, scope);
     }
 
     let argv: Vec<CString> = cfg

@@ -172,16 +172,24 @@ scripts/review-regressions.sh
     sandbox's existing namespaces, cgroup limits, seccomp filter and Landlock
     policy. It refuses terminal descriptors until kiln has a controlled PTY
     mode; redirect all three streams as in the example above. The overlay and
-    `/workspace` survive between commands. Each command runs in its own
-    process group; if the `kiln exec` client goes away before it finishes
-    (killed, or timed out by a caller), PID 1 kills that group and keeps
-    serving, so the sandbox stays usable. A request that cannot start because
-    `pids.max` is full also fails without taking PID 1 or the sandbox down.
-    `kiln exec` exits with the command's code (128 + signal if it was killed),
-    or 125 when kiln itself fails, for example because the sandbox is gone.
+    `/workspace` survive between commands. One exec runs at a time in the
+    reusable child cgroup `/sys/fs/cgroup/kiln/<id>/exec`; PID 1 stays in the
+    parent sandbox cgroup. When the command exits, its client disconnects
+    (including a `kilnd` timeout or shutdown), startup fails, or `kiln rm`
+    interrupts it, PID 1 kills and drains that exec's cgroup before reporting
+    status, serving the next command, or acknowledging removal. Background
+    work intentionally never outlives the exec that launched it, even with
+    `setsid`, `setpgid`, `nohup` or a double fork; inherited output pipes reach
+    EOF after drainage. An uninterruptible kernel wait can delay drainage,
+    so termination has no fixed time bound. A request that cannot start
+    because `pids.max` is full also fails without taking PID 1 or the sandbox
+    down. `kiln exec` exits with the command's code (128 + signal if it was
+    killed), or 125 when kiln itself fails, for example because the sandbox
+    is gone.
     `kiln ls` lists live and stale shims, `kiln rm` stops one and waits for its
     resources to be removed, and `kiln gc` removes cgroups, network state and
-    run directories left by crashed shims. One-shot `kiln run` is unchanged.
+    run directories left by crashed shims, removing child cgroup directories
+    before their parent. One-shot `kiln run` is unchanged.
 
 ![kiln dashboard in Grafana](docs/kiln-dashboard.png)
 
@@ -217,6 +225,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   `cgroup_threadgroup_rwsem` for writing, which waits for an RCU grace period
   (5-15 ms on this VM unless another process was moved just before). It was
   the largest part of a `--net none` cold start.
+- **Process groups forward signals; cgroups contain descendants.** A command
+  can change its process group or session, so killing a group cannot contain
+  everything it started. For persistent execs, a trusted bootstrap writes
+  itself to a host-opened `cgroup.procs`, reports admission to PID 1, and waits
+  for PID 1 to release it before running any image or workload instruction.
+  Descendants inherit cgroup membership. They cannot migrate: cgroupfs is
+  read-only, the control descriptors are close-on-exec and explicitly closed
+  before the workload runs, and PID 1 is nondumpable so its descriptors cannot
+  be reopened through `/proc/1/fd`. That relies on PID 1 also keeping the
+  memory image it was cloned with from host-side kiln, whose user namespace is
+  the host's: a refactor that makes PID 1 exec a new image would need this
+  rechecked. PID 1 writes `cgroup.kill` and waits for
+  `cgroup.events` to report `populated 0` before the exec is finished. Process
+  groups remain a signal-forwarding convenience, not the containment boundary.
 - **Controllers are enabled top-down.** A cgroup can only use `memory`, `cpu`
   or `pids` if its parent lists them in `cgroup.subtree_control`, and a cgroup
   that hands controllers to children can't hold processes itself ("no internal

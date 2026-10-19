@@ -9,8 +9,13 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 - A persistent sandbox now survives a per-request setup failure, including
   `fork()` being refused at `pids.max`; only that `kiln exec` fails with 125.
+- Persistent `kiln exec` now contains every descendant in a reusable child
+  cgroup, with gated admission before workload execution. PID 1 kills and
+  drains it on leader exit, client disconnect, startup failure or active
+  `kiln rm` before reporting status, reuse or removal. Detached background
+  work cannot survive its exec; cleanup and GC remove child cgroups first.
 - `kiln exec`: if the client disconnects before its command finishes, PID 1
-  kills the command's process group and keeps serving. Before, the command
+  stops the command and its descendants and keeps serving. Before, the command
   ran on, blocked later execs, and PID 1 then exited on the failed status
   write, removing the whole sandbox.
 - `kiln exec` exits 125 when kiln itself fails (invalid ID, missing sandbox,

@@ -3,7 +3,9 @@
 kiln runs AI agent tool calls inside Linux sandboxes. This file records where
 it is today, where it's going, and the decisions that shape the path.
 
-## Today: one-shot CLI
+## Today: one-shot and persistent CLI
+
+The one-shot path is unchanged:
 
 ```
 sudo kiln run [--memory --cpus --pids --disk --net --allow --read-only] -- <cmd>
@@ -45,6 +47,31 @@ The parent is the supervisor: if it's killed, `PR_SET_PDEATHSIG` kills the
 sandbox too, but its cgroup, run dir and lease are left for a future
 reconcile.
 
+`kiln create` uses the same sandbox setup, but detaches a host shim and leaves
+PID 1 serving requests over a root-only control socket. The host also creates
+`/sys/fs/cgroup/kiln/<id>/exec` and opens its `cgroup.procs`, `cgroup.kill` and
+`cgroup.events` before sandbox lockdown. PID 1 stays in the parent sandbox
+cgroup; one serial exec at a time uses the reusable child. The parent's
+resource limits cover both, without enabling controllers in its subtree.
+
+For each `kiln exec`, a trusted forked bootstrap writes itself to the
+host-opened `cgroup.procs`, acknowledges admission, and waits for PID 1's
+release before executing any image or workload instruction. Its descendants
+inherit membership. Read-only cgroupfs prevents migration, the control
+descriptors are close-on-exec and explicitly closed in the bootstrap before
+the workload runs, and nondumpable PID 1 prevents workloads from reopening
+its descriptors through `/proc/1/fd`.
+
+On leader exit, client disconnect (including a `kilnd` timeout or shutdown),
+startup failure, or an active `kiln rm`, PID 1 writes `cgroup.kill` and waits
+for `cgroup.events` to report `populated 0`, then reaps exited children. Only
+then does it report status, reuse the exec cgroup, or acknowledge removal.
+`setsid`, `setpgid`, `nohup` and double forks do not escape this cleanup;
+background work never outlives its launching exec, and inherited output pipes
+reach EOF after drainage. Process groups only aid signal forwarding. A task
+stuck in an uninterruptible kernel wait can delay drainage indefinitely.
+Sandbox cleanup and `kiln gc` remove nested cgroup directories children-first.
+
 ## Target
 
 ```
@@ -81,7 +108,8 @@ reconcile.
    and many commands run in it, like `docker exec`. `kiln exec` doesn't enter
    from the host with `setns`: it hands the command and its stdio to the
    sandbox's PID 1 over a control socket, so every command inherits the same
-   restrictions.
+   restrictions. Files survive between commands; background processes do not.
+   The per-exec cgroup must drain before another exec starts.
 2. **A daemon (`kilnd`) will own sandbox state.** Until the API daemon is added,
    the CLI provides the same lifecycle and `kiln gc` reconciliation: it scans
    persistent run directories and removes cgroups and network state whose shim
@@ -107,6 +135,10 @@ reconcile.
 | CPU hog                          | Handled: `cpu.max` throttling           |
 | Signals to PID 1 ignored         | Handled: kiln-init                      |
 | Zombie processes                 | Handled: kiln-init reaps                |
+| Persistent exec descendants survive completion or disconnect | Handled: gated admission to the exec cgroup; PID 1 uses `cgroup.kill` and waits for `populated 0` before status or reuse, including normal leader exit, startup failure and `kilnd` timeout/shutdown |
+| Active `kiln rm` leaves exec descendants | Handled: PID 1 interrupts the active exec and drains its cgroup before acknowledging removal; cleanup/GC removes child cgroup directories first |
+| Descendants hold exec output pipes open | Handled: all descendants are killed and drained before completion, including separate sessions/process groups, `nohup` and double forks |
+| Task stuck in uninterruptible kernel sleep | Limit: SIGKILL cannot finish until the kernel wait ends; cgroup drainage and removal have no fixed time bound |
 | Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |

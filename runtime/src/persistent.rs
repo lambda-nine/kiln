@@ -144,7 +144,7 @@ pub fn gc() -> Result<()> {
 }
 
 pub fn receive(stream: &mut UnixStream) -> Result<(u8, Vec<CString>, Vec<OwnedFd>)> {
-    let (op, len, fds) = recv_header(stream)?;
+    let (op, len, fds) = receive_header(stream)?;
     if len as usize > MAX_REQUEST {
         bail!("request is too large");
     }
@@ -270,7 +270,10 @@ fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<(
     Ok(())
 }
 
-fn recv_header(stream: &UnixStream) -> Result<(u8, u32, Vec<OwnedFd>)> {
+/// Reads only a request's fixed 8-byte header, in one recvmsg: the operation
+/// (1 exec, 2 rm), the length of the body that follows, and any descriptors
+/// passed with it. `receive` reads the body after it.
+pub fn receive_header(stream: &UnixStream) -> Result<(u8, u32, Vec<OwnedFd>)> {
     let mut header = [0u8; 8];
     let mut iov = libc::iovec {
         iov_base: header.as_mut_ptr().cast(),
@@ -326,6 +329,48 @@ mod tests {
             .custom_flags(libc::O_NOCTTY)
             .open(path)
             .unwrap()
+    }
+
+    #[test]
+    fn header_only_read_leaves_the_body_and_keeps_descriptors() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = open("/dev/null");
+        let fd = null.as_raw_fd();
+        send_header(&client, 1, 5, &[fd, fd, fd]).unwrap();
+        (&client).write_all(b"hello").unwrap();
+        let (op, len, fds) = receive_header(&server).unwrap();
+        assert_eq!((op, len, fds.len()), (1, 5, 3));
+        let mut body = [0u8; 5];
+        (&server).read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"hello", "the header read must not consume the body");
+    }
+
+    #[test]
+    fn rm_header_has_no_body_or_descriptors() {
+        let (client, server) = UnixStream::pair().unwrap();
+        send_header(&client, 2, 0, &[]).unwrap();
+        let (op, len, fds) = receive_header(&server).unwrap();
+        assert_eq!((op, len, fds.len()), (2, 0, 0));
+    }
+
+    #[test]
+    fn short_or_stalled_headers_fail() {
+        let (client, server) = UnixStream::pair().unwrap();
+        (&client).write_all(&[1, 0, 0, 0]).unwrap();
+        drop(client);
+        assert!(receive_header(&server).is_err(), "a truncated header must be rejected");
+
+        let (_client, server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        assert!(receive_header(&server).is_err(), "a silent client must time out");
+    }
+
+    #[test]
+    fn oversized_bodies_are_rejected_before_reading() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        send_header(&client, 1, MAX_REQUEST as u32 + 1, &[]).unwrap();
+        let err = receive(&mut server).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]

@@ -46,6 +46,22 @@ relying on it:
 - **seccomp denylist.** The filter blocks a list of risky syscalls and
   namespace creation. Everything else is allowed; an allowlist would be
   stricter.
+- **Persistent exec descendants.** One serial exec at a time runs in a child
+  cgroup, with PID 1 outside it. A trusted bootstrap joins through a
+  host-opened `cgroup.procs` and waits for PID 1's release before any image or
+  workload instruction runs. Descendants inherit membership and cannot
+  migrate: cgroupfs is read-only, control descriptors are close-on-exec and
+  closed before the workload runs, and PID 1 is nondumpable. The
+  nondumpable protection also relies on PID 1 never exec'ing, so its memory
+  stays tied to the host's user namespace rather than the sandbox's; revalidate
+  it if PID 1 is ever changed to re-exec. On leader exit,
+  client disconnect (including `kilnd` timeout/shutdown), startup failure or
+  active `kiln rm`, PID 1 kills and drains the exec cgroup before status,
+  reuse or removal. Separate sessions/process groups, `nohup` and double
+  forks cannot keep background work alive past that exec; output pipes reach
+  EOF after drainage. This is a lifecycle guarantee, not stronger kernel
+  isolation: an uninterruptible kernel wait can delay drainage indefinitely.
+  One-shot `kiln run` is unchanged.
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the
