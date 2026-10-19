@@ -145,9 +145,12 @@ scripts/review-regressions.sh
    failure. Full method, raw-data boundaries and analysis:
    [docs/benchmarks.md](docs/benchmarks.md); `KILN_TRACE=1` prints each phase.
 8. **kiln-init** (done): PID 1 inside the sandbox is kiln itself. It forks the
-   command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to it, reaps orphans, and
-   exits with the command's code. The host-side `kiln` survives Ctrl-C and
-   `kill`, passes them on, and still cleans up.
+   command as PID 2, forwards SIGTERM/HUP/USR1/USR2 to that direct child for a
+   one-shot run, reaps orphans, and exits with the command's code. Persistent
+   PID 1 forwards those signals to the active command's process group and
+   polls a lifetime-scoped signalfd beside its control listener, so adopted
+   children are reaped even while the sandbox is idle. The host-side `kiln`
+   survives Ctrl-C and `kill`, passes them on, and still cleans up.
 
 9. **Disk limits** (done): `/var/lib/kiln/runs` is an XFS filesystem (in a
    sparse file on a loop device) mounted with `prjquota`. Each run directory
@@ -183,9 +186,16 @@ scripts/review-regressions.sh
     EOF after drainage. An uninterruptible kernel wait can delay drainage,
     so termination has no fixed time bound. A request that cannot start
     because `pids.max` is full also fails without taking PID 1 or the sandbox
-    down. `kiln exec` exits with the command's code (128 + signal if it was
-    killed), or 125 when kiln itself fails, for example because the sandbox
-    is gone.
+    down. A forwarded SIGTERM/HUP/USR1/USR2 received while no exec is active
+    stops the sandbox and triggers shim cleanup instead of becoming a stale
+    signal for the next command. An accepted request body is still read with a
+    blocking receive: an incomplete root-side client can delay that idle
+    handling until it finishes or disconnects, but the admission-boundary
+    drain still prevents the pending signal from reaching its command.
+    Signal-aware request framing is reserved for the control-protocol work.
+    Commands start with the normal default `SIGPIPE` behavior. `kiln exec`
+    exits with the command's code (128 + signal if it was killed), or 125 when
+    kiln itself fails, for example because the sandbox is gone.
     `kiln ls` lists live and stale shims, `kiln rm` stops one and waits for its
     resources to be removed, and `kiln gc` removes cgroups, network state and
     run directories left by crashed shims, removing child cgroup directories
@@ -255,8 +265,18 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   exits after 2 s with code 143.
 - **Waiting for signals instead of handling them.** Both kiln-init and the
   host-side `kiln` block signals with `sigprocmask` and pick them up one at a
-  time with `sigwait`, in the same loop that reaps children. No async signal
+  time with `sigwait` or signalfd, in the same loop that reaps children. A
+  persistent PID 1 polls signalfd together with its control listener, so idle
+  children cannot become zombies and idle signals cannot drift into a future
+  exec. Request bodies are not yet part of that poll loop, so an accepted,
+  incomplete root-side request can delay signal handling; the final idle drain
+  before admission preserves ownership of the signal. No async signal
   handlers, so no async-signal-safety rules to get wrong.
+- **Rust ignores SIGPIPE; commands should not.** kiln itself keeps Rust's
+  ignored disposition so a closed pipe becomes an I/O error it can report.
+  Immediately before executing a sandbox command, kiln restores `SIGPIPE` to
+  `SIG_DFL`, preserving conventional pipeline behavior such as a producer
+  terminating when `head` closes its input.
 - **Don't forward Ctrl-C.** The terminal sends SIGINT to its whole foreground
   process group, and the sandboxed command is in that group, so it already got
   the signal. Forwarding it too would deliver it twice. Ctrl-C ends a run with

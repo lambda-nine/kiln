@@ -72,6 +72,20 @@ reach EOF after drainage. Process groups only aid signal forwarding. A task
 stuck in an uninterruptible kernel wait can delay drainage indefinitely.
 Sandbox cleanup and `kiln gc` remove nested cgroup directories children-first.
 
+PID 1 keeps one signalfd for its whole lifetime and polls it beside the control
+listener. It therefore reaps any unexpectedly adopted child even when no exec
+is active. `SIGTERM`, `SIGHUP`, `SIGUSR1` or `SIGUSR2` received while idle stop
+the sandbox and let the shim clean its resources; none can remain pending for
+the next unrelated command. During an exec those signals go to the command's
+process group, while the exec cgroup remains the non-escapable cleanup unit.
+Commands restore the default `SIGPIPE` disposition before `exec`.
+Request reception remains in the idle state: PID 1 drains the signalfd again
+at the command-admission boundary, so a signal arriving after `accept()` still
+stops the sandbox instead of crossing into the command. The request body read
+is currently blocking, however. A root-side peer that connects and never
+finishes a request can defer that handling until it completes or disconnects;
+signal-aware request framing remains future control-protocol work.
+
 ## Target
 
 ```
@@ -133,8 +147,9 @@ Sandbox cleanup and `kiln gc` remove nested cgroup directories children-first.
 | Memory hog                       | Handled: group OOM kill, reported       |
 | Fork bomb                        | Handled: `pids.max`; a refused persistent exec leaves PID 1 and its overlay alive |
 | CPU hog                          | Handled: `cpu.max` throttling           |
-| Signals to PID 1 ignored         | Handled: kiln-init                      |
-| Zombie processes                 | Handled: kiln-init reaps                |
+| Signals to PID 1 ignored         | Handled: kiln-init forwards them to an active command group; forwarded signals received while idle stop the sandbox instead of leaking into the next exec |
+| Incomplete accepted control request delays idle duties | Limit: request bodies are still read synchronously; pending shutdown is applied with idle semantics at the admission boundary once the root-side peer completes or disconnects |
+| Zombie processes                 | Handled: lifetime signalfd loop reaps while busy or idle; exec cleanup also drains and reaps before reuse |
 | Persistent exec descendants survive completion or disconnect | Handled: gated admission to the exec cgroup; PID 1 uses `cgroup.kill` and waits for `populated 0` before status or reuse, including normal leader exit, startup failure and `kilnd` timeout/shutdown |
 | Active `kiln rm` leaves exec descendants | Handled: PID 1 interrupts the active exec and drains its cgroup before acknowledging removal; cleanup/GC removes child cgroup directories first |
 | Descendants hold exec output pipes open | Handled: all descendants are killed and drained before completion, including separate sessions/process groups, `nohup` and double forks |

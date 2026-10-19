@@ -7,6 +7,13 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Persistent PID 1 now polls one lifetime-scoped signal fd alongside its
+  control listener, reaps adopted children while idle, and treats forwarded
+  signals received with no active exec as requests to stop the sandbox rather
+  than retaining them for a later command, including across request admission.
+  During a persistent exec, signals reach the command's process group; both
+  one-shot and persistent commands restore the normal default `SIGPIPE`
+  disposition before `exec`.
 - A persistent sandbox now survives a per-request setup failure, including
   `fork()` being refused at `pids.max`; only that `kiln exec` fails with 125.
 - Persistent `kiln exec` now contains every descendant in a reusable child

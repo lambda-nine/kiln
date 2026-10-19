@@ -62,6 +62,18 @@ relying on it:
   EOF after drainage. This is a lifecycle guarantee, not stronger kernel
   isolation: an uninterruptible kernel wait can delay drainage indefinitely.
   One-shot `kiln run` is unchanged.
+- **Persistent PID 1 lifecycle.** PID 1 polls one lifetime-scoped signalfd
+  beside the control listener and reaps adopted children even while idle.
+  `SIGTERM`, `SIGHUP`, `SIGUSR1` and `SIGUSR2` received without an active exec
+  stop the sandbox and trigger shim cleanup instead of remaining pending for
+  the next command. During an exec they are sent to the command's process
+  group; cgroup drainage, not the process group, remains the descendant
+  containment boundary. Commands restore the default `SIGPIPE` disposition
+  before `exec`. An accepted control request remains idle until admission, so
+  a final signal drain prevents pending shutdown from crossing into its
+  command. The request body read is still blocking: an incomplete root-side
+  peer can defer signal handling until completion or disconnect. Making that
+  framing signal-aware remains control-protocol hardening work.
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the

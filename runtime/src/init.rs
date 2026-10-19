@@ -45,7 +45,7 @@ pub fn run(argv: &[CString]) -> Result<i32> {
     // SAFETY: single-threaded, so the child can safely run any code.
     match unsafe { fork() }.context("fork")? {
         ForkResult::Child => {
-            let _ = SigSet::empty().thread_set_mask();
+            prepare_command_signals();
             let err = execvp(&argv[0], argv).unwrap_err();
             eprintln!("kiln: exec {}: {err}", argv[0].to_string_lossy());
             // 127 is the shell's "command not found" code.
@@ -75,12 +75,18 @@ pub fn run(argv: &[CString]) -> Result<i32> {
 pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
     let all = SigSet::all();
     all.thread_block().context("block signals")?;
+    // Readiness may become stale before accept(), especially when signals and
+    // connections wake the same poll. Never let PID 1 block in accept().
+    listener.set_nonblocking(true).context("set control listener nonblocking")?;
     // Blocked signals queue up on the signalfd, so one poll() waits for them,
     // the client hanging up and new requests.
     let signals = SignalFd::with_flags(&all, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
         .context("signalfd")?;
     loop {
-        let (mut stream, _) = listener.accept().context("accept exec request")?;
+        let mut stream = match wait_for_request(listener, &signals)? {
+            IdleEvent::Request(stream) => stream,
+            IdleEvent::Stop(code) => return Ok(code),
+        };
         let (op, argv, fds) = match crate::persistent::receive(&mut stream) {
             Ok(request) => request,
             Err(e) => { eprintln!("kiln: bad exec request: {e:#}"); continue; }
@@ -100,6 +106,7 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
                 eprintln!("kiln: report exec status: {e}");
             },
             Outcome::Disconnected => eprintln!("kiln: exec client disconnected; stopped its command"),
+            Outcome::Stop(code) => return Ok(code),
             // A request-local setup failure such as fork() returning EAGAIN
             // at pids.max must fail this exec, not unwind PID 1 and destroy
             // the persistent sandbox. Dropping the stream makes the CLI
@@ -119,10 +126,22 @@ enum Outcome {
     Exited(i32),
     /// The client hung up first (killed, or timed out by a caller like kilnd).
     Disconnected,
+    /// An idle shutdown signal arrived after request acceptance but before
+    /// command admission. It belongs to the sandbox, not the next command.
+    Stop(i32),
     /// Trusted request setup failed before any child was created.
     RequestFailed,
     /// `kiln rm` arrived; this is its connection, still to be acknowledged.
     Removed(UnixStream),
+}
+
+/// What wakes PID 1 while no exec request is active.
+enum IdleEvent {
+    /// A client connected with a new exec or removal request.
+    Request(UnixStream),
+    /// A forwarded signal has its normal no-workload meaning: stop the
+    /// persistent sandbox instead of saving it for an unrelated later exec.
+    Stop(i32),
 }
 
 /// Runs one exec request inside the exec cgroup. Process groups and sessions
@@ -132,10 +151,12 @@ enum Outcome {
 /// the next exec starts from an empty cgroup.
 fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener: &UnixListener,
     scope: &ExecCgroup, signals: &SignalFd) -> Result<Outcome> {
-    // Signals that arrived between execs aren't for this command, and an
-    // earlier exec's last process may have become a zombie after its reap.
-    while signals.read_signal().context("read signalfd")?.is_some() {}
-    reap(None)?;
+    // Request reception is deliberately still part of the idle state. Drain
+    // once at the admission boundary so a shutdown signal received after
+    // accept() cannot cross into and terminate this unrelated command.
+    if let Some(code) = drain_idle_signals(signals)? {
+        return Ok(Outcome::Stop(code));
+    }
 
     // The child reports whether it joined the exec cgroup, then waits to be
     // released. It runs only kiln's code until then.
@@ -185,7 +206,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     // pending `kiln rm` stops it here. Anything later is still contained.
     let mut wait = watch(signals, client, listener);
     poll(&mut wait, 0)?;
-    if let Some(outcome) = interrupted(&wait, listener) {
+    if let Some(outcome) = interrupted(&wait, listener)? {
         return finish(scope, outcome);
     }
     // If the child died meanwhile, its SIGCHLD ends the loop below.
@@ -195,7 +216,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     let outcome = loop {
         let mut wait = watch(signals, client, listener);
         poll(&mut wait, -1)?;
-        if let Some(outcome) = interrupted(&wait, listener) {
+        if let Some(outcome) = interrupted(&wait, listener)? {
             break outcome;
         }
         let mut status = None;
@@ -204,7 +225,9 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
                 Ok(Signal::SIGCHLD) => if let Some(code) = reap(Some(leader))? {
                     status = Some(code);
                 },
-                Ok(sig) if FORWARDED.contains(&sig) && status.is_none() => { let _ = kill(leader, sig); }
+                Ok(sig) if FORWARDED.contains(&sig) && status.is_none() => {
+                    forward_to_group(leader, sig);
+                }
                 _ => {}
             }
         }
@@ -238,7 +261,7 @@ fn launch(argv: &[CString], stdio: &[OwnedFd], scope: &ExecCgroup, joined: &Owne
     // Its own process group only so forwarded signals have a clear target;
     // containment doesn't depend on it.
     let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
-    let _ = SigSet::empty().thread_set_mask();
+    prepare_command_signals();
     let err = execvp(&argv[0], argv).unwrap_err();
     eprintln!("kiln: exec {}: {err}", argv[0].to_string_lossy());
     std::process::exit(127);
@@ -281,10 +304,10 @@ fn watch(signals: &SignalFd, client: &UnixStream, listener: &UnixListener) -> [l
     ]
 }
 
-fn poll(fds: &mut [libc::pollfd; 3], timeout: i32) -> Result<()> {
+fn poll(fds: &mut [libc::pollfd], timeout: i32) -> Result<()> {
     loop {
-        // SAFETY: `fds` is an array of three initialized pollfds.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout) } >= 0 {
+        // SAFETY: `fds` points to initialized pollfds for the supplied length.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } >= 0 {
             return Ok(());
         }
         match Errno::last() {
@@ -294,45 +317,117 @@ fn poll(fds: &mut [libc::pollfd; 3], timeout: i32) -> Result<()> {
     }
 }
 
+/// Waits for work without abandoning PID 1's other lifetime duties. Adopted
+/// children can exit long after their launching command, so SIGCHLD is reaped
+/// even while the control listener is otherwise idle. A forwarded signal with
+/// no active command stops the sandbox with the signal's shell-style status;
+/// it is never retained for the next command.
+fn wait_for_request(listener: &UnixListener, signals: &SignalFd) -> Result<IdleEvent> {
+    loop {
+        let mut wait = [
+            libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        poll(&mut wait, -1)?;
+
+        poll_error(wait[0].revents, "signalfd")?;
+        poll_error(wait[1].revents, "control listener")?;
+        if let Some(code) = drain_idle_signals(signals)? {
+            return Ok(IdleEvent::Stop(code));
+        }
+        if wait[1].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(IdleEvent::Request(stream)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e).context("accept exec request"),
+            }
+        }
+    }
+}
+
+/// Performs PID 1's idle signal duties and returns the first requested stop.
+/// Reading until EAGAIN matters because standard signals can coalesce and a
+/// SIGCHLD may share a readiness notification with a shutdown signal.
+fn drain_idle_signals(signals: &SignalFd) -> Result<Option<i32>> {
+    let mut stop = None;
+    while let Some(info) = signals.read_signal().context("read signalfd")? {
+        match Signal::try_from(info.ssi_signo as i32) {
+            Ok(Signal::SIGCHLD) => { reap(None)?; }
+            Ok(sig) if FORWARDED.contains(&sig) && stop.is_none() => {
+                stop = Some(128 + sig as i32);
+            }
+            _ => {}
+        }
+    }
+    Ok(stop)
+}
+
+fn poll_error(revents: i16, source: &str) -> Result<()> {
+    let errors = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    if revents & errors != 0 {
+        return Err(anyhow::anyhow!("{source} poll failure: revents={revents:#x}"));
+    }
+    Ok(())
+}
+
+/// Sends a signal to the command's process group. Descendants may create
+/// other groups or sessions, so the exec cgroup remains the cleanup boundary;
+/// this group delivery supplies normal signal semantics to cooperating work.
+fn forward_to_group(leader: Pid, sig: Signal) {
+    let _ = kill(Pid::from_raw(-leader.as_raw()), sig);
+}
+
+/// Rust ignores SIGPIPE for its own process. An exec'd command must receive
+/// the Unix default instead, or pipeline writers observe EPIPE and return an
+/// application error rather than terminating with SIGPIPE.
+fn prepare_command_signals() {
+    let _ = SigSet::empty().thread_set_mask();
+    // SAFETY: SIG_DFL installs no function pointer and SIGPIPE is valid.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+}
+
 /// Whether the exec must stop because its client hung up or `kiln rm` came.
-fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener) -> Option<Outcome> {
+fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener) -> Result<Option<Outcome>> {
+    poll_error(wait[0].revents, "signalfd")?;
+    poll_error(wait[2].revents, "control listener")?;
     if wait[1].revents != 0 {
-        return Some(Outcome::Disconnected);
+        return Ok(Some(Outcome::Disconnected));
     }
     if wait[2].revents & libc::POLLIN != 0 {
-        return accept_while_busy(listener).map(Outcome::Removed);
+        return Ok(accept_while_busy(listener)?.map(Outcome::Removed));
     }
-    None
+    Ok(None)
 }
 
 /// Handles a connection that arrives while an exec runs. Execs run one at a
 /// time, so another exec request fails with EXEC_FAILED instead of queueing.
 /// Returns a `kiln rm` connection, which interrupts the running exec.
-fn accept_while_busy(listener: &UnixListener) -> Option<UnixStream> {
+fn accept_while_busy(listener: &UnixListener) -> Result<Option<UnixStream>> {
     let mut stream = match listener.accept() {
         Ok((stream, _)) => stream,
-        Err(e) => { eprintln!("kiln: accept exec request: {e}"); return None; }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e).context("accept exec request"),
     };
     // Only the fixed-size header is read, in one recvmsg, so a client that
     // stalls holds up the running exec for at most this once. An exec's body
     // is never read: the request is refused either way.
     if let Err(e) = stream.set_read_timeout(Some(BUSY_READ_TIMEOUT)) {
         eprintln!("kiln: set request timeout: {e}");
-        return None;
+        return Ok(None);
     }
     match crate::persistent::receive_header(&stream) {
-        Ok((2, 0, fds)) if fds.is_empty() => Some(stream),
+        Ok((2, 0, fds)) if fds.is_empty() => Ok(Some(stream)),
         Ok((1, _, fds)) => {
             drop(fds);
             eprintln!("kiln: refused an exec request while another exec runs");
             let _ = stream.write_all(&EXEC_FAILED.to_ne_bytes());
-            None
+            Ok(None)
         }
         Ok((op, len, fds)) => {
             eprintln!("kiln: bad request during exec: op {op}, {len} bytes, {} fds", fds.len());
-            None
+            Ok(None)
         }
-        Err(e) => { eprintln!("kiln: bad request during exec: {e:#}"); None }
+        Err(e) => { eprintln!("kiln: bad request during exec: {e:#}"); Ok(None) }
     }
 }
 
