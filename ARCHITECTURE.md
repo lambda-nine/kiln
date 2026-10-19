@@ -81,10 +81,16 @@ process group, while the exec cgroup remains the non-escapable cleanup unit.
 Commands restore the default `SIGPIPE` disposition before `exec`.
 Request reception remains in the idle state: PID 1 drains the signalfd again
 at the command-admission boundary, so a signal arriving after `accept()` still
-stops the sandbox instead of crossing into the command. The request body read
-is currently blocking, however. A root-side peer that connects and never
-finishes a request can defer that handling until it completes or disconnects;
-signal-aware request framing remains future control-protocol work.
+stops the sandbox instead of crossing into the command. Accepted sockets are
+nonblocking and PID 1 polls each beside the signalfd. The complete eight-byte
+header and payload have one absolute two-second receive deadline, so byte-wise
+progress cannot prolong it; a stalled or crashed peer is dropped and the next
+`exec` or `rm` is accepted. Framing accepts exactly one SCM_RIGHTS message with
+three stdio descriptors for exec, none for removal, rejects ancillary
+truncation and descriptors attached to the payload, and closes every received
+descriptor on errors. After a complete request, `shutdown(SHUT_WR)` explicitly
+means "request finished; response still wanted"; a full close cancels an active
+exec.
 
 ## Target
 
@@ -148,7 +154,7 @@ signal-aware request framing remains future control-protocol work.
 | Fork bomb                        | Handled: `pids.max`; a refused persistent exec leaves PID 1 and its overlay alive |
 | CPU hog                          | Handled: `cpu.max` throttling           |
 | Signals to PID 1 ignored         | Handled: kiln-init forwards them to an active command group; forwarded signals received while idle stop the sandbox instead of leaking into the next exec |
-| Incomplete accepted control request delays idle duties | Limit: request bodies are still read synchronously; pending shutdown is applied with idle semantics at the admission boundary once the root-side peer completes or disconnects |
+| Incomplete or malformed control request wedges PID 1 | Handled: nonblocking signal-aware framing has one absolute two-second header-plus-payload deadline; malformed frames and ancillary data are dropped without leaking descriptors |
 | Zombie processes                 | Handled: lifetime signalfd loop reaps while busy or idle; exec cleanup also drains and reaps before reuse |
 | Persistent exec descendants survive completion or disconnect | Handled: gated admission to the exec cgroup; PID 1 uses `cgroup.kill` and waits for `populated 0` before status or reuse, including normal leader exit, startup failure and `kilnd` timeout/shutdown |
 | Active `kiln rm` leaves exec descendants | Handled: PID 1 interrupts the active exec and drains its cgroup before acknowledging removal; cleanup/GC removes child cgroup directories first |

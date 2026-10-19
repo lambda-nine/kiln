@@ -11,7 +11,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
@@ -22,7 +22,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
-use crate::persistent::EXEC_FAILED;
+use crate::persistent::{EXEC_FAILED, HeaderReader, ReadState, Request, RequestReader};
 
 /// Signals passed on to the command. SIGINT, SIGQUIT and SIGWINCH are left
 /// out on purpose: the terminal sends those to the whole foreground process
@@ -31,8 +31,9 @@ use crate::persistent::EXEC_FAILED;
 pub const FORWARDED: [Signal; 4] =
     [Signal::SIGTERM, Signal::SIGHUP, Signal::SIGUSR1, Signal::SIGUSR2];
 
-/// How long the header of a request that arrives during an exec may take.
-const BUSY_READ_TIMEOUT: Duration = Duration::from_secs(1);
+/// One absolute window for a complete local control frame, from its first
+/// accept through its final payload byte. Progress does not reset it.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Starts `argv` as a child and supervises it until it exits. Returns its
 /// shell-style exit code (128 + signal number if it was killed).
@@ -87,18 +88,15 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
             IdleEvent::Request(stream) => stream,
             IdleEvent::Stop(code) => return Ok(code),
         };
-        let (op, argv, fds) = match crate::persistent::receive(&mut stream) {
-            Ok(request) => request,
+        let request = match receive_idle_request(&mut stream, &signals) {
+            Ok(FramingOutcome::Request(request)) => request,
+            Ok(FramingOutcome::Stop(code)) => return Ok(code),
             Err(e) => { eprintln!("kiln: bad exec request: {e:#}"); continue; }
         };
-        if op == 2 {
+        let Request::Exec(argv, fds) = request else {
             stream.write_all(&0i32.to_ne_bytes())?;
             return Ok(0);
-        }
-        if op != 1 || fds.len() != 3 {
-            eprintln!("kiln: exec request needs stdin, stdout and stderr");
-            continue;
-        }
+        };
         // A client that went away can't take the status; failing to send it
         // must not end PID 1 and with it the sandbox.
         match run_exec(&argv, fds, &stream, listener, scope, &signals)? {
@@ -142,6 +140,90 @@ enum IdleEvent {
     /// A forwarded signal has its normal no-workload meaning: stop the
     /// persistent sandbox instead of saving it for an unrelated later exec.
     Stop(i32),
+}
+
+/// A fully framed idle request, or the sandbox signal that preempted it.
+enum FramingOutcome {
+    Request(Request),
+    Stop(i32),
+}
+
+enum FrameWake {
+    Client,
+    Signal,
+}
+
+/// Reads one idle request without abandoning PID 1's signal duties. Framing
+/// has one absolute deadline; a slow byte stream cannot extend it by making
+/// occasional progress.
+fn receive_idle_request(stream: &mut UnixStream, signals: &SignalFd) -> Result<FramingOutcome> {
+    stream.set_nonblocking(true).context("set control request nonblocking")?;
+    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
+    let mut reader = RequestReader::new();
+    loop {
+        if let Some(code) = drain_idle_signals(signals)? {
+            return Ok(FramingOutcome::Stop(code));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!("control request framing deadline exceeded"));
+        }
+        let (state, stop) = read_frame_before_deadline(
+            deadline,
+            || reader.read(stream),
+            || drain_idle_signals(signals),
+            Instant::now,
+        )?;
+        if let Some(code) = stop {
+            return Ok(FramingOutcome::Stop(code));
+        }
+        if let ReadState::Complete(request) = state {
+            return Ok(FramingOutcome::Request(request));
+        }
+        let _ = wait_for_frame(stream, signals, deadline)?;
+    }
+}
+
+/// Advances framing once, services signals, then samples the clock. Keeping
+/// the clock injectable makes the post-read deadline boundary deterministic
+/// under test: a read that completes after expiration must not be accepted.
+fn read_frame_before_deadline<T>(
+    deadline: Instant,
+    read: impl FnOnce() -> Result<ReadState<T>>,
+    after_read: impl FnOnce() -> Result<Option<i32>>,
+    now: impl FnOnce() -> Instant,
+) -> Result<(ReadState<T>, Option<i32>)> {
+    let state = read()?;
+    let stop = after_read()?;
+    if stop.is_none() && now() >= deadline {
+        return Err(anyhow::anyhow!("control request framing deadline exceeded"));
+    }
+    Ok((state, stop))
+}
+
+fn wait_for_frame(stream: &UnixStream, signals: &SignalFd, deadline: Instant) -> Result<FrameWake> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("control request framing deadline exceeded")?;
+    let millis = remaining.as_nanos().div_ceil(1_000_000);
+    let timeout = millis.min(i32::MAX as u128) as i32;
+    let mut wait = [
+        libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLRDHUP,
+            revents: 0,
+        },
+    ];
+    if poll(&mut wait, timeout)? == 0 {
+        return Err(anyhow::anyhow!("control request framing deadline exceeded"));
+    }
+    poll_error(wait[0].revents, "signalfd")?;
+    socket_poll_error(wait[1].revents, "control request")?;
+    if wait[0].revents & libc::POLLIN != 0 {
+        Ok(FrameWake::Signal)
+    } else {
+        Ok(FrameWake::Client)
+    }
 }
 
 /// Runs one exec request inside the exec cgroup. Process groups and sessions
@@ -206,7 +288,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     // pending `kiln rm` stops it here. Anything later is still contained.
     let mut wait = watch(signals, client, listener);
     poll(&mut wait, 0)?;
-    if let Some(outcome) = interrupted(&wait, listener)? {
+    if let Some(outcome) = interrupted(&wait, listener, signals)? {
         return finish(scope, outcome);
     }
     // If the child died meanwhile, its SIGCHLD ends the loop below.
@@ -216,7 +298,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     let outcome = loop {
         let mut wait = watch(signals, client, listener);
         poll(&mut wait, -1)?;
-        if let Some(outcome) = interrupted(&wait, listener)? {
+        if let Some(outcome) = interrupted(&wait, listener, signals)? {
             break outcome;
         }
         let mut status = None;
@@ -299,16 +381,21 @@ fn reap_all_blocking() -> Result<()> {
 fn watch(signals: &SignalFd, client: &UnixStream, listener: &UnixListener) -> [libc::pollfd; 3] {
     [
         libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: client.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 },
+        // POLLHUP is reported even when not requested and means the peer's
+        // read side is gone. Do not request POLLRDHUP: a peer may legitimately
+        // shutdown(SHUT_WR) after its complete length-framed request while it
+        // keeps reading the response.
+        libc::pollfd { fd: client.as_raw_fd(), events: 0, revents: 0 },
         libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
     ]
 }
 
-fn poll(fds: &mut [libc::pollfd], timeout: i32) -> Result<()> {
+fn poll(fds: &mut [libc::pollfd], timeout: i32) -> Result<usize> {
     loop {
         // SAFETY: `fds` points to initialized pollfds for the supplied length.
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } >= 0 {
-            return Ok(());
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if ready >= 0 {
+            return Ok(ready as usize);
         }
         match Errno::last() {
             Errno::EINTR => continue,
@@ -370,6 +457,14 @@ fn poll_error(revents: i16, source: &str) -> Result<()> {
     Ok(())
 }
 
+fn socket_poll_error(revents: i16, source: &str) -> Result<()> {
+    let errors = libc::POLLERR | libc::POLLNVAL;
+    if revents & errors != 0 {
+        return Err(anyhow::anyhow!("{source} poll failure: revents={revents:#x}"));
+    }
+    Ok(())
+}
+
 /// Sends a signal to the command's process group. Descendants may create
 /// other groups or sessions, so the exec cgroup remains the cleanup boundary;
 /// this group delivery supplies normal signal semantics to cooperating work.
@@ -387,14 +482,16 @@ fn prepare_command_signals() {
 }
 
 /// Whether the exec must stop because its client hung up or `kiln rm` came.
-fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener) -> Result<Option<Outcome>> {
+fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener,
+    signals: &SignalFd) -> Result<Option<Outcome>> {
     poll_error(wait[0].revents, "signalfd")?;
     poll_error(wait[2].revents, "control listener")?;
-    if wait[1].revents != 0 {
+    let disconnected = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    if wait[1].revents & disconnected != 0 {
         return Ok(Some(Outcome::Disconnected));
     }
     if wait[2].revents & libc::POLLIN != 0 {
-        return Ok(accept_while_busy(listener)?.map(Outcome::Removed));
+        return Ok(accept_while_busy(listener, signals)?.map(Outcome::Removed));
     }
     Ok(None)
 }
@@ -402,32 +499,57 @@ fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener) -> Result<Opti
 /// Handles a connection that arrives while an exec runs. Execs run one at a
 /// time, so another exec request fails with EXEC_FAILED instead of queueing.
 /// Returns a `kiln rm` connection, which interrupts the running exec.
-fn accept_while_busy(listener: &UnixListener) -> Result<Option<UnixStream>> {
+fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Option<UnixStream>> {
     let mut stream = match listener.accept() {
         Ok((stream, _)) => stream,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
         Err(e) => return Err(e).context("accept exec request"),
     };
-    // Only the fixed-size header is read, in one recvmsg, so a client that
-    // stalls holds up the running exec for at most this once. An exec's body
-    // is never read: the request is refused either way.
-    if let Err(e) = stream.set_read_timeout(Some(BUSY_READ_TIMEOUT)) {
-        eprintln!("kiln: set request timeout: {e}");
+    if let Err(e) = stream.set_nonblocking(true) {
+        eprintln!("kiln: set busy request nonblocking: {e}");
         return Ok(None);
     }
-    match crate::persistent::receive_header(&stream) {
-        Ok((2, 0, fds)) if fds.is_empty() => Ok(Some(stream)),
-        Ok((1, _, fds)) => {
-            drop(fds);
+    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
+    let mut reader = HeaderReader::new();
+    let header = loop {
+        if Instant::now() >= deadline {
+            eprintln!("kiln: bad request during exec: framing deadline exceeded");
+            return Ok(None);
+        }
+        match reader.read(&stream) {
+            Ok(ReadState::Complete(header)) => {
+                if Instant::now() >= deadline {
+                    eprintln!("kiln: bad request during exec: framing deadline exceeded");
+                    return Ok(None);
+                }
+                break header;
+            }
+            Ok(ReadState::Pending) => match wait_for_frame(&stream, signals, deadline) {
+                Ok(FrameWake::Client) => continue,
+                Ok(FrameWake::Signal) => return Ok(None),
+                Err(e) => {
+                    eprintln!("kiln: bad request during exec: {e:#}");
+                    return Ok(None);
+                }
+            },
+            Err(e) => {
+                eprintln!("kiln: bad request during exec: {e:#}");
+                return Ok(None);
+            }
+        }
+    };
+    match (header.op, header.len, header.fds.len()) {
+        (2, 0, 0) => Ok(Some(stream)),
+        (1, _, 3) => {
+            drop(header.fds);
             eprintln!("kiln: refused an exec request while another exec runs");
             let _ = stream.write_all(&EXEC_FAILED.to_ne_bytes());
             Ok(None)
         }
-        Ok((op, len, fds)) => {
-            eprintln!("kiln: bad request during exec: op {op}, {len} bytes, {} fds", fds.len());
+        (op, len, count) => {
+            eprintln!("kiln: bad request during exec: op {op}, {len} bytes, {count} fds");
             Ok(None)
         }
-        Err(e) => { eprintln!("kiln: bad request during exec: {e:#}"); Ok(None) }
     }
 }
 
@@ -446,5 +568,39 @@ fn reap(command: Option<Pid>) -> Result<Option<i32>> {
             Ok(_) => continue,
             Err(e) => return Err(e).context("waitpid"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn completed_frame_is_rejected_when_clock_expires_during_read() {
+        let start = Instant::now();
+        let deadline = start + REQUEST_READ_TIMEOUT;
+        let read_finished = Cell::new(false);
+
+        let err = read_frame_before_deadline(
+            deadline,
+            || {
+                read_finished.set(true);
+                Ok(ReadState::Complete(()))
+            },
+            || {
+                assert!(read_finished.get(), "signals must be checked after the read");
+                Ok(None)
+            },
+            || {
+                assert!(read_finished.get(), "the clock must be sampled after the read");
+                deadline
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("framing deadline exceeded"), "{err}");
     }
 }

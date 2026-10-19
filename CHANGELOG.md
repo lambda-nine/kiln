@@ -7,6 +7,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Persistent control requests now use nonblocking, signal-aware framing with
+  one absolute two-second header-and-payload deadline. Malformed frames and
+  truncated or misplaced SCM_RIGHTS data close safely without wedging later
+  exec/removal requests; a completed write half-close is explicitly allowed,
+  while a full client close still cancels its active exec.
 - Persistent PID 1 now polls one lifetime-scoped signal fd alongside its
   control listener, reaps adopted children while idle, and treats forwarded
   signals received with no active exec as requests to stop the sandbox rather

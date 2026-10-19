@@ -188,11 +188,12 @@ scripts/review-regressions.sh
     because `pids.max` is full also fails without taking PID 1 or the sandbox
     down. A forwarded SIGTERM/HUP/USR1/USR2 received while no exec is active
     stops the sandbox and triggers shim cleanup instead of becoming a stale
-    signal for the next command. An accepted request body is still read with a
-    blocking receive: an incomplete root-side client can delay that idle
-    handling until it finishes or disconnects, but the admission-boundary
-    drain still prevents the pending signal from reaching its command.
-    Signal-aware request framing is reserved for the control-protocol work.
+    signal for the next command. PID 1 reads each accepted control frame
+    nonblockingly while polling the same signalfd, with one absolute two-second
+    deadline for the header and payload. An incomplete or malformed root-side
+    client is dropped without leaking its passed descriptors, so later exec or
+    removal requests still run. A client may half-close its completed request
+    and keep reading the response; only a full close cancels an active exec.
     Commands start with the normal default `SIGPIPE` behavior. `kiln exec`
     exits with the command's code (128 + signal if it was killed), or 125 when
     kiln itself fails, for example because the sandbox is gone.
@@ -268,10 +269,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
   time with `sigwait` or signalfd, in the same loop that reaps children. A
   persistent PID 1 polls signalfd together with its control listener, so idle
   children cannot become zombies and idle signals cannot drift into a future
-  exec. Request bodies are not yet part of that poll loop, so an accepted,
-  incomplete root-side request can delay signal handling; the final idle drain
-  before admission preserves ownership of the signal. No async signal
-  handlers, so no async-signal-safety rules to get wrong.
+  exec. Accepted request headers and bodies are part of that poll loop too, so
+  a signal preempts incomplete framing and a two-second absolute frame deadline
+  bounds a silent or slow peer. The final idle drain before admission preserves
+  ownership of the signal. No async signal handlers, so no async-signal-safety
+  rules to get wrong.
 - **Rust ignores SIGPIPE; commands should not.** kiln itself keeps Rust's
   ignored disposition so a closed pipe becomes an I/O error it can report.
   Immediately before executing a sandbox command, kiln restores `SIGPIPE` to

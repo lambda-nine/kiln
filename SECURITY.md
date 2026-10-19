@@ -71,9 +71,13 @@ relying on it:
   containment boundary. Commands restore the default `SIGPIPE` disposition
   before `exec`. An accepted control request remains idle until admission, so
   a final signal drain prevents pending shutdown from crossing into its
-  command. The request body read is still blocking: an incomplete root-side
-  peer can defer signal handling until completion or disconnect. Making that
-  framing signal-aware remains control-protocol hardening work.
+  command. Request framing is nonblocking and polls the same signalfd, with one
+  absolute two-second deadline across the header and payload. Invalid
+  operations, lengths, reserved bytes, descriptor counts, truncated ancillary
+  messages and descriptors attached to a body are rejected; received
+  descriptors are owned immediately and close on every error path. A complete
+  request may use `shutdown(SHUT_WR)` while reading its response. A full socket
+  close remains cancellation for an active exec.
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the

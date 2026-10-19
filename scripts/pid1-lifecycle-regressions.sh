@@ -147,10 +147,13 @@ argv = [b"sh", b"-c", b"echo ran >/workspace/delayed-ran"]
 payload = struct.pack("=I", len(argv))
 payload += b"".join(struct.pack("=I", len(arg)) + arg for arg in argv)
 fds = array.array("i", [os.open(os.devnull, os.O_RDWR) for _ in range(3)])
-sock.sendmsg([bytes([1, 0, 0, 0]) + struct.pack("=I", len(payload))],
-             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
-sock.sendall(payload)
-data = sock.recv(4)
+try:
+    sock.sendmsg([bytes([1, 0, 0, 0]) + struct.pack("=I", len(payload))],
+                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)])
+    sock.sendall(payload)
+    data = sock.recv(4)
+except (BrokenPipeError, ConnectionResetError):
+    data = b""
 sys.exit(0 if data == b"" else 1)
 PY
 client=$!

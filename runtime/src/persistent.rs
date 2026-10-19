@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::signal::kill;
 use nix::unistd::{ForkResult, Pid, fork, pipe2, read, setsid};
@@ -15,9 +16,165 @@ use nix::unistd::{ForkResult, Pid, fork, pipe2, read, setsid};
 use crate::container::{self, Config};
 
 const MAX_REQUEST: usize = 1024 * 1024;
+const MAX_REQUEST_FDS: usize = 3;
 /// Exit code of `kiln exec` when kiln itself fails (bad ID, sandbox gone,
 /// terminal stdio) rather than the command.
 pub const EXEC_FAILED: i32 = 125;
+
+/// One complete, validated request from a persistent control connection.
+#[derive(Debug)]
+pub enum Request {
+    Exec(Vec<CString>, Vec<OwnedFd>),
+    Remove,
+}
+
+/// Result of advancing a nonblocking frame reader.
+#[derive(Debug)]
+pub enum ReadState<T> {
+    Pending,
+    Complete(T),
+}
+
+/// The fixed portion of a control request. Descriptors may arrive with any
+/// byte of the header, so the reader retains them across partial recvmsg calls.
+#[derive(Debug)]
+pub struct Header {
+    pub op: u8,
+    pub len: u32,
+    pub fds: Vec<OwnedFd>,
+}
+
+pub struct HeaderReader {
+    bytes: [u8; 8],
+    read: usize,
+    fds: Vec<OwnedFd>,
+    rights_messages: usize,
+}
+
+impl HeaderReader {
+    pub fn new() -> Self {
+        Self { bytes: [0; 8], read: 0, fds: Vec::new(), rights_messages: 0 }
+    }
+
+    /// Reads as much of one header as is available without blocking. All
+    /// received descriptors become OwnedFd immediately, including on an error,
+    /// so malformed or truncated ancillary data cannot leak them in PID 1.
+    pub fn read(&mut self, stream: &UnixStream) -> Result<ReadState<Header>> {
+        while self.read < self.bytes.len() {
+            let chunk = recv_chunk(stream, &mut self.bytes[self.read..])?;
+            let RecvChunk::Data { bytes, mut fds, rights_messages } = chunk else {
+                return match chunk {
+                    RecvChunk::Pending => Ok(ReadState::Pending),
+                    RecvChunk::Eof => bail!("truncated request header"),
+                    RecvChunk::Data { .. } => unreachable!(),
+                };
+            };
+            self.read += bytes;
+            self.rights_messages += rights_messages;
+            if self.rights_messages > 1 {
+                bail!("request has more than one SCM_RIGHTS message");
+            }
+            if self.fds.len() + fds.len() > MAX_REQUEST_FDS {
+                bail!("request has too many descriptors");
+            }
+            self.fds.append(&mut fds);
+        }
+        if self.bytes[1..4] != [0, 0, 0] {
+            bail!("request reserved header bytes must be zero");
+        }
+        Ok(ReadState::Complete(Header {
+            op: self.bytes[0],
+            len: u32::from_ne_bytes(self.bytes[4..].try_into().unwrap()),
+            fds: mem::take(&mut self.fds),
+        }))
+    }
+}
+
+/// Incremental decoder for one connection's one request. The caller owns the
+/// absolute deadline and polls between Pending results.
+pub struct RequestReader {
+    header: HeaderReader,
+    frame: Option<Header>,
+    body: Vec<u8>,
+    body_read: usize,
+    complete: bool,
+}
+
+impl RequestReader {
+    pub fn new() -> Self {
+        Self {
+            header: HeaderReader::new(),
+            frame: None,
+            body: Vec::new(),
+            body_read: 0,
+            complete: false,
+        }
+    }
+
+    pub fn read(&mut self, stream: &UnixStream) -> Result<ReadState<Request>> {
+        if self.complete {
+            bail!("request reader is already complete");
+        }
+        if self.frame.is_none() {
+            let ReadState::Complete(header) = self.header.read(stream)? else {
+                return Ok(ReadState::Pending);
+            };
+            if header.len as usize > MAX_REQUEST {
+                bail!("request is too large");
+            }
+            match header.op {
+                1 if header.fds.len() != MAX_REQUEST_FDS => {
+                    bail!("exec request needs stdin, stdout and stderr")
+                }
+                1 => {
+                    self.body = vec![0; header.len as usize];
+                    self.frame = Some(header);
+                }
+                2 if header.len != 0 || !header.fds.is_empty() => {
+                    bail!("remove request must have an empty body and no descriptors")
+                }
+                2 => {
+                    self.complete = true;
+                    return Ok(ReadState::Complete(Request::Remove));
+                }
+                op => bail!("unknown request operation {op}"),
+            }
+        }
+
+        if self.body_read < self.body.len() {
+            match recv_chunk(stream, &mut self.body[self.body_read..])? {
+                RecvChunk::Pending => return Ok(ReadState::Pending),
+                RecvChunk::Eof => bail!("truncated request body"),
+                RecvChunk::Data { bytes, fds, rights_messages } => {
+                    if rights_messages != 0 || !fds.is_empty() {
+                        bail!("SCM_RIGHTS is only allowed with the request header");
+                    }
+                    self.body_read += bytes;
+                }
+            }
+            if self.body_read < self.body.len() {
+                // Return to the caller after every successful body receive so
+                // it can enforce the absolute deadline and service signals.
+                return Ok(ReadState::Pending);
+            }
+        }
+
+        let header = self.frame.take().unwrap();
+        let argv = parse_argv(&self.body)?;
+        self.complete = true;
+        Ok(ReadState::Complete(Request::Exec(argv, header.fds)))
+    }
+}
+
+enum RecvChunk {
+    Pending,
+    Eof,
+    Data {
+        bytes: usize,
+        fds: Vec<OwnedFd>,
+        rights_messages: usize,
+    },
+}
 
 pub fn create(cfg: &Config) -> Result<String> {
     container::validate_image(cfg)?;
@@ -143,24 +300,15 @@ pub fn gc() -> Result<()> {
     Ok(())
 }
 
-pub fn receive(stream: &mut UnixStream) -> Result<(u8, Vec<CString>, Vec<OwnedFd>)> {
-    let (op, len, fds) = receive_header(stream)?;
-    if len as usize > MAX_REQUEST {
-        bail!("request is too large");
-    }
-    let mut data = vec![0; len as usize];
-    stream.read_exact(&mut data)?;
-    if op != 1 {
-        return Ok((op, Vec::new(), fds));
-    }
+fn parse_argv(data: &[u8]) -> Result<Vec<CString>> {
     let mut at = 0;
-    let argc = take_u32(&data, &mut at)? as usize;
+    let argc = take_u32(data, &mut at)? as usize;
     if argc == 0 || argc > 4096 {
         bail!("invalid argument count");
     }
     let mut argv = Vec::with_capacity(argc);
     for _ in 0..argc {
-        let n = take_u32(&data, &mut at)? as usize;
+        let n = take_u32(data, &mut at)? as usize;
         let bytes = data.get(at..at + n).context("truncated argument")?;
         argv.push(CString::new(bytes).context("argument contains a NUL byte")?);
         at += n;
@@ -168,7 +316,7 @@ pub fn receive(stream: &mut UnixStream) -> Result<(u8, Vec<CString>, Vec<OwnedFd
     if at != data.len() {
         bail!("trailing request data");
     }
-    Ok((op, argv, fds))
+    Ok(argv)
 }
 
 /// Whether `fd` is a terminal.
@@ -242,9 +390,13 @@ fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<(
     let mut header = [0u8; 8];
     header[0] = op;
     header[4..].copy_from_slice(&len.to_ne_bytes());
+    send_with_fds(stream, &header, fds)
+}
+
+fn send_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> Result<()> {
     let mut iov = libc::iovec {
-        iov_base: header.as_mut_ptr().cast(),
-        iov_len: header.len(),
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
     };
     let space = unsafe { libc::CMSG_SPACE(mem::size_of_val(fds) as u32) as usize };
     let mut control = vec![0u8; space];
@@ -264,23 +416,30 @@ fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<(
         }
     }
     let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if n != 8 {
+    if n < 0 {
         bail!("send exec request: {}", std::io::Error::last_os_error());
+    }
+    if n as usize != bytes.len() {
+        bail!("send exec request: short write ({n} of {} bytes)", bytes.len());
     }
     Ok(())
 }
 
-/// Reads only a request's fixed 8-byte header, in one recvmsg: the operation
-/// (1 exec, 2 rm), the length of the body that follows, and any descriptors
-/// passed with it. `receive` reads the body after it.
-pub fn receive_header(stream: &UnixStream) -> Result<(u8, u32, Vec<OwnedFd>)> {
-    let mut header = [0u8; 8];
+/// Receives one available stream chunk and every descriptor attached to it.
+/// The descriptor buffer is deliberately capped at the protocol maximum. If
+/// the kernel reports truncation, the visible descriptors are already owned
+/// here and the kernel closes any excess, so the error path leaks nothing.
+fn recv_chunk(stream: &UnixStream, bytes: &mut [u8]) -> Result<RecvChunk> {
     let mut iov = libc::iovec {
-        iov_base: header.as_mut_ptr().cast(),
-        iov_len: header.len(),
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
     };
-    let mut control =
-        vec![0u8; unsafe { libc::CMSG_SPACE((3 * mem::size_of::<RawFd>()) as u32) as usize }];
+    let mut control = vec![
+        0u8;
+        unsafe {
+            libc::CMSG_SPACE((MAX_REQUEST_FDS * mem::size_of::<RawFd>()) as u32) as usize
+        }
+    ];
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -290,30 +449,67 @@ pub fn receive_header(stream: &UnixStream) -> Result<(u8, u32, Vec<OwnedFd>)> {
         libc::recvmsg(
             stream.as_raw_fd(),
             &mut msg,
-            libc::MSG_WAITALL | libc::MSG_CMSG_CLOEXEC,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
         )
     };
-    if n != 8 {
-        bail!("read exec request");
+    if n < 0 {
+        return match Errno::last() {
+            Errno::EAGAIN => Ok(RecvChunk::Pending),
+            e => Err(e).context("read control request"),
+        };
     }
+    if n == 0 {
+        return Ok(RecvChunk::Eof);
+    }
+
     let mut fds = Vec::new();
+    let mut rights_messages = 0;
+    let mut invalid_ancillary = false;
     unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if !cmsg.is_null()
-            && (*cmsg).cmsg_level == libc::SOL_SOCKET
-            && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-        {
-            let count = ((*cmsg).cmsg_len - libc::CMSG_LEN(0) as usize) / mem::size_of::<RawFd>();
-            for &fd in std::slice::from_raw_parts(libc::CMSG_DATA(cmsg).cast::<RawFd>(), count) {
-                fds.push(OwnedFd::from_raw_fd(fd));
+        let control_start = control.as_ptr() as usize;
+        let control_end = control_start + msg.msg_controllen;
+        let minimum = libc::CMSG_LEN(0) as usize;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            let address = cmsg as usize;
+            let length = (*cmsg).cmsg_len;
+            if length < minimum || address.checked_add(length).is_none_or(|end| end > control_end) {
+                invalid_ancillary = true;
+                break;
             }
+            if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
+                invalid_ancillary = true;
+            } else {
+                let payload = length - minimum;
+                if payload % mem::size_of::<RawFd>() != 0 {
+                    invalid_ancillary = true;
+                } else {
+                    rights_messages += 1;
+                    let count = payload / mem::size_of::<RawFd>();
+                    for &fd in std::slice::from_raw_parts(
+                        libc::CMSG_DATA(cmsg).cast::<RawFd>(), count,
+                    ) {
+                        if fd < 0 {
+                            invalid_ancillary = true;
+                        } else {
+                            fds.push(OwnedFd::from_raw_fd(fd));
+                        }
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
-    Ok((
-        header[0],
-        u32::from_ne_bytes(header[4..].try_into().unwrap()),
-        fds,
-    ))
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        bail!("truncated SCM_RIGHTS control message");
+    }
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        bail!("truncated control request data");
+    }
+    if invalid_ancillary {
+        bail!("invalid control message");
+    }
+    Ok(RecvChunk::Data { bytes: n as usize, fds, rights_messages })
 }
 
 #[cfg(test)]
@@ -333,15 +529,17 @@ mod tests {
 
     #[test]
     fn header_only_read_leaves_the_body_and_keeps_descriptors() {
-        let (client, server) = UnixStream::pair().unwrap();
+        let (client, mut server) = UnixStream::pair().unwrap();
         let null = open("/dev/null");
         let fd = null.as_raw_fd();
         send_header(&client, 1, 5, &[fd, fd, fd]).unwrap();
         (&client).write_all(b"hello").unwrap();
-        let (op, len, fds) = receive_header(&server).unwrap();
-        assert_eq!((op, len, fds.len()), (1, 5, 3));
+        let ReadState::Complete(header) = HeaderReader::new().read(&server).unwrap() else {
+            panic!("complete header was reported pending");
+        };
+        assert_eq!((header.op, header.len, header.fds.len()), (1, 5, 3));
         let mut body = [0u8; 5];
-        (&server).read_exact(&mut body).unwrap();
+        server.read_exact(&mut body).unwrap();
         assert_eq!(&body, b"hello", "the header read must not consume the body");
     }
 
@@ -349,28 +547,69 @@ mod tests {
     fn rm_header_has_no_body_or_descriptors() {
         let (client, server) = UnixStream::pair().unwrap();
         send_header(&client, 2, 0, &[]).unwrap();
-        let (op, len, fds) = receive_header(&server).unwrap();
-        assert_eq!((op, len, fds.len()), (2, 0, 0));
+        let ReadState::Complete(header) = HeaderReader::new().read(&server).unwrap() else {
+            panic!("complete header was reported pending");
+        };
+        assert_eq!((header.op, header.len, header.fds.len()), (2, 0, 0));
     }
 
     #[test]
-    fn short_or_stalled_headers_fail() {
+    fn nonzero_reserved_header_bytes_are_rejected() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&[2, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        let err = HeaderReader::new().read(&server).unwrap_err().to_string();
+        assert!(err.contains("reserved header bytes"), "{err}");
+    }
+
+    #[test]
+    fn truncated_headers_fail_and_stalled_headers_are_pending() {
         let (client, server) = UnixStream::pair().unwrap();
         (&client).write_all(&[1, 0, 0, 0]).unwrap();
         drop(client);
-        assert!(receive_header(&server).is_err(), "a truncated header must be rejected");
+        assert!(HeaderReader::new().read(&server).is_err(), "a truncated header must be rejected");
 
         let (_client, server) = UnixStream::pair().unwrap();
-        server.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        assert!(receive_header(&server).is_err(), "a silent client must time out");
+        assert!(matches!(HeaderReader::new().read(&server).unwrap(), ReadState::Pending));
     }
 
     #[test]
     fn oversized_bodies_are_rejected_before_reading() {
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
         send_header(&client, 1, MAX_REQUEST as u32 + 1, &[]).unwrap();
-        let err = receive(&mut server).unwrap_err().to_string();
+        let err = RequestReader::new().read(&server).unwrap_err().to_string();
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn truncated_rights_are_rejected() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = open("/dev/null");
+        let fd = null.as_raw_fd();
+        // CMSG_SPACE for three i32s has enough alignment padding for a fourth
+        // on 64-bit Linux; the fifth forces MSG_CTRUNC.
+        send_header(&client, 1, 0, &[fd, fd, fd, fd, fd]).unwrap();
+        let err = HeaderReader::new().read(&server).unwrap_err().to_string();
+        assert!(err.contains("truncated SCM_RIGHTS"), "{err}");
+    }
+
+    #[test]
+    fn rights_attached_to_the_body_are_rejected() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = open("/dev/null");
+        let fd = null.as_raw_fd();
+        send_header(&client, 1, 1, &[fd, fd, fd]).unwrap();
+        send_with_fds(&client, b"x", &[fd]).unwrap();
+        let err = RequestReader::new().read(&server).unwrap_err().to_string();
+        assert!(err.contains("only allowed with the request header"), "{err}");
+    }
+
+    #[test]
+    fn malformed_remove_frame_is_rejected() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = open("/dev/null");
+        send_header(&client, 2, 1, &[null.as_raw_fd()]).unwrap();
+        let err = RequestReader::new().read(&server).unwrap_err().to_string();
+        assert!(err.contains("empty body and no descriptors"), "{err}");
     }
 
     #[test]
