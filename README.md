@@ -197,10 +197,17 @@ scripts/review-regressions.sh
     Commands start with the normal default `SIGPIPE` behavior. `kiln exec`
     exits with the command's code (128 + signal if it was killed), or 125 when
     kiln itself fails, for example because the sandbox is gone.
-    `kiln ls` lists live and stale shims, `kiln rm` stops one and waits for its
-    resources to be removed, and `kiln gc` removes cgroups, network state and
-    run directories left by crashed shims, removing child cgroup directories
-    before their parent. One-shot `kiln run` is unchanged.
+    `kiln ls` lists live and stale shims by matching both `shim.pid` and its
+    recorded Linux process start time; same-boot PID reuse cannot make stale
+    state look live. `kiln rm` stops one and waits for its resources to be removed, and
+    `kiln gc` removes cgroups, network state and run directories left by
+    crashed shims, removing child cgroup directories before their parent.
+    Identity files are atomically published with `shim.pid` last; after that
+    marker exists, missing, malformed or unreadable metadata fails `ls`/`gc`
+    rather than looking like an empty registry or a dead shim. Linux process
+    start times are boot-relative, so a coincidental PID/start-time match after
+    reboot is conservatively retained pending manual review. One-shot
+    `kiln run` is unchanged.
 
 ![kiln dashboard in Grafana](docs/kiln-dashboard.png)
 

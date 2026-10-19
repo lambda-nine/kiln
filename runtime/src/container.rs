@@ -1,8 +1,9 @@
 use std::ffi::CString;
-use std::net::Ipv4Addr;
 use std::fs;
+use std::io::Write;
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, chown, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -121,8 +122,8 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<(
     prepare(cfg, &run_dir, &layers)?;
     let socket = run_dir.join("control.sock");
     let listener = bind_control_socket(&socket)?;
-    fs::write(run_dir.join("shim.pid"), std::process::id().to_string())?;
-    fs::write(run_dir.join("shim.start"), process_start_time(std::process::id())?)?;
+    let pid = std::process::id();
+    publish_shim_identity(&run_dir, pid, &process_start_time(pid)?)?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     let _ = fs::remove_dir_all(&run_dir);
     result.map(|_| ())
@@ -173,6 +174,58 @@ fn process_start_time(pid: u32) -> Result<String> {
         .and_then(|(_, fields)| fields.split_whitespace().nth(19))
         .map(str::to_string)
         .context("parse shim start time")
+}
+
+fn publish_shim_identity(run_dir: &Path, pid: u32, start: &str) -> Result<()> {
+    publish_shim_identity_with(run_dir, pid, start, || {})
+}
+
+fn publish_shim_identity_with<F>(run_dir: &Path, pid: u32, start: &str,
+    before_pid_publish: F) -> Result<()>
+where
+    F: FnOnce(),
+{
+    atomic_publish_with(&run_dir.join("shim.start"), start.as_bytes(), || {})?;
+    // shim.pid is the completed identity marker. Each file is renamed from a
+    // fully written, synced temporary file, and the marker is published last.
+    atomic_publish_with(
+        &run_dir.join("shim.pid"),
+        pid.to_string().as_bytes(),
+        before_pid_publish,
+    )
+}
+
+fn atomic_publish_with<F>(path: &Path, contents: &[u8], before_publish: F) -> Result<()>
+where
+    F: FnOnce(),
+{
+    let name = path.file_name().context("identity path has no file name")?;
+    let temporary = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("create temporary identity file {}", temporary.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write temporary identity file {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary identity file {}", temporary.display()))?;
+        drop(file);
+
+        before_publish();
+        fs::rename(&temporary, path)
+            .with_context(|| format!("publish identity file {}", path.display()))?;
+        let parent = path.parent().context("identity path has no parent")?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync identity directory {}", parent.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
@@ -655,5 +708,76 @@ mod tests {
 
         drop(listener);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shim_pid_is_absent_until_its_complete_identity_is_published() {
+        let root = std::env::temp_dir().join(format!(
+            "kiln-identity-publication-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let run_dir = root.clone();
+            let publisher = scope.spawn(move || {
+                publish_shim_identity_with(&run_dir, 1234, "5678", || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+            });
+            paused_rx.recv().unwrap();
+            let start = fs::read_to_string(root.join("shim.start"));
+            let pid_visible = root.join("shim.pid").exists();
+            resume_tx.send(()).unwrap();
+            publisher.join().unwrap().unwrap();
+            assert_eq!(start.unwrap(), "5678");
+            assert!(!pid_visible, "partial PID marker became visible");
+        });
+
+        assert_eq!(fs::read_to_string(root.join("shim.pid")).unwrap(), "1234");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paused_publication_resumes_when_start_observation_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "kiln-identity-publication-failure-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        let (removed, start, pid_visible, resumed, published) = std::thread::scope(|scope| {
+            let run_dir = root.clone();
+            let publisher = scope.spawn(move || {
+                publish_shim_identity_with(&run_dir, 1234, "5678", || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+            });
+            paused_rx.recv().unwrap();
+            let removed = fs::remove_file(root.join("shim.start"));
+            let start = fs::read_to_string(root.join("shim.start"));
+            let pid_visible = root.join("shim.pid").exists();
+            let resumed = resume_tx.send(());
+            let published = publisher.join();
+            (removed, start, pid_visible, resumed, published)
+        });
+
+        let final_pid = fs::read_to_string(root.join("shim.pid"));
+        let cleanup = fs::remove_dir_all(&root);
+        removed.unwrap();
+        resumed.unwrap();
+        published.unwrap().unwrap();
+        assert_eq!(start.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(!pid_visible, "partial PID marker became visible");
+        assert_eq!(final_pid.unwrap(), "1234");
+        cleanup.unwrap();
     }
 }

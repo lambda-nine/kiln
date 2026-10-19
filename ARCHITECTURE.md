@@ -92,6 +92,16 @@ descriptor on errors. After a complete request, `shutdown(SHUT_WR)` explicitly
 means "request finished; response still wanted"; a full close cancels an active
 exec.
 
+The shim atomically publishes `shim.start` followed by `shim.pid`, using a
+same-directory rename for each file; the PID file is the completed identity
+record. `kiln ls` and `kiln gc` call a shim live only when that PID's current
+`/proc/<pid>/stat` start time still matches the record and the process is not a
+zombie. A different process reusing the PID during the same boot is stale.
+Once the PID marker exists, missing, malformed or unreadable identity metadata
+is indeterminate and fails the operation rather than authorizing cleanup. The
+Linux start time is boot-relative, however: without a recorded boot identity,
+a coincidental PID/start-time match after reboot can still be retained as live.
+
 ## Target
 
 ```
@@ -166,7 +176,7 @@ exec.
 | Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir). One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
-| Host reboot leaves run dirs      | Handled manually by `kiln gc`; automatic daemon startup reconciliation remains open |
+| Host reboot leaves run dirs      | Partial: `kiln gc` rejects same-boot PID reuse, but a coincidental PID/start-time match across boots is retained for manual review; boot identity and automatic daemon startup reconciliation remain open |
 | Compromised image download       | Reduced: pinned Alpine signature, strict basename and atomic staged install |
 | Sandbox escape                   | Reduced: userns, seccomp, Landlock, network namespace |
 | Data exfiltration over network   | Reduced: no network by default; with `--allow`, only allowed names and their subdomains resolve and egress is restricted to their resolved IPs; `--net full` permits public hosts |

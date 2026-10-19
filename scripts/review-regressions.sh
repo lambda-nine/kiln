@@ -223,7 +223,10 @@ sh scripts/pid1-lifecycle-regressions.sh
 echo "12. Persistent control protocol"
 sh scripts/control-protocol-regressions.sh
 
-echo "13. Bridge ports isolated"
+echo "13. Persistent registry identity"
+sh scripts/shim-identity-regressions.sh
+
+echo "14. Bridge ports isolated"
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sleep 5 &
 first=$!
 i=0
@@ -237,7 +240,7 @@ sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
 wait "$first"
 echo "PASS"
 
-echo "14. Concurrent network reuse stress"
+echo "15. Concurrent network reuse stress"
 wave=0
 failed=0
 while [ "$wave" -lt 10 ]; do
@@ -256,7 +259,7 @@ done
 [ "$failed" -eq 0 ] || { echo "FAIL: concurrent network start failed"; exit 1; }
 echo "PASS"
 
-echo "15. Cleanup"
+echo "16. Cleanup"
 [ -z "$(find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print -quit)" ]
 [ -z "$(find /run/kiln/net/leases -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
 [ -z "$(find /sys/fs/cgroup/kiln -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]

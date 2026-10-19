@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -10,13 +10,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
-use nix::sys::signal::kill;
-use nix::unistd::{ForkResult, Pid, fork, pipe2, read, setsid};
+use nix::unistd::{ForkResult, fork, pipe2, read, setsid};
 
 use crate::container::{self, Config};
 
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_REQUEST_FDS: usize = 3;
+const RUNS_ROOT: &str = "/var/lib/kiln/runs";
 /// Exit code of `kiln exec` when kiln itself fails (bad ID, sandbox gone,
 /// terminal stdio) rather than the command.
 pub const EXEC_FAILED: i32 = 125;
@@ -250,23 +250,39 @@ pub fn remove(id: &str) -> Result<()> {
 }
 
 pub fn list() -> Result<()> {
-    println!("ID\tSTATUS\tSHIM");
-    let root = Path::new("/var/lib/kiln/runs");
-    let Ok(entries) = fs::read_dir(root) else {
-        return Ok(());
-    };
-    let mut ids: Vec<_> = entries
-        .flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    ids.sort();
-    for id in ids {
-        let dir = container::run_dir(&id);
-        if !dir.join("control.sock").exists() {
+    let root = Path::new(RUNS_ROOT);
+    let mut records = Vec::new();
+    for entry in registry_entries(root)? {
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|name| anyhow::anyhow!("sandbox registry entry is not UTF-8: {name:?}"))?;
+        let dir = entry.path();
+        if !dir
+            .join("shim.pid")
+            .try_exists()
+            .with_context(|| format!("inspect sandbox registry entry {id}"))?
+        {
             continue;
         }
-        let pid = fs::read_to_string(dir.join("shim.pid")).unwrap_or_default();
-        let live = pid.trim().parse::<i32>().ok().is_some_and(pid_alive);
+        // A present PID is the identity-complete marker. Once it exists,
+        // missing, malformed or unreadable companion metadata is an error,
+        // never evidence that the shim is dead.
+        let shim = read_shim(&dir)?;
+        let live = shim.is_live()?;
+        if !dir
+            .join("control.sock")
+            .try_exists()
+            .with_context(|| format!("inspect sandbox registry entry {id}"))?
+        {
+            continue;
+        }
+        records.push((id, live, shim.pid_text));
+    }
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+
+    println!("ID\tSTATUS\tSHIM");
+    for (id, live, pid) in records {
         println!(
             "{id}\t{}\t{}",
             if live { "running" } else { "stale" },
@@ -277,27 +293,104 @@ pub fn list() -> Result<()> {
 }
 
 pub fn gc() -> Result<()> {
-    let root = Path::new("/var/lib/kiln/runs");
-    let Ok(entries) = fs::read_dir(root) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
-        if !entry.path().join("shim.pid").exists() {
+    let root = Path::new(RUNS_ROOT);
+    for entry in registry_entries(root)? {
+        let dir = entry.path();
+        if !dir
+            .join("shim.pid")
+            .try_exists()
+            .with_context(|| format!("inspect sandbox registry entry {}", dir.display()))?
+        {
             continue;
         }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        let pid = fs::read_to_string(entry.path().join("shim.pid"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok());
-        if entry.path().join("control.sock").exists() && pid.is_some_and(pid_alive) {
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|name| anyhow::anyhow!("sandbox registry entry is not UTF-8: {name:?}"))?;
+        // Validate identity before considering cleanup, even if the control
+        // socket is absent. A live shim can be between socket creation and
+        // identity publication, or its socket may have been removed.
+        if read_shim(&dir)?.is_live()? {
             continue;
         }
         crate::cgroup::remove(&id);
         crate::net::remove_run(&id);
-        fs::remove_dir_all(entry.path()).with_context(|| format!("remove stale sandbox {id}"))?;
+        fs::remove_dir_all(&dir).with_context(|| format!("remove stale sandbox {id}"))?;
         eprintln!("kiln: removed stale sandbox {id}");
     }
     Ok(())
+}
+
+fn registry_entries(root: &Path) -> Result<Vec<fs::DirEntry>> {
+    fs::read_dir(root)
+        .with_context(|| format!("read sandbox registry {}", root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("enumerate sandbox registry {}", root.display()))
+}
+
+#[derive(Debug)]
+struct RecordedShim {
+    pid_text: String,
+    pid: u32,
+    start: u64,
+}
+
+impl RecordedShim {
+    fn is_live(&self) -> Result<bool> {
+        let Some((state, actual_start)) = process_state_and_start(self.pid)? else {
+            return Ok(false);
+        };
+        Ok(state != 'Z' && state != 'X' && actual_start == self.start)
+    }
+}
+
+fn read_shim(dir: &Path) -> Result<RecordedShim> {
+    let pid_path = dir.join("shim.pid");
+    let start_path = dir.join("shim.start");
+    let pid_text = fs::read_to_string(&pid_path)
+        .with_context(|| format!("read sandbox registry file {}", pid_path.display()))?;
+    let start_text = fs::read_to_string(&start_path)
+        .with_context(|| format!("read sandbox registry file {}", start_path.display()))?;
+    let pid = pid_text
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse sandbox registry file {}", pid_path.display()))?;
+    if pid == 0 || pid > i32::MAX as u32 {
+        bail!("invalid shim PID in {}", pid_path.display());
+    }
+    let start = start_text
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse sandbox registry file {}", start_path.display()))?;
+    Ok(RecordedShim { pid_text, pid, start })
+}
+
+fn process_state_and_start(pid: u32) -> Result<Option<(char, u64)>> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(e) if process_disappeared(&e) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read process identity {path}")),
+    };
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .with_context(|| format!("parse process identity {path}"))?;
+    let mut fields = fields.split_whitespace();
+    let state = fields
+        .next()
+        .and_then(|field| field.chars().next())
+        .with_context(|| format!("parse process state {path}"))?;
+    let start = fields
+        .nth(18)
+        .with_context(|| format!("parse process start time {path}"))?
+        .parse::<u64>()
+        .with_context(|| format!("parse process start time {path}"))?;
+    Ok(Some((state, start)))
+}
+
+fn process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn parse_argv(data: &[u8]) -> Result<Vec<CString>> {
@@ -356,10 +449,6 @@ fn validate_id(id: &str) -> Result<()> {
         bail!("invalid sandbox ID {id:?}");
     }
     Ok(())
-}
-
-fn pid_alive(pid: i32) -> bool {
-    kill(Pid::from_raw(pid), None).is_ok()
 }
 
 fn take_u32(data: &[u8], at: &mut usize) -> Result<u32> {
@@ -634,5 +723,63 @@ mod tests {
             assert!(err.contains("interactive (PTY) exec is not implemented"), "{err}");
             assert!(err.contains("redirect all of stdin, stdout and stderr"), "{err}");
         }
+    }
+
+    #[test]
+    fn live_shim_requires_the_recorded_process_start_time() {
+        let dir = std::env::temp_dir().join(format!("kiln-shim-identity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+
+        let pid = std::process::id();
+        let (_, start) = process_state_and_start(pid).unwrap().unwrap();
+        fs::write(dir.join("shim.pid"), pid.to_string()).unwrap();
+        fs::write(dir.join("shim.start"), start.to_string()).unwrap();
+        assert!(read_shim(&dir).unwrap().is_live().unwrap());
+
+        fs::write(dir.join("shim.start"), (start + 1).to_string()).unwrap();
+        assert!(!read_shim(&dir).unwrap().is_live().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn registry_metadata_read_errors_are_not_liveness_answers() {
+        let dir = std::env::temp_dir().join(format!("kiln-shim-read-error-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("shim.pid"), std::process::id().to_string()).unwrap();
+        fs::create_dir(dir.join("shim.start")).unwrap();
+
+        let err = read_shim(&dir).unwrap_err().to_string();
+        assert!(err.contains("read sandbox registry file"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_or_malformed_identity_is_not_a_dead_shim() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiln-shim-incomplete-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("shim.pid"), std::process::id().to_string()).unwrap();
+
+        let err = read_shim(&dir).unwrap_err().to_string();
+        assert!(err.contains("read sandbox registry file"), "{err}");
+        fs::write(dir.join("shim.start"), "not-a-start-time").unwrap();
+        let err = read_shim(&dir).unwrap_err().to_string();
+        assert!(err.contains("parse sandbox registry file"), "{err}");
+        fs::write(dir.join("shim.start"), "1").unwrap();
+        fs::write(dir.join("shim.pid"), "not-a-pid").unwrap();
+        let err = read_shim(&dir).unwrap_err().to_string();
+        assert!(err.contains("parse sandbox registry file"), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn esrch_means_the_process_disappeared() {
+        assert!(process_disappeared(&std::io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(!process_disappeared(&std::io::Error::from_raw_os_error(libc::EACCES)));
     }
 }

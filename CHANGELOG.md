@@ -7,6 +7,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- `kiln ls` and `kiln gc` now require the recorded shim PID and Linux process
+  start time to match, so same-boot PID reuse cannot make stale sandbox state
+  appear live. Identity files are published atomically with the PID marker
+  last; incomplete, malformed or unreadable metadata fails closed instead of
+  being misrepresented as an empty registry or a dead shim.
 - Persistent control requests now use nonblocking, signal-aware framing with
   one absolute two-second header-and-payload deadline. Malformed frames and
   truncated or misplaced SCM_RIGHTS data close safely without wedging later
