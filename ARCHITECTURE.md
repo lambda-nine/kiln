@@ -102,6 +102,20 @@ is indeterminate and fails the operation rather than authorizing cleanup. The
 Linux start time is boot-relative, however: without a recorded boot identity,
 a coincidental PID/start-time match after reboot can still be retained as live.
 
+[Persistent-exec protocol v1](docs/exec-protocol-v1.md) adds capability probe
+operation 3 and typed exec operation 4 alongside unchanged legacy operations.
+PID 1 retains exit versus signal/core status and uses a CLOEXEC bootstrap pipe
+for admission/release/stdio/exec errors, keeping runtime diagnostics out of
+workload stderr. All post-fork paths drain and reap before a command result;
+cleanup failure reports unconfirmed cleanup and ends PID 1. Replies are bounded
+to 2088 bytes and writes are nonblocking, signal-aware and request-local on
+peer failure. Busy requests receive typed rejection; probes work during exec.
+The machine CLI relays one frame on a private status socket, sends only three
+explicit workload descriptors into PID 1 and preserves human exit projections.
+Capabilities describe the responding binary/PID 1, never a minimum package
+version. Protocol v1 is first supplied by the resulting kiln commit based on
+`3b42552`; old live PID 1 processes must be recreated explicitly.
+
 ## Target
 
 ```

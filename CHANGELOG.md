@@ -7,6 +7,16 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Add persistent-exec protocol v1: versioned bounded outcome/capability frames,
+  raw exit/signal/core status, typed bootstrap/runtime failures, and private
+  machine status plus explicit workload stdio FDs. Preserve legacy requests
+  and human exit projections, including ordinary command exits 125/126/127.
+  PID 1 drains/reaps before status, serves capabilities while busy and survives
+  disconnected/non-reading reply peers. Add capability probes and a create
+  requirement flag that rejects unsupported versions before creation. Protocol
+  v1 is first supplied by the resulting kiln commit based on `3b42552`; see
+  [the protocol specification](docs/exec-protocol-v1.md).
+
 - `kiln ls` and `kiln gc` now require the recorded shim PID and Linux process
   start time to match, so same-boot PID reuse cannot make stale sandbox state
   appear live. Identity files are published atomically with the PID marker

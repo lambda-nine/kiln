@@ -8,7 +8,6 @@
 //! forward signals and reap children, like `tini` does for Docker.
 
 use std::ffi::CString;
-use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, Instant};
@@ -22,7 +21,9 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
-use crate::persistent::{EXEC_FAILED, HeaderReader, ReadState, Request, RequestReader};
+use crate::persistent::{EXEC_FAILED, ReadState, Request, RequestReader};
+use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, CommandStatus, FailureKind,
+    Frame, Outcome as ExecOutcome, Stage};
 
 /// Signals passed on to the command. SIGINT, SIGQUIT and SIGWINCH are left
 /// out on purpose: the terminal sends those to the whole foreground process
@@ -57,7 +58,7 @@ pub fn run(argv: &[CString]) -> Result<i32> {
                 Signal::SIGCHLD => {
                     if let Some(code) = reap(Some(child))? {
                         crate::trace::mark("init: command exited");
-                        return Ok(code);
+                        return Ok(code.projection());
                     }
                 }
                 sig if FORWARDED.contains(&sig) => {
@@ -93,44 +94,79 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
             Ok(FramingOutcome::Stop(code)) => return Ok(code),
             Err(e) => { eprintln!("kiln: bad exec request: {e:#}"); continue; }
         };
-        let Request::Exec(argv, fds) = request else {
-            stream.write_all(&0i32.to_ne_bytes())?;
-            return Ok(0);
+        let (argv, fds, typed) = match request {
+            Request::Remove => {
+                respond(&stream, &0i32.to_ne_bytes(), &signals, true);
+                return Ok(0);
+            }
+            Request::Capabilities => {
+                respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, &signals, true);
+                continue;
+            }
+            Request::Exec(argv, fds) => (argv, fds, false),
+            Request::TypedExec(argv, fds) => (argv, fds, true),
         };
         // A client that went away can't take the status; failing to send it
         // must not end PID 1 and with it the sandbox.
         match run_exec(&argv, fds, &stream, listener, scope, &signals)? {
-            Outcome::Exited(code) => if let Err(e) = stream.write_all(&code.to_ne_bytes()) {
-                eprintln!("kiln: report exec status: {e}");
-            },
+            Outcome::Completed(outcome) => report(&stream, &outcome, typed, &signals)?,
+            Outcome::Fatal(outcome) => {
+                report(&stream, &outcome, typed, &signals)?;
+                anyhow::bail!("exec cleanup failed; stopping sandbox");
+            }
             Outcome::Disconnected => eprintln!("kiln: exec client disconnected; stopped its command"),
-            Outcome::Stop(code) => return Ok(code),
-            // A request-local setup failure such as fork() returning EAGAIN
-            // at pids.max must fail this exec, not unwind PID 1 and destroy
-            // the persistent sandbox. Dropping the stream makes the CLI
-            // report kiln's own failure code (125).
-            Outcome::RequestFailed => eprintln!("kiln: exec request failed before launch"),
-            Outcome::Removed(mut remover) => {
-                remover.write_all(&0i32.to_ne_bytes())?;
+            Outcome::Stop(code) => {
+                if typed {
+                    report(&stream, &ExecOutcome::failure(FailureKind::Stopped, Stage::Admission,
+                        Cleanup::NoChildStarted, 0, "sandbox stopping before admission"), true, &signals)?;
+                }
+                return Ok(code);
+            }
+            Outcome::Removed(remover) => {
+                if typed {
+                    report(&stream, &ExecOutcome::failure(FailureKind::Stopped, Stage::Cleanup,
+                        Cleanup::Drained, 0, "sandbox removed during exec"), true, &signals)?;
+                }
+                respond(&remover, &0i32.to_ne_bytes(), &signals, true);
                 return Ok(0);
             }
         }
     }
 }
 
-/// How an exec ended. Every exec ends with its cgroup empty.
+/// How an exec ended. Cleanup must be confirmed before reuse.
 enum Outcome {
-    /// The command exited with this shell-style status.
-    Exited(i32),
+    /// Typed command or request-local runtime result.
+    Completed(ExecOutcome),
+    Fatal(ExecOutcome),
     /// The client hung up first (killed, or timed out by a caller like kilnd).
     Disconnected,
     /// An idle shutdown signal arrived after request acceptance but before
     /// command admission. It belongs to the sandbox, not the next command.
     Stop(i32),
-    /// Trusted request setup failed before any child was created.
-    RequestFailed,
     /// `kiln rm` arrived; this is its connection, still to be acknowledged.
     Removed(UnixStream),
+}
+
+fn report(stream: &UnixStream, outcome: &ExecOutcome, typed: bool, signals: &SignalFd) -> Result<()> {
+    let bytes = if typed { Frame::Outcome(outcome.clone()).encode()? }
+        else { outcome.projection().to_ne_bytes().to_vec() };
+    respond(stream, &bytes, signals, true);
+    Ok(())
+}
+
+/// Request-local write failure never unwinds PID 1. Leave signals queued for
+/// the lifetime or exec loop so this writer cannot steal leader/stop ownership.
+fn respond(stream: &UnixStream, bytes: &[u8], signals: &SignalFd, idle: bool) {
+    let result = protocol::write_bounded(stream.as_raw_fd(), bytes, || {
+        // Leave signals queued for the lifetime/exec loop; in particular this
+        // must never reap the active leader while replying to a busy probe.
+        let mut p = [libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        poll(&mut p, 0)?;
+        anyhow::ensure!(p[0].revents == 0, "signal pending during {} response", if idle { "idle" } else { "busy" });
+        Ok(())
+    });
+    if let Err(e) = result { eprintln!("kiln: report status: {e:#}"); }
 }
 
 /// What wakes PID 1 while no exec request is active.
@@ -239,28 +275,33 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     if let Some(code) = drain_idle_signals(signals)? {
         return Ok(Outcome::Stop(code));
     }
+    #[cfg(test)]
+    if let Some(errno) = injected("pipe") {
+        return Ok(launch_failure(Stage::Prepare, Cleanup::NoChildStarted, errno, "injected pipe failure"));
+    }
 
     // The child reports whether it joined the exec cgroup, then waits to be
     // released. It runs only kiln's code until then.
     let (joined_rx, joined_tx) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(pipe) => pipe,
         Err(e) => {
-            eprintln!("kiln: create exec admission pipe: {e}");
-            return Ok(Outcome::RequestFailed);
+            return Ok(launch_failure(Stage::Prepare, Cleanup::NoChildStarted, e as i32, "create exec admission pipe"));
         }
     };
     let (release_rx, release_tx) = match pipe2(OFlag::O_CLOEXEC) {
         Ok(pipe) => pipe,
         Err(e) => {
-            eprintln!("kiln: create exec release pipe: {e}");
-            return Ok(Outcome::RequestFailed);
+            return Ok(launch_failure(Stage::Prepare, Cleanup::NoChildStarted, e as i32, "create exec release pipe"));
         }
     };
     // SAFETY: PID 1 is single-threaded.
+    #[cfg(test)]
+    if let Some(errno) = injected("fork") {
+        return Ok(launch_failure(Stage::Fork, Cleanup::NoChildStarted, errno, "injected fork failure"));
+    }
     let leader = match unsafe { fork() } {
         Err(e) => {
-            eprintln!("kiln: fork exec request: {e}");
-            return Ok(Outcome::RequestFailed);
+            return Ok(launch_failure(Stage::Fork, Cleanup::NoChildStarted, e as i32, "fork exec request"));
         }
         Ok(ForkResult::Child) => {
             drop(joined_rx);
@@ -275,78 +316,194 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     drop(stdio);
     let _ = setpgid(leader, leader);
 
-    let mut byte = [0u8; 1];
-    if !matches!(read(&joined_rx, &mut byte), Ok(1) if byte[0] == b'1') {
-        // It never joined, so the cgroup can't reach it: kill it directly.
-        eprintln!("kiln: exec could not join its cgroup; not running {}", argv[0].to_string_lossy());
-        let _ = kill(leader, Signal::SIGKILL);
-        let _ = waitpid(leader, None);
-        return finish(scope, Outcome::Exited(126));
-    }
-
-    // Last check before the command runs: a client that already left or a
-    // pending `kiln rm` stops it here. Anything later is still contained.
-    let mut wait = watch(signals, client, listener);
-    poll(&mut wait, 0)?;
-    if let Some(outcome) = interrupted(&wait, listener, signals)? {
-        return finish(scope, outcome);
-    }
-    // If the child died meanwhile, its SIGCHLD ends the loop below.
-    let _ = write(&release_tx, b"1");
-    drop(release_tx);
-
-    let outcome = loop {
-        let mut wait = watch(signals, client, listener);
-        poll(&mut wait, -1)?;
-        if let Some(outcome) = interrupted(&wait, listener, signals)? {
-            break outcome;
+    let mut status = None;
+    // Every fallible parent operation after fork is inside this region. Its
+    // result always crosses direct-child kill, cgroup drainage and reaping.
+    let outcome = (|| -> Result<Outcome> {
+        let flags = unsafe { libc::fcntl(joined_rx.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(joined_rx.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("nonblocking bootstrap channel");
         }
-        let mut status = None;
-        while let Some(info) = signals.read_signal().context("read signalfd")? {
-            match Signal::try_from(info.ssi_signo as i32) {
-                Ok(Signal::SIGCHLD) => if let Some(code) = reap(Some(leader))? {
-                    status = Some(code);
-                },
-                Ok(sig) if FORWARDED.contains(&sig) && status.is_none() => {
-                    forward_to_group(leader, sig);
+        let mut bootstrap = BootstrapReader::new();
+        let mut release = Some(release_tx);
+        loop {
+            bootstrap.advance(&joined_rx)?;
+            if let Some((stage, errno)) = bootstrap.failure {
+                return Ok(launch_failure(stage, Cleanup::Unconfirmed, errno, "exec bootstrap failed"));
+            }
+            let mut wait = watch(signals, client, listener);
+            let mut fds = [wait[0], wait[1], wait[2], libc::pollfd {
+                fd: if bootstrap.eof { -1 } else { joined_rx.as_raw_fd() }, events: libc::POLLIN, revents: 0 }];
+            poll(&mut fds, if bootstrap.joined && release.is_some() { 0 } else { -1 })?;
+            wait.copy_from_slice(&fds[..3]);
+            if let Some(outcome) = interrupted(&wait, listener, signals)? { return Ok(outcome); }
+            while let Some(info) = signals.read_signal().context("read signalfd")? {
+                match Signal::try_from(info.ssi_signo as i32) {
+                    Ok(Signal::SIGCHLD) => if let Some(s) = reap(Some(leader))? { status = Some(s); },
+                    Ok(sig) if FORWARDED.contains(&sig) => forward_to_group(leader, sig),
+                    _ => {}
                 }
-                _ => {}
+            }
+            // Read bootstrap failures before interpreting a reaped 126/127.
+            bootstrap.advance(&joined_rx)?;
+            if let Some((stage, errno)) = bootstrap.failure {
+                return Ok(launch_failure(stage, Cleanup::Unconfirmed, errno, "exec bootstrap failed"));
+            }
+            if let Some(s) = status {
+                if !bootstrap.joined || release.is_some() {
+                    return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, 0, "bootstrap exited before release"));
+                }
+                if bootstrap.eof { return Ok(Outcome::Completed(ExecOutcome::command(s))); }
+            }
+            if bootstrap.joined {
+                if let Some(tx) = release.take() {
+                    #[cfg(test)]
+                    if let Some(errno) = injected("release") {
+                        return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, errno, "injected release failure"));
+                    }
+                    loop {
+                        match write(&tx, b"1") {
+                            Ok(1) => break,
+                            Err(Errno::EINTR) => continue,
+                            Err(e) => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, e as i32, "release exec bootstrap")),
+                            _ => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, 0, "short bootstrap release")),
+                        }
+                    }
+                }
             }
         }
-        if let Some(code) = status {
-            break Outcome::Exited(code);
+    })();
+    // An admission failure may leave the child outside the exec cgroup.
+    if status.is_none() { let _ = kill(leader, Signal::SIGKILL); }
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            let mut o = ExecOutcome::failure(FailureKind::Io, Stage::Wait, Cleanup::Unconfirmed,
+                error_errno(&e), &format!("{e:#}"));
+            o.status = status;
+            Outcome::Completed(o)
         }
     };
     finish(scope, outcome)
+}
+
+fn error_errno(e: &anyhow::Error) -> i32 {
+    e.chain().find_map(|e| e.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error())
+        .or_else(|| e.downcast_ref::<Errno>().map(|e| *e as i32))).unwrap_or(0)
+}
+
+fn launch_failure(stage: Stage, cleanup: Cleanup, errno: i32, message: &str) -> Outcome {
+    Outcome::Completed(ExecOutcome::failure(FailureKind::LaunchFailed, stage, cleanup, errno, message))
+}
+
+/// Fixed 8-byte records: stage u16, two zero bytes, errno i32, all LE.
+/// A zero record means Joined; errors remain reportable after release until
+/// CLOEXEC closes the writer. This channel contains trusted bootstrap code only.
+struct BootstrapReader {
+    bytes: [u8; 8], at: usize, joined: bool, eof: bool, failure: Option<(Stage, i32)>,
+}
+
+impl BootstrapReader {
+    fn new() -> Self { Self { bytes: [0; 8], at: 0, joined: false, eof: false, failure: None } }
+    fn advance(&mut self, fd: &OwnedFd) -> Result<()> {
+        while !self.eof && self.failure.is_none() {
+            match read(fd, &mut self.bytes[self.at..]) {
+                Ok(0) => {
+                    anyhow::ensure!(self.at == 0, "truncated bootstrap record");
+                    self.eof = true;
+                    if !self.joined { self.failure = Some((Stage::Admission, 0)); }
+                }
+                Ok(n) => {
+                    self.at += n;
+                    if self.at == 8 {
+                        let stage = Stage::try_from(u16::from_le_bytes(self.bytes[..2].try_into().unwrap()))?;
+                        let errno = i32::from_le_bytes(self.bytes[4..].try_into().unwrap());
+                        anyhow::ensure!(self.bytes[2..4] == [0; 2] && errno >= 0, "invalid bootstrap record");
+                        if stage == Stage::None {
+                            anyhow::ensure!(!self.joined && errno == 0, "duplicate bootstrap admission");
+                            self.joined = true;
+                        } else { self.failure = Some((stage, errno)); }
+                        self.at = 0;
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => break,
+                Err(e) => return Err(e).context("read bootstrap status"),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn bootstrap_record(fd: &OwnedFd, stage: Stage, errno: i32) -> bool {
+    let mut bytes = [0u8; 8];
+    bytes[..2].copy_from_slice(&(stage as u16).to_le_bytes());
+    bytes[4..].copy_from_slice(&errno.max(0).to_le_bytes());
+    loop {
+        match write(fd, &bytes) { Ok(8) => return true, Err(Errno::EINTR) => continue, _ => return false }
+    }
+}
+
+fn bootstrap_fail(fd: &OwnedFd, stage: Stage, errno: i32) -> ! {
+    bootstrap_record(fd, stage, errno);
+    unsafe { libc::_exit(if stage == Stage::Exec { 127 } else { 126 }) }
 }
 
 /// The forked child: joins the exec cgroup, waits for PID 1 to release it,
 /// then becomes the command. Every instruction of the command, and of all it
 /// starts, runs inside the cgroup.
 fn launch(argv: &[CString], stdio: &[OwnedFd], scope: &ExecCgroup, joined: &OwnedFd, release: &OwnedFd) -> ! {
-    let ok = match scope.join_self() {
-        Ok(()) => true,
-        Err(e) => { eprintln!("kiln: {e:#}"); false }
-    };
-    let _ = write(joined, if ok { b"1" } else { b"0" });
+    #[cfg(test)]
+    if let Some(errno) = injected("admission") { bootstrap_fail(joined, Stage::Admission, errno); }
+    if let Err(e) = scope.join_self() { bootstrap_fail(joined, Stage::Admission, error_errno(&e)); }
+    if !bootstrap_record(joined, Stage::None, 0) { unsafe { libc::_exit(126) } }
     let mut byte = [0u8; 1];
-    if !ok || !matches!(read(release, &mut byte), Ok(1)) {
-        std::process::exit(126);
+    loop {
+        match read(release, &mut byte) {
+            Ok(1) if byte[0] == b'1' => break,
+            Err(Errno::EINTR) => continue,
+            Err(e) => bootstrap_fail(joined, Stage::Admission, e as i32),
+            _ => bootstrap_fail(joined, Stage::Admission, 0),
+        }
     }
     // The command must not be able to move or kill processes in cgroups.
     scope.close_in_child();
+    #[cfg(test)]
+    if let Some(errno) = injected("stdio") { bootstrap_fail(joined, Stage::Stdio, errno); }
     for (target, source) in stdio.iter().enumerate() {
         if unsafe { libc::dup2(source.as_raw_fd(), target as i32) } < 0 {
-            std::process::exit(126);
+            bootstrap_fail(joined, Stage::Stdio, Errno::last() as i32);
         }
     }
     // Its own process group only so forwarded signals have a clear target;
     // containment doesn't depend on it.
-    let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
-    prepare_command_signals();
+    if let Err(e) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+        bootstrap_fail(joined, Stage::Stdio, e as i32);
+    }
+    if let Err(e) = crate::container::close_fds_except(&[joined.as_raw_fd()]) {
+        bootstrap_fail(joined, Stage::Stdio, error_errno(&e));
+    }
+    if let Err(e) = SigSet::empty().thread_set_mask() { bootstrap_fail(joined, Stage::Stdio, e as i32); }
+    if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+        bootstrap_fail(joined, Stage::Stdio, Errno::last() as i32);
+    }
+    #[cfg(test)]
+    if let Some(errno) = injected("exec") { bootstrap_fail(joined, Stage::Exec, errno); }
     let err = execvp(&argv[0], argv).unwrap_err();
-    eprintln!("kiln: exec {}: {err}", argv[0].to_string_lossy());
-    std::process::exit(127);
+    bootstrap_fail(joined, Stage::Exec, err as i32);
+}
+
+// Test binaries only: a consumed fixture file injects one request-local fault.
+// No environment variable, path, or injection hook exists in shipped binaries.
+#[cfg(test)]
+fn injected(point: &str) -> Option<i32> {
+    let root = std::env::var_os("KILN_PROTOCOL_FIXTURE")?;
+    let path = std::path::PathBuf::from(root).join("inject");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let (name, errno) = text.split_once(' ')?;
+    if name != point { return None; }
+    std::fs::remove_file(path).ok()?;
+    errno.parse().ok()
 }
 
 /// The one way an exec ends, whether its command exited, its client left, it
@@ -354,10 +511,20 @@ fn launch(argv: &[CString], stdio: &[OwnedFd], scope: &ExecCgroup, joined: &Owne
 /// exec cgroup, wait until it's empty, and reap every last process. An error
 /// here ends PID 1, and with it the sandbox, rather than run the next exec
 /// beside leftovers.
-fn finish(scope: &ExecCgroup, outcome: Outcome) -> Result<Outcome> {
-    scope.kill_and_wait_empty()?;
-    reap_all_blocking()?;
-    Ok(outcome)
+fn finish(scope: &ExecCgroup, mut outcome: Outcome) -> Result<Outcome> {
+    let cleanup = scope.kill_and_wait_empty().and_then(|()| reap_all_blocking());
+    match cleanup {
+        Ok(()) => {
+            if let Outcome::Completed(o) = &mut outcome { o.cleanup = Cleanup::Drained; }
+            Ok(outcome)
+        }
+        Err(e) => {
+            let mut o = ExecOutcome::failure(FailureKind::CleanupFailed, Stage::Cleanup,
+                Cleanup::Unconfirmed, error_errno(&e), &format!("{e:#}"));
+            if let Outcome::Completed(old) = outcome { o.status = old.status; }
+            Ok(Outcome::Fatal(o))
+        }
+    }
 }
 
 /// Waits for and reaps every remaining child, direct or adopted, until none
@@ -500,7 +667,7 @@ fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener,
 /// time, so another exec request fails with EXEC_FAILED instead of queueing.
 /// Returns a `kiln rm` connection, which interrupts the running exec.
 fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Option<UnixStream>> {
-    let mut stream = match listener.accept() {
+    let stream = match listener.accept() {
         Ok((stream, _)) => stream,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
         Err(e) => return Err(e).context("accept exec request"),
@@ -510,19 +677,19 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
         return Ok(None);
     }
     let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
-    let mut reader = HeaderReader::new();
-    let header = loop {
+    let mut reader = RequestReader::new();
+    let request = loop {
         if Instant::now() >= deadline {
             eprintln!("kiln: bad request during exec: framing deadline exceeded");
             return Ok(None);
         }
         match reader.read(&stream) {
-            Ok(ReadState::Complete(header)) => {
+            Ok(ReadState::Complete(request)) => {
                 if Instant::now() >= deadline {
                     eprintln!("kiln: bad request during exec: framing deadline exceeded");
                     return Ok(None);
                 }
-                break header;
+                break request;
             }
             Ok(ReadState::Pending) => match wait_for_frame(&stream, signals, deadline) {
                 Ok(FrameWake::Client) => continue,
@@ -538,16 +705,21 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
             }
         }
     };
-    match (header.op, header.len, header.fds.len()) {
-        (2, 0, 0) => Ok(Some(stream)),
-        (1, _, 3) => {
-            drop(header.fds);
-            eprintln!("kiln: refused an exec request while another exec runs");
-            let _ = stream.write_all(&EXEC_FAILED.to_ne_bytes());
+    match request {
+        Request::Remove => Ok(Some(stream)),
+        Request::Capabilities => {
+            respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
             Ok(None)
         }
-        (op, len, count) => {
-            eprintln!("kiln: bad request during exec: op {op}, {len} bytes, {count} fds");
+        Request::Exec(_, _) | Request::TypedExec(_, _) => {
+            let typed = matches!(request, Request::TypedExec(_, _));
+            drop(request);
+            eprintln!("kiln: refused an exec request while another exec runs");
+            let bytes = if typed {
+                Frame::Outcome(ExecOutcome::failure(FailureKind::Busy, Stage::Validate,
+                    Cleanup::NoChildStarted, 0, "another exec is active")).encode()?
+            } else { EXEC_FAILED.to_ne_bytes().to_vec() };
+            respond(&stream, &bytes, signals, false);
             Ok(None)
         }
     }
@@ -556,13 +728,13 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
 /// Reaps every child that has exited, including orphans that were reparented
 /// to us. Several exits can collapse into one SIGCHLD, so loop until none are
 /// left. Returns the command's exit code once it has exited.
-fn reap(command: Option<Pid>) -> Result<Option<i32>> {
+fn reap(command: Option<Pid>) -> Result<Option<CommandStatus>> {
     let mut code = None;
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, c)) if Some(pid) == command => code = Some(c),
-            Ok(WaitStatus::Signaled(pid, sig, _)) if Some(pid) == command => {
-                code = Some(128 + sig as i32)
+            Ok(WaitStatus::Exited(pid, c)) if Some(pid) == command => code = Some(CommandStatus::Exited(c)),
+            Ok(WaitStatus::Signaled(pid, sig, core_dumped)) if Some(pid) == command => {
+                code = Some(CommandStatus::Signaled { signal: sig as i32, core_dumped })
             }
             Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => return Ok(code),
             Ok(_) => continue,
@@ -574,8 +746,151 @@ fn reap(command: Option<Pid>) -> Result<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::os::fd::RawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
 
     use super::*;
+
+    /// This is a protocol/bootstrap fixture, not a cgroup containment test.
+    /// A separate process keeps signal masks, fork, and close_range away from
+    /// the parallel Rust test runner. Real cgroups remain in the root suite.
+    #[test]
+    fn protocol_server_fixture() {
+        let Some(path) = std::env::var_os("KILN_PROTOCOL_FIXTURE") else { return; };
+        let root = std::path::PathBuf::from(path);
+        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let scope = ExecCgroup::protocol_fixture(&root);
+        let result = serve(&listener, &scope);
+        if root.join("expect-fatal").exists() { assert!(result.is_err()); }
+        else { result.unwrap(); }
+    }
+
+    struct Server { child: Child, root: std::path::PathBuf }
+    impl Server {
+        fn start() -> Self {
+            let root = std::env::temp_dir().join(format!("kiln-protocol-{}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            for (file, text) in [("procs", ""), ("kill", ""), ("events", "populated 0\n")] {
+                fs::write(root.join(file), text).unwrap();
+            }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "init::tests::protocol_server_fixture", "--test-threads=1"])
+                .env("KILN_PROTOCOL_FIXTURE", &root).stdout(Stdio::null()).stderr(Stdio::inherit());
+            unsafe { command.pre_exec(|| {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&mut mask);
+                if libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }); }
+            let child = command.spawn().unwrap();
+            let server = Self { child, root };
+            let start = Instant::now();
+            while !server.root.join("control.sock").exists() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            server
+        }
+        fn connect(&self) -> UnixStream { UnixStream::connect(self.root.join("control.sock")).unwrap() }
+        fn exec(&self, args: &[&str]) -> (ExecOutcome, Vec<u8>, Vec<u8>) {
+            let (mut stream, out, err) = self.start_exec(args);
+            let frame = protocol::read_reply(&mut stream, Some(Instant::now() + Duration::from_secs(5))).unwrap();
+            let Frame::Outcome(o) = frame else { panic!("not an outcome") };
+            let mut stdout = Vec::new(); let mut stderr = Vec::new();
+            fs::File::from(out).read_to_end(&mut stdout).unwrap();
+            fs::File::from(err).read_to_end(&mut stderr).unwrap();
+            (o, stdout, stderr)
+        }
+        fn start_exec(&self, args: &[&str]) -> (UnixStream, OwnedFd, OwnedFd) {
+            let stream = self.connect();
+            let input = fs::File::open("/dev/null").unwrap();
+            let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            let (err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            let mut body = (args.len() as u32).to_le_bytes().to_vec();
+            for arg in args { body.extend_from_slice(&(arg.len() as u32).to_le_bytes()); body.extend_from_slice(arg.as_bytes()); }
+            let mut header = vec![4, 0, 0, 0]; header.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            let fds: [RawFd; 3] = [input.as_raw_fd(), out_tx.as_raw_fd(), err_tx.as_raw_fd()];
+            let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(12) as usize }];
+            let mut iov = libc::iovec { iov_base: header.as_mut_ptr().cast(), iov_len: 8 };
+            unsafe {
+                let mut msg: libc::msghdr = std::mem::zeroed();
+                msg.msg_iov = &mut iov; msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr().cast(); msg.msg_controllen = control.len();
+                let c = libc::CMSG_FIRSTHDR(&msg); (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS; (*c).cmsg_len = libc::CMSG_LEN(12) as usize;
+                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast(), 3);
+                assert_eq!(libc::sendmsg(stream.as_raw_fd(), &msg, 0), 8);
+            }
+            (&stream).write_all(&body).unwrap();
+            (stream, out_rx, err_rx)
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = fs::remove_dir_all(&self.root); }
+    }
+
+    #[test]
+    fn typed_exec_bootstrap_signals_busy_and_recovery() {
+        let server = Server::start();
+        let (o, out, err) = server.exec(&["/bin/sh", "-c", "printf 'a\\000\\377'; printf 'b\\000\\376' >&2; exit 125"]);
+        assert_eq!(o, ExecOutcome::command(CommandStatus::Exited(125)));
+        assert_eq!(out, b"a\0\xff"); assert_eq!(err, b"b\0\xfe");
+        assert_eq!(server.exec(&["/bin/sh", "-c", "for f in /proc/self/fd/*; do [ -e \"$f\" ] || continue; [ \"${f##*/}\" -lt 3 ] || exit 91; done"]).0.status,
+            Some(CommandStatus::Exited(0)), "bootstrap exposed an inherited descriptor");
+        let fake = Frame::Outcome(ExecOutcome::command(CommandStatus::Exited(42))).encode().unwrap();
+        let octal = fake.iter().map(|byte| format!("\\{byte:03o}")).collect::<String>();
+        let (o, out, err) = server.exec(&["/bin/sh", "-c", &format!("printf '{octal}'; printf '{octal}' >&2; exit 125")]);
+        assert_eq!(o.status, Some(CommandStatus::Exited(125)));
+        assert_eq!(out, fake); assert_eq!(err, fake);
+        for code in [126, 127, 143] {
+            assert_eq!(server.exec(&["/bin/sh", "-c", &format!("exit {code}")]).0.status, Some(CommandStatus::Exited(code)));
+        }
+        let o = server.exec(&["/bin/sh", "-c", "kill -TERM $$"]).0;
+        assert_eq!(o.status, Some(CommandStatus::Signaled { signal: 15, core_dumped: false }));
+        let (o, _, err) = server.exec(&["/no/such/executable"]);
+        assert_eq!((o.kind, o.stage, o.errno, o.status), (FailureKind::LaunchFailed, Stage::Exec, libc::ENOENT, None));
+        assert!(err.is_empty());
+        for (point, stage, errno, cleanup) in [
+            ("pipe", Stage::Prepare, libc::EMFILE, Cleanup::NoChildStarted),
+            ("fork", Stage::Fork, libc::EAGAIN, Cleanup::NoChildStarted),
+            ("admission", Stage::Admission, libc::EPERM, Cleanup::Drained),
+            ("release", Stage::Admission, libc::EPIPE, Cleanup::Drained),
+            ("stdio", Stage::Stdio, libc::EBADF, Cleanup::Drained),
+            ("exec", Stage::Exec, libc::ENOENT, Cleanup::Drained),
+        ] {
+            fs::write(server.root.join("inject"), format!("{point} {errno}")).unwrap();
+            let (o, out, err) = server.exec(&["/bin/true"]);
+            assert_eq!((o.kind, o.stage, o.errno, o.cleanup, o.status),
+                (FailureKind::LaunchFailed, stage, errno, cleanup, None), "{point}");
+            assert!(out.is_empty() && err.is_empty(), "bootstrap leaked output at {point}");
+            assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
+        }
+        let (active, out, err) = server.start_exec(&["/bin/sleep", "10"]);
+        // A complete probe is accepted even with the active exec's output held.
+        let mut probe = server.connect();
+        probe.write_all(&[3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(protocol::read_reply(&mut probe, Some(Instant::now() + Duration::from_secs(5))).unwrap(), Frame::Capabilities(_)));
+        let busy = server.exec(&["/bin/true"]).0;
+        assert_eq!((busy.kind, busy.cleanup), (FailureKind::Busy, Cleanup::NoChildStarted));
+        drop((active, out, err));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
+        // Complete request followed by a peer close must remain request-local.
+        for _ in 0..5 { drop(server.start_exec(&["/bin/true"])); }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
+        fs::write(server.root.join("expect-fatal"), "").unwrap();
+        fs::write(server.root.join("events"), "malformed cleanup observation\n").unwrap();
+        let (o, out, err) = server.exec(&["/bin/sh", "-c", "printf retained; exit 125"]);
+        assert_eq!((o.kind, o.stage, o.cleanup, o.status), (FailureKind::CleanupFailed,
+            Stage::Cleanup, Cleanup::Unconfirmed, Some(CommandStatus::Exited(125))));
+        assert_eq!(out, b"retained"); assert!(err.is_empty());
+    }
 
     #[test]
     fn completed_frame_is_rejected_when_clock_expires_during_read() {

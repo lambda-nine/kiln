@@ -4,8 +4,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
@@ -13,6 +14,7 @@ use nix::fcntl::OFlag;
 use nix::unistd::{ForkResult, fork, pipe2, read, setsid};
 
 use crate::container::{self, Config};
+use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, FailureKind, Frame, Outcome, Stage};
 
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_REQUEST_FDS: usize = 3;
@@ -25,6 +27,8 @@ pub const EXEC_FAILED: i32 = 125;
 #[derive(Debug)]
 pub enum Request {
     Exec(Vec<CString>, Vec<OwnedFd>),
+    TypedExec(Vec<CString>, Vec<OwnedFd>),
+    Capabilities,
     Remove,
 }
 
@@ -84,7 +88,9 @@ impl HeaderReader {
         }
         Ok(ReadState::Complete(Header {
             op: self.bytes[0],
-            len: u32::from_ne_bytes(self.bytes[4..].try_into().unwrap()),
+            len: if matches!(self.bytes[0], 3 | 4) {
+                u32::from_le_bytes(self.bytes[4..].try_into().unwrap())
+            } else { u32::from_ne_bytes(self.bytes[4..].try_into().unwrap()) },
             fds: mem::take(&mut self.fds),
         }))
     }
@@ -123,10 +129,10 @@ impl RequestReader {
                 bail!("request is too large");
             }
             match header.op {
-                1 if header.fds.len() != MAX_REQUEST_FDS => {
+                1 | 4 if header.fds.len() != MAX_REQUEST_FDS => {
                     bail!("exec request needs stdin, stdout and stderr")
                 }
-                1 => {
+                1 | 4 => {
                     self.body = vec![0; header.len as usize];
                     self.frame = Some(header);
                 }
@@ -136,6 +142,10 @@ impl RequestReader {
                 2 => {
                     self.complete = true;
                     return Ok(ReadState::Complete(Request::Remove));
+                }
+                3 if header.len == 0 && header.fds.is_empty() => {
+                    self.complete = true;
+                    return Ok(ReadState::Complete(Request::Capabilities));
                 }
                 op => bail!("unknown request operation {op}"),
             }
@@ -160,9 +170,10 @@ impl RequestReader {
         }
 
         let header = self.frame.take().unwrap();
-        let argv = parse_argv(&self.body)?;
+        let argv = parse_argv_ordered(&self.body, header.op == 4)?;
         self.complete = true;
-        Ok(ReadState::Complete(Request::Exec(argv, header.fds)))
+        Ok(ReadState::Complete(if header.op == 4 { Request::TypedExec(argv, header.fds) }
+            else { Request::Exec(argv, header.fds) }))
     }
 }
 
@@ -229,6 +240,140 @@ pub fn exec(id: &str, cmd: &[String]) -> Result<i32> {
         .read_exact(&mut status)
         .context("sandbox did not report an exec status")?;
     Ok(i32::from_ne_bytes(status))
+}
+
+pub fn capabilities(id: Option<&str>, version: u16) -> Result<()> {
+    anyhow::ensure!(version == protocol::VERSION, "unsupported persistent-exec protocol {version}");
+    let frame = match id {
+        None => Frame::Capabilities(Capabilities::current()),
+        Some(id) => {
+            validate_id(id)?;
+            let deadline = Instant::now() + protocol::FRAME_TIMEOUT;
+            let mut stream = connect_bounded(id, deadline)?;
+            stream.set_write_timeout(Some(deadline.checked_duration_since(Instant::now())
+                .context("capability exchange deadline")?))?;
+            send_header(&stream, 3, 0, &[])?;
+            match protocol::read_reply(&mut stream, Some(deadline))? {
+                Frame::Capabilities(c) => { c.require_v1()?; Frame::Capabilities(c) }
+                _ => bail!("expected sandbox capabilities"),
+            }
+        }
+    };
+    std::io::stdout().write_all(&frame.encode()?)?;
+    Ok(())
+}
+
+/// Own the private status socket before validating the rest, so host-side
+/// failures can still be reported. No workload FD is ever used for diagnostics.
+pub fn machine_exec(id: &str, cmd: &[String], version: u16, status: RawFd,
+    stdio: [RawFd; 3]) -> Result<i32> {
+    validate_status_fd(status)?;
+    restore_cloexec(status)?;
+    let status = unsafe { OwnedFd::from_raw_fd(status) };
+    let outcome = machine_request(id, cmd, version, status.as_raw_fd(), stdio);
+    protocol::write_bounded(status.as_raw_fd(), &Frame::Outcome(outcome.clone()).encode()?, || Ok(()))?;
+    Ok(outcome.projection())
+}
+
+fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio: [RawFd; 3]) -> Outcome {
+    let mut cleanup = Cleanup::NoChildStarted;
+    let mut stage = Stage::Validate;
+    let run = (|| -> Result<Outcome> {
+        validate_machine_stdio(status, stdio)?;
+        let fds: Vec<OwnedFd> = stdio.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+        anyhow::ensure!(version == protocol::VERSION, "unsupported persistent-exec protocol {version}");
+        validate_id(id)?;
+        anyhow::ensure!(!cmd.is_empty() && cmd.len() <= 4096, "invalid argument count");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(cmd.len() as u32).to_le_bytes());
+        for arg in cmd {
+            anyhow::ensure!(!arg.as_bytes().contains(&0), "argument contains NUL");
+            anyhow::ensure!(arg.len() <= MAX_REQUEST && payload.len() + 4 + arg.len() <= MAX_REQUEST,
+                "command is too large");
+            payload.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+            payload.extend_from_slice(arg.as_bytes());
+        }
+        stage = Stage::Connect;
+        let mut stream = connect_bounded(id, Instant::now() + protocol::FRAME_TIMEOUT)?;
+        stage = Stage::Request;
+        stream.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
+        // From the first send onward a partial transfer may have reached PID 1.
+        cleanup = Cleanup::Unconfirmed;
+        send_header(&stream, 4, payload.len() as u32, &stdio)?;
+        stream.write_all(&payload)?;
+        drop(fds);
+        stage = Stage::Report;
+        match protocol::read_reply(&mut stream, None)? {
+            Frame::Outcome(o) => Ok(o),
+            _ => bail!("expected typed exec outcome"),
+        }
+    })();
+    match run {
+        Ok(o) => o,
+        Err(e) => {
+            let errno = e.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()
+                .and_then(|e| e.raw_os_error())).unwrap_or(0);
+            let kind = match stage {
+                Stage::Validate if version != protocol::VERSION => FailureKind::Incompatible,
+                Stage::Validate => FailureKind::InvalidRequest,
+                Stage::Connect if errno == libc::ENOENT => FailureKind::NotFound,
+                Stage::Connect => FailureKind::Unavailable,
+                Stage::Report => FailureKind::Protocol,
+                _ => FailureKind::Io,
+            };
+            Outcome::failure(kind, stage, cleanup, errno, &format!("{e:#}"))
+        }
+    }
+}
+
+fn restore_cloexec(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("restore descriptor CLOEXEC");
+    }
+    Ok(())
+}
+
+fn validate_status_fd(fd: RawFd) -> Result<()> {
+    anyhow::ensure!(fd >= 3, "status fd must be private (>=3)");
+    for (option, expected) in [(libc::SO_TYPE, libc::SOCK_STREAM), (libc::SO_DOMAIN, libc::AF_UNIX)] {
+        let mut value = 0i32;
+        let mut len = mem::size_of_val(&value) as libc::socklen_t;
+        let n = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, option, (&mut value as *mut i32).cast(), &mut len) };
+        anyhow::ensure!(n == 0 && value == expected, "status fd must be an anonymous Unix stream socket");
+    }
+    // A socketpair has no local or peer pathname. Reject listeners, unconnected
+    // sockets and named endpoints rather than assuming this channel is private.
+    for peer in [false, true] {
+        let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+        let mut len = mem::size_of_val(&addr) as libc::socklen_t;
+        let n = unsafe {
+            let addr = (&mut addr as *mut libc::sockaddr_un).cast();
+            if peer { libc::getpeername(fd, addr, &mut len) } else { libc::getsockname(fd, addr, &mut len) }
+        };
+        anyhow::ensure!(n == 0 && len as usize == mem::offset_of!(libc::sockaddr_un, sun_path),
+            "status fd must be a connected anonymous Unix socketpair");
+    }
+    Ok(())
+}
+
+fn validate_machine_stdio(status: RawFd, stdio: [RawFd; 3]) -> Result<()> {
+    let mut identity = unsafe { mem::zeroed::<libc::stat>() };
+    anyhow::ensure!(unsafe { libc::fstat(status, &mut identity) } == 0, "invalid status fd");
+    for (i, fd) in stdio.into_iter().enumerate() {
+        anyhow::ensure!(fd >= 3 && fd != status && !stdio[..i].contains(&fd), "machine descriptors must be distinct and >=3");
+        restore_cloexec(fd)?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        anyhow::ensure!(flags >= 0 && flags & libc::O_PATH == 0, "invalid workload fd");
+        let mode = flags & libc::O_ACCMODE;
+        anyhow::ensure!(mode == libc::O_RDWR || mode == if i == 0 { libc::O_RDONLY } else { libc::O_WRONLY },
+            "wrong workload fd direction");
+        let mut info = unsafe { mem::zeroed::<libc::stat>() };
+        anyhow::ensure!(unsafe { libc::fstat(fd, &mut info) } == 0, "invalid workload fd");
+        anyhow::ensure!(identity.st_dev != info.st_dev || identity.st_ino != info.st_ino,
+            "status fd aliases workload stdio");
+    }
+    refuse_terminal_stdio(&stdio)
 }
 
 pub fn remove(id: &str) -> Result<()> {
@@ -393,15 +538,19 @@ fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
-fn parse_argv(data: &[u8]) -> Result<Vec<CString>> {
+fn parse_argv_ordered(data: &[u8], little_endian: bool) -> Result<Vec<CString>> {
     let mut at = 0;
-    let argc = take_u32(data, &mut at)? as usize;
+    let take = |at: &mut usize| -> Result<u32> {
+        let n = take_u32(data, at)?;
+        Ok(if little_endian { u32::from_le_bytes(n.to_ne_bytes()) } else { n })
+    };
+    let argc = take(&mut at)? as usize;
     if argc == 0 || argc > 4096 {
         bail!("invalid argument count");
     }
     let mut argv = Vec::with_capacity(argc);
     for _ in 0..argc {
-        let n = take_u32(data, &mut at)? as usize;
+        let n = take(&mut at)? as usize;
         let bytes = data.get(at..at + n).context("truncated argument")?;
         argv.push(CString::new(bytes).context("argument contains a NUL byte")?);
         at += n;
@@ -444,6 +593,62 @@ fn connect(id: &str) -> Result<UnixStream> {
     UnixStream::connect(&path).with_context(|| format!("connect to sandbox {id}"))
 }
 
+/// Unix connect may otherwise wait indefinitely when PID 1's backlog is full.
+/// Both the connect and the subsequent probe share the caller's deadline.
+fn connect_bounded(id: &str, deadline: Instant) -> Result<UnixStream> {
+    let path = container::run_dir(id).join("control.sock");
+    connect_path_bounded(&path, deadline).with_context(|| format!("connect to sandbox {id}"))
+}
+
+fn connect_path_bounded(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 { return Err(std::io::Error::last_os_error()).context("create control socket"); }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let name = path.as_os_str().as_bytes();
+    anyhow::ensure!(name.len() < addr.sun_path.len() && !name.contains(&0), "invalid control socket path");
+    for (target, &byte) in addr.sun_path.iter_mut().zip(name) { *target = byte as libc::c_char; }
+    let len = (mem::offset_of!(libc::sockaddr_un, sun_path) + name.len() + 1) as libc::socklen_t;
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "control connect deadline exceeded");
+        let n = unsafe { libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), len) };
+        if n == 0 { break; }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EISCONN) => break,
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => {
+                // AF_UNIX backlog pressure means retry connect, not SO_ERROR=0.
+                unsafe { libc::poll(std::ptr::null_mut(), 0, 10); }
+            }
+            Some(libc::EINPROGRESS | libc::EALREADY) => {
+                let mut wait = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                let timeout = deadline.saturating_duration_since(Instant::now()).as_millis().min(20) as i32;
+                if unsafe { libc::poll(&mut wait, 1, timeout) } < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == ErrorKind::Interrupted { continue; }
+                    return Err(e).context("poll control connect");
+                }
+                if wait.revents != 0 {
+                    let mut error = 0i32;
+                    let mut size = mem::size_of_val(&error) as libc::socklen_t;
+                    if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR,
+                        (&mut error as *mut i32).cast(), &mut size) } < 0 {
+                        return Err(std::io::Error::last_os_error()).context("control connect result");
+                    }
+                    if error != 0 { return Err(std::io::Error::from_raw_os_error(error).into()); }
+                    break;
+                }
+            }
+            _ => return Err(e).context("connect control socket"),
+        }
+    }
+    anyhow::ensure!(Instant::now() < deadline, "control connect deadline exceeded");
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
         bail!("invalid sandbox ID {id:?}");
@@ -478,7 +683,7 @@ fn redirect_stdio() {
 fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<()> {
     let mut header = [0u8; 8];
     header[0] = op;
-    header[4..].copy_from_slice(&len.to_ne_bytes());
+    header[4..].copy_from_slice(&if matches!(op, 3 | 4) { len.to_le_bytes() } else { len.to_ne_bytes() });
     send_with_fds(stream, &header, fds)
 }
 
@@ -504,13 +709,17 @@ fn send_with_fds(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> Result<()>
             std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast(), fds.len());
         }
     }
-    let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if n < 0 {
-        bail!("send exec request: {}", std::io::Error::last_os_error());
-    }
-    if n as usize != bytes.len() {
-        bail!("send exec request: short write ({n} of {} bytes)", bytes.len());
-    }
+    let n = loop {
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if n >= 0 { break n as usize; }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == ErrorKind::Interrupted { continue; }
+        return Err(e).context("send exec request");
+    };
+    anyhow::ensure!(n != 0, "send exec request made no progress");
+    // SCM_RIGHTS was transferred with the first successful byte; never resend
+    // it when finishing a short header write.
+    (&*stream).write_all(&bytes[n..]).context("finish exec request header")?;
     Ok(())
 }
 
@@ -543,7 +752,7 @@ fn recv_chunk(stream: &UnixStream, bytes: &mut [u8]) -> Result<RecvChunk> {
     };
     if n < 0 {
         return match Errno::last() {
-            Errno::EAGAIN => Ok(RecvChunk::Pending),
+            Errno::EAGAIN | Errno::EINTR => Ok(RecvChunk::Pending),
             e => Err(e).context("read control request"),
         };
     }
@@ -603,7 +812,9 @@ fn recv_chunk(stream: &UnixStream, bytes: &mut [u8]) -> Result<RecvChunk> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::IntoRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::net::UnixListener;
 
     use super::*;
 
@@ -614,6 +825,81 @@ mod tests {
             .custom_flags(libc::O_NOCTTY)
             .open(path)
             .unwrap()
+    }
+
+    #[test]
+    fn machine_descriptors_restore_cloexec_and_refuse_aliases_and_directions() {
+        let (status, alias) = UnixStream::pair().unwrap();
+        let status_alias = status.try_clone().unwrap();
+        let source = fs::File::open("/dev/null").unwrap();
+        let (_rx, output) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let (_rx2, error) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let stdio = [source.as_raw_fd(), output.as_raw_fd(), error.as_raw_fd()];
+        for fd in stdio { assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0); }
+        validate_machine_stdio(status.as_raw_fd(), stdio).unwrap();
+        for fd in stdio { assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0); }
+        assert!(validate_machine_stdio(status.as_raw_fd(), [stdio[0], status_alias.as_raw_fd(), stdio[2]]).is_err());
+        assert!(validate_machine_stdio(status.as_raw_fd(), [stdio[1], stdio[0], stdio[2]]).is_err());
+        assert!(validate_machine_stdio(status.as_raw_fd(), [stdio[0], stdio[1], stdio[1]]).is_err());
+        assert!(validate_status_fd(source.as_raw_fd()).is_err());
+        drop(alias);
+    }
+
+    #[test]
+    fn capability_connect_deadline_covers_full_listener_backlog() {
+        let path = std::env::temp_dir().join(format!("kiln-connect-deadline-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&path).unwrap();
+        let start = Instant::now();
+        assert!(connect_path_bounded(&path, start + Duration::from_millis(30)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn machine_host_failures_use_only_private_status() {
+        for version in [1, 2] {
+            let (status, mut receiver) = UnixStream::pair().unwrap();
+            let input = fs::File::open("/dev/null").unwrap();
+            let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            let (err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+            let stdio = [input.into_raw_fd(), out_tx.into_raw_fd(), err_tx.into_raw_fd()];
+            assert_eq!(machine_exec("invalid/id", &["true".into()], version, status.into_raw_fd(), stdio).unwrap(), 125);
+            let Frame::Outcome(o) = protocol::read_reply(&mut receiver, Some(Instant::now() + protocol::FRAME_TIMEOUT)).unwrap()
+                else { panic!("not an outcome") };
+            assert_eq!((o.kind, o.stage, o.cleanup), (if version == 1 { FailureKind::InvalidRequest }
+                else { FailureKind::Incompatible }, Stage::Validate, Cleanup::NoChildStarted));
+            let mut out = Vec::new(); let mut err = Vec::new();
+            fs::File::from(out_rx).read_to_end(&mut out).unwrap();
+            fs::File::from(err_rx).read_to_end(&mut err).unwrap();
+            assert!(out.is_empty() && err.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_requests_have_le_argv_and_strict_probe_descriptors() {
+        let (client, server) = UnixStream::pair().unwrap();
+        send_header(&client, 3, 0, &[]).unwrap();
+        assert!(matches!(RequestReader::new().read(&server).unwrap(), ReadState::Complete(Request::Capabilities)));
+        for (len, fds) in [(1, vec![]), (0, vec![open("/dev/null")])] {
+            let (client, server) = UnixStream::pair().unwrap();
+            send_header(&client, 3, len, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
+            assert!(RequestReader::new().read(&server).is_err());
+        }
+        for op in [1, 4] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let null = open("/dev/null");
+            send_header(&client, op, 12, &[null.as_raw_fd(); 3]).unwrap();
+            (&client).write_all(&[1, 0, 0, 0, 4, 0, 0, 0, b't', b'r', b'u', b'e']).unwrap();
+            let request = RequestReader::new().read(&server).unwrap();
+            assert!(match request {
+                ReadState::Complete(Request::TypedExec(argv, fds)) if op == 4 => argv[0].to_bytes() == b"true" && fds.len() == 3,
+                ReadState::Complete(Request::Exec(argv, fds)) if op == 1 => argv[0].to_bytes() == b"true" && fds.len() == 3,
+                _ => false,
+            });
+        }
     }
 
     #[test]

@@ -596,7 +596,7 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// revoke open descriptors: each would be a handle straight through the
 /// sandbox walls. This also drops our copies of the parent's pipe ends, so a
 /// parent that dies mid-setup shows up here as EOF instead of a hang.
-fn close_fds_except(keep: &[RawFd]) -> Result<()> {
+pub(crate) fn close_fds_except(keep: &[RawFd]) -> Result<()> {
     let mut keep: Vec<u32> = keep.iter().map(|&fd| fd as u32).collect();
     keep.sort_unstable();
     let mut first = 3;

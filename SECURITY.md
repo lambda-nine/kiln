@@ -78,6 +78,18 @@ relying on it:
   descriptors are owned immediately and close on every error path. A complete
   request may use `shutdown(SHUT_WR)` while reading its response. A full socket
   close remains cancellation for an active exec.
+- **Machine exec status.** Persistent-exec protocol v1 uses bounded typed
+  replies and an anonymous private Unix status socket owned only by the host
+  CLI. Only three explicit workload descriptors cross into PID 1; bootstrap
+  closes control/cgroup/signal descriptors before exec. Workload stdout/stderr
+  cannot spoof status, and bootstrap errors cannot pollute workload stderr.
+  CLI diagnostics use a separate stream. Malformed, missing or truncated
+  status is a protocol failure with unknown command result, never a legacy
+  exit-code fallback. Capability checks must cover both the installed CLI and
+  an existing sandbox PID 1; package version/provenance alone is insufficient.
+  Reply writes are bounded and tolerate peer failure without stopping PID 1.
+  Protocol v1 is first supplied by the resulting kiln commit based on
+  `3b42552`; see [exact bytes and compatibility](docs/exec-protocol-v1.md).
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the

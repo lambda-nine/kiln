@@ -213,6 +213,19 @@ scripts/review-regressions.sh
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for where this is going.
 
+Machine callers can use **persistent-exec protocol v1** to distinguish command
+exits (including 125/126/127) and signals from runtime/bootstrap failures while
+keeping stdout/stderr byte-transparent. Use `kiln capabilities --protocol=1`
+for installed CLI capability/provenance, or append an ID to probe its PID 1.
+Create with `--require-exec-protocol=1`, then use
+`kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV...`.
+All four private descriptors are required; the status Unix socket stays in the
+host CLI, separate from command output and CLI diagnostics. See the exact
+[protocol and compatibility rules](docs/exec-protocol-v1.md). Protocol v1 is
+first supplied by the resulting kiln commit introducing that document, based
+on `3b42552`; package version `0.1.0` alone does not establish compatibility.
+Recreate older persistent sandboxes explicitly after checking their capabilities.
+
 ## Notes
 
 - **PID 1 ignores signals from inside its own namespace.** `kill -9 $$` inside

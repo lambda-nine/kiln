@@ -141,6 +141,11 @@ pub struct ExecCgroup {
 }
 
 impl ExecCgroup {
+    #[cfg(test)]
+    pub fn protocol_fixture(path: &Path) -> Self {
+        let file = |name| fs::OpenOptions::new().read(true).write(true).open(path.join(name)).unwrap();
+        Self { procs: file("procs"), kill: file("kill"), events: file("events") }
+    }
     /// The descriptors to keep open across PID 1's setup.
     pub fn raw_fds(&self) -> [RawFd; 3] {
         [self.procs.as_raw_fd(), self.kill.as_raw_fd(), self.events.as_raw_fd()]

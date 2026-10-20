@@ -1,6 +1,7 @@
 mod cgroup;
 mod container;
 mod dns;
+mod exec_protocol;
 mod init;
 mod landlock;
 mod metrics;
@@ -46,9 +47,25 @@ enum Command {
     Create(Box<CreateArgs>),
     /// Run a command in a persistent sandbox.
     Exec {
+        #[arg(long)]
+        protocol: Option<u16>,
+        #[arg(long, requires_all = ["protocol", "stdin_fd", "stdout_fd", "stderr_fd"])]
+        status_fd: Option<i32>,
+        #[arg(long, requires = "status_fd")]
+        stdin_fd: Option<i32>,
+        #[arg(long, requires = "status_fd")]
+        stdout_fd: Option<i32>,
+        #[arg(long, requires = "status_fd")]
+        stderr_fd: Option<i32>,
         id: String,
         #[arg(required = true, trailing_var_arg = true)]
         cmd: Vec<String>,
+    },
+    /// Report CLI or sandbox persistent-exec capabilities as a binary frame.
+    Capabilities {
+        #[arg(long, required = true)]
+        protocol: u16,
+        id: Option<String>,
     },
     /// List persistent sandboxes.
     Ls,
@@ -118,6 +135,8 @@ struct RunArgs {
 
 #[derive(clap::Args)]
 struct CreateArgs {
+    #[arg(long)]
+    require_exec_protocol: Option<u16>,
     #[arg(long, default_value = "kiln")]
     hostname: String,
     #[arg(long, default_value = "alpine")]
@@ -164,6 +183,9 @@ fn main() -> Result<()> {
             std::process::exit(container::run(&cfg)?);
         }
         Command::Create(args) => {
+            if let Some(version) = args.require_exec_protocol {
+                anyhow::ensure!(version == exec_protocol::VERSION, "unsupported persistent-exec protocol {version}");
+            }
             validate_writable(&args.writable)?;
             let cfg = container::Config {
                 limits: cgroup::Limits {
@@ -184,15 +206,23 @@ fn main() -> Result<()> {
             println!("{}", persistent::create(&cfg)?);
             Ok(())
         }
-        Command::Exec { id, cmd } => match persistent::exec(&id, &cmd) {
-            Ok(code) => std::process::exit(code),
-            // Like `docker exec`, kiln's own failure exits 125 so callers can
-            // tell it from the command exiting 1.
-            Err(e) => {
-                eprintln!("Error: {e:?}");
-                std::process::exit(persistent::EXEC_FAILED);
+        Command::Exec { id, cmd, protocol, status_fd, stdin_fd, stdout_fd, stderr_fd } => {
+            let result = match (protocol, status_fd, stdin_fd, stdout_fd, stderr_fd) {
+                (Some(version), Some(status), Some(input), Some(output), Some(error)) =>
+                    persistent::machine_exec(&id, &cmd, version, status, [input, output, error]),
+                (None, None, None, None, None) => persistent::exec(&id, &cmd),
+                _ => Err(anyhow::anyhow!("machine exec requires protocol and all four private descriptors")),
+            };
+            match result {
+                Ok(code) => std::process::exit(code),
+                // Human projection only; machine callers use the private frame.
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(persistent::EXEC_FAILED);
+                }
             }
-        },
+        }
+        Command::Capabilities { protocol, id } => persistent::capabilities(id.as_deref(), protocol),
         Command::Ls => persistent::list(),
         Command::Rm { id } => persistent::remove(&id),
         Command::Gc => persistent::gc(),
@@ -255,6 +285,16 @@ mod tests {
     fn about_matches_package_description() {
         let about = Cli::command().get_about().unwrap().to_string();
         assert_eq!(about, "A small Linux sandbox runtime for AI agent tools");
+    }
+
+    #[test]
+    fn machine_flags_are_separate_from_workload_argv() {
+        let cli = Cli::try_parse_from(["kiln", "exec", "--protocol=1", "--status-fd=3",
+            "--stdin-fd=4", "--stdout-fd=5", "--stderr-fd=6", "abc", "--", "printf", "--protocol=99"]).unwrap();
+        let Command::Exec { cmd, protocol, .. } = cli.command else { panic!("not exec") };
+        assert_eq!(protocol, Some(1));
+        assert_eq!(cmd, ["printf", "--protocol=99"]);
+        assert!(Cli::try_parse_from(["kiln", "exec", "--protocol=1", "--status-fd=3", "abc", "--", "true"]).is_err());
     }
 
     #[test]
