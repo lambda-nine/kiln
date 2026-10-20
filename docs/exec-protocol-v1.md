@@ -165,7 +165,10 @@ authority. If the private receiver disconnects or refuses to read, the CLI
 reports a diagnostic and exits 125; PID 1 remains usable.
 
 Tests: Rust golden vectors, every split, invalid frames, bounded writes,
-test-only bootstrap fault injection and a separate protocol server fixture;
-`scripts/typed-exec-regressions.py` for real installed-path cgroup acceptance,
-invoked by `scripts/review-regressions.sh`. No bootstrap injection hooks are
+test-only bootstrap fault injection and a separate protocol server fixture
+that saturates PID 1's response socket to EAGAIN after cleanup and verifies
+signal-aware recovery. `scripts/typed-exec-regressions.py` covers installed-path
+cgroup acceptance, including real-time leader signals 34 and 64, and is invoked
+by `scripts/review-regressions.sh`. Its control peer-close/unread-small-response
+checks do not force response backpressure. No fixture injection hooks are
 compiled into shipped binaries.

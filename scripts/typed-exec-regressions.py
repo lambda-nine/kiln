@@ -137,6 +137,9 @@ def run():
         assert outcome(status) == (1, 2, 2, 0, 15, 0, 0, 0) and rc == 143
         rc, status, out, err, diag = machine(identifier, ["sh", "-c", "kill -PIPE $$"])
         assert outcome(status) == (1, 2, 2, 0, 13, 0, 0, 0) and rc == 141
+        for signal in (34, 64):
+            rc, status, out, err, diag = machine(identifier, ["sh", "-c", f"kill -{signal} $$"])
+            assert outcome(status) == (1, 2, 2, 0, signal, 0, 0, 0) and rc == 128 + signal
         rc, status, out, err, diag = machine(identifier, ["/no/such/executable"])
         assert outcome(status) == (2, 0, 2, 0, 0, 6, 8, 2) and rc == 127
         assert out == err == b"", "bootstrap diagnostic leaked into command streams"
@@ -163,8 +166,9 @@ def run():
             rc, _, out, err, diag = machine(identifier, ["sh", "-c", "printf kept; printf evidence >&2"], broken_status=broken)
             assert rc == 125 and (out, err) == (b"kept", b"evidence") and diag
             assert outcome(machine(identifier, ["true"])[1])[4] == 0
-        # PID 1 response disconnect and non-reader: each has its own socket;
-        # no failed response may stop the sandbox or pin its active slot.
+        # PID 1 peer-close/EPIPE and unread-small-response recovery. Leaving a
+        # 40-byte reply unread does not force backpressure; the isolated Rust
+        # protocol fixture fills the send buffer to EAGAIN deterministically.
         for _ in range(10):
             raw_exec(identifier, ["true"]).close()
         peer = raw_exec(identifier, ["true"])
@@ -182,7 +186,7 @@ def run():
         caps(limited)
     finally:
         subprocess.run([KILN, "rm", limited], check=True, timeout=15)
-    print("PASS: typed exec v1, signals, bootstrap, spoofing, compatibility, disconnect/nonreader, recovery")
+    print("PASS: typed exec v1, real-time signals, bootstrap, spoofing, compatibility, status backpressure, control peer-close/unread, recovery")
 
 
 if __name__ == "__main__":

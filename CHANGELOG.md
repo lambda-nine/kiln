@@ -7,6 +7,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Decode raw Linux wait statuses so real-time signals 34–64 remain typed
+  command outcomes and adopted-child cleanup reaps them successfully. Add
+  deterministic test-only PID 1 response-backpressure and signal recovery.
+
 - Add persistent-exec protocol v1: versioned bounded outcome/capability frames,
   raw exit/signal/core status, typed bootstrap/runtime failures, and private
   machine status plus explicit workload stdio FDs. Preserve legacy requests

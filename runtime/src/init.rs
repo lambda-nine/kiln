@@ -17,7 +17,6 @@ use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::signal::{SigSet, Signal, kill};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
@@ -151,6 +150,10 @@ enum Outcome {
 fn report(stream: &UnixStream, outcome: &ExecOutcome, typed: bool, signals: &SignalFd) -> Result<()> {
     let bytes = if typed { Frame::Outcome(outcome.clone()).encode()? }
         else { outcome.projection().to_ne_bytes().to_vec() };
+    #[cfg(test)]
+    if typed && injected("response-backpressure").is_some() {
+        fixture_response_backpressure(stream, outcome)?;
+    }
     respond(stream, &bytes, signals, true);
     Ok(())
 }
@@ -159,6 +162,15 @@ fn report(stream: &UnixStream, outcome: &ExecOutcome, typed: bool, signals: &Sig
 /// the lifetime or exec loop so this writer cannot steal leader/stop ownership.
 fn respond(stream: &UnixStream, bytes: &[u8], signals: &SignalFd, idle: bool) {
     let result = protocol::write_bounded(stream.as_raw_fd(), bytes, || {
+        #[cfg(test)]
+        if let Some(root) = std::env::var_os("KILN_PROTOCOL_FIXTURE") {
+            let root = std::path::PathBuf::from(root);
+            if root.join("response-started").exists() {
+                // The saturated fixture reaches this callback only after the
+                // real bounded writer has received EAGAIN.
+                std::fs::write(root.join("response-blocked"), b"")?;
+            }
+        }
         // Leave signals queued for the lifetime/exec loop; in particular this
         // must never reap the active leader while replying to a busy probe.
         let mut p = [libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
@@ -506,6 +518,37 @@ fn injected(point: &str) -> Option<i32> {
     errno.parse().ok()
 }
 
+#[cfg(test)]
+fn fixture_response_backpressure(stream: &UnixStream, outcome: &ExecOutcome) -> Result<()> {
+    anyhow::ensure!(outcome.cleanup == Cleanup::Drained, "response preceded exec cleanup");
+    let size: libc::c_int = 4096;
+    let fd = stream.as_raw_fd();
+    // SAFETY: size is an initialized socket option of the specified length.
+    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+        (&size as *const libc::c_int).cast(), std::mem::size_of_val(&size) as libc::socklen_t) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("fixture send buffer");
+    }
+    // Fill even the space for a minimum-sized response. The peer never reads,
+    // so reaching EAGAIN guarantees the following writer must wait for space.
+    let filler = [b'x'; 40];
+    loop {
+        let n = unsafe { libc::send(fd, filler.as_ptr().cast(), filler.len(),
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+        if n >= 0 { anyhow::ensure!(n > 0, "fixture send made no progress"); continue; }
+        match Errno::last() {
+            Errno::EINTR => continue,
+            Errno::EAGAIN => break,
+            e => return Err(e).context("fixture saturate response"),
+        }
+    }
+    let root = std::path::PathBuf::from(
+        std::env::var_os("KILN_PROTOCOL_FIXTURE").context("missing protocol fixture")?);
+    // report() is reached only after run_exec() has finished drainage/reaping.
+    std::fs::write(root.join("response-started.pending"), b"drained\n")?;
+    std::fs::rename(root.join("response-started.pending"), root.join("response-started"))?;
+    Ok(())
+}
+
 /// The one way an exec ends, whether its command exited, its client left, it
 /// couldn't start or `kiln rm` interrupted it: kill everything left in the
 /// exec cgroup, wait until it's empty, and reap every last process. An error
@@ -535,8 +578,8 @@ fn finish(scope: &ExecCgroup, mut outcome: Outcome) -> Result<Outcome> {
 /// cgroup, so each is already dying and this can't block on a live process.
 fn reap_all_blocking() -> Result<()> {
     loop {
-        match waitpid(Pid::from_raw(-1), None) {
-            Ok(_) | Err(Errno::EINTR) => continue,
+        match wait_raw(-1, 0) {
+            Ok(_) => continue,
             Err(Errno::ECHILD) => return Ok(()),
             Err(e) => return Err(e).context("waitpid"),
         }
@@ -731,15 +774,43 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
 fn reap(command: Option<Pid>) -> Result<Option<CommandStatus>> {
     let mut code = None;
     loop {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(pid, c)) if Some(pid) == command => code = Some(CommandStatus::Exited(c)),
-            Ok(WaitStatus::Signaled(pid, sig, core_dumped)) if Some(pid) == command => {
-                code = Some(CommandStatus::Signaled { signal: sig as i32, core_dumped })
+        match wait_raw(-1, libc::WNOHANG) {
+            Ok(Some((pid, RawWaitStatus::Exited(c)))) if Some(pid) == command => code = Some(CommandStatus::Exited(c)),
+            Ok(Some((pid, RawWaitStatus::Signaled { signal, core_dumped }))) if Some(pid) == command => {
+                code = Some(CommandStatus::Signaled { signal, core_dumped })
             }
-            Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => return Ok(code),
+            Ok(None) | Err(Errno::ECHILD) => return Ok(code),
             Ok(_) => continue,
             Err(e) => return Err(e).context("waitpid"),
         }
+    }
+}
+
+enum RawWaitStatus {
+    Exited(i32),
+    Signaled { signal: i32, core_dumped: bool },
+    Other,
+}
+
+/// Decode without nix's Signal enum, which excludes Linux real-time signals.
+/// Keep ECHILD separate from WNOHANG's no-status result for caller ownership.
+fn wait_raw(pid: libc::pid_t, options: libc::c_int) -> nix::Result<Option<(Pid, RawWaitStatus)>> {
+    loop {
+        let mut status = 0;
+        // SAFETY: status points to a valid wait-status output slot.
+        let child = unsafe { libc::waitpid(pid, &mut status, options) };
+        if child < 0 {
+            let e = Errno::last();
+            if e == Errno::EINTR { continue; }
+            return Err(e);
+        }
+        if child == 0 { return Ok(None); }
+        let status = if libc::WIFEXITED(status) {
+            RawWaitStatus::Exited(libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            RawWaitStatus::Signaled { signal: libc::WTERMSIG(status), core_dumped: libc::WCOREDUMP(status) }
+        } else { RawWaitStatus::Other };
+        return Ok(Some((Pid::from_raw(child), status)));
     }
 }
 
@@ -761,6 +832,8 @@ mod tests {
     fn protocol_server_fixture() {
         let Some(path) = std::env::var_os("KILN_PROTOCOL_FIXTURE") else { return; };
         let root = std::path::PathBuf::from(path);
+        // Model PID 1 adoption without requiring a privileged PID namespace.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
         let scope = ExecCgroup::protocol_fixture(&root);
         let result = serve(&listener, &scope);
@@ -771,7 +844,9 @@ mod tests {
     struct Server { child: Child, root: std::path::PathBuf }
     impl Server {
         fn start() -> Self {
-            let root = std::env::temp_dir().join(format!("kiln-protocol-{}", std::process::id()));
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!("kiln-protocol-{}-{id}", std::process::id()));
             fs::create_dir(&root).unwrap();
             for (file, text) in [("procs", ""), ("kill", ""), ("events", "populated 0\n")] {
                 fs::write(root.join(file), text).unwrap();
@@ -789,12 +864,15 @@ mod tests {
             }); }
             let child = command.spawn().unwrap();
             let server = Self { child, root };
+            server.wait_for("control.sock");
+            server
+        }
+        fn wait_for(&self, name: &str) {
             let start = Instant::now();
-            while !server.root.join("control.sock").exists() {
-                assert!(start.elapsed() < Duration::from_secs(5));
+            while !self.root.join(name).exists() {
+                assert!(start.elapsed() < Duration::from_secs(5), "fixture never reached {name}");
                 std::thread::sleep(Duration::from_millis(5));
             }
-            server
         }
         fn connect(&self) -> UnixStream { UnixStream::connect(self.root.join("control.sock")).unwrap() }
         fn exec(&self, args: &[&str]) -> (ExecOutcome, Vec<u8>, Vec<u8>) {
@@ -852,6 +930,10 @@ mod tests {
         }
         let o = server.exec(&["/bin/sh", "-c", "kill -TERM $$"]).0;
         assert_eq!(o.status, Some(CommandStatus::Signaled { signal: 15, core_dumped: false }));
+        for signal in [34, 64] {
+            assert_eq!(server.exec(&["/bin/sh", "-c", &format!("kill -{signal} $$")]).0,
+                ExecOutcome::command(CommandStatus::Signaled { signal, core_dumped: false }));
+        }
         let (o, _, err) = server.exec(&["/no/such/executable"]);
         assert_eq!((o.kind, o.stage, o.errno, o.status), (FailureKind::LaunchFailed, Stage::Exec, libc::ENOENT, None));
         assert!(err.is_empty());
@@ -890,6 +972,44 @@ mod tests {
         assert_eq!((o.kind, o.stage, o.cleanup, o.status), (FailureKind::CleanupFailed,
             Stage::Cleanup, Cleanup::Unconfirmed, Some(CommandStatus::Exited(125))));
         assert_eq!(out, b"retained"); assert!(err.is_empty());
+    }
+
+    #[test]
+    fn cleanup_reaps_adopted_realtime_signal_before_reuse() {
+        let server = Server::start();
+        // The orphan stays alive until finish() writes the fake cgroup.kill.
+        // Therefore reap(leader)'s WNOHANG loop cannot consume its status:
+        // reap_all_blocking() must observe its real-time signal termination.
+        let script = r#"/bin/sh -c 'while [ ! -s "$KILN_PROTOCOL_FIXTURE/kill" ]; do sleep 0.005; done; kill -64 $$' & exit 0"#;
+        assert_eq!(server.exec(&["/bin/sh", "-c", script]).0,
+            ExecOutcome::command(CommandStatus::Exited(0)));
+        assert_eq!(fs::read(server.root.join("kill")).unwrap(), b"1");
+        assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
+    }
+
+    #[test]
+    fn response_backpressure_services_sigchld_and_recovers() {
+        let mut server = Server::start();
+        fs::write(server.root.join("inject"), "response-backpressure 0").unwrap();
+        let (peer, out, err) = server.start_exec(&["/bin/true"]);
+        // Do not read any filler or response bytes: publication can only begin
+        // after finish(), and EAGAIN must occur inside the real bounded writer.
+        server.wait_for("response-started");
+        assert_eq!(fs::read(server.root.join("response-started")).unwrap(), b"drained\n");
+        assert_eq!(fs::read(server.root.join("kill")).unwrap(), b"1");
+        server.wait_for("response-blocked");
+        let mut wait = [libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLRDHUP, revents: 0 }];
+        assert_eq!(poll(&mut wait, 0).unwrap(), 0, "writer stopped before the injected signal");
+        let start = Instant::now();
+        kill(Pid::from_raw(server.child.id() as i32), Signal::SIGCHLD).unwrap();
+        let signal_timeout = protocol::FRAME_TIMEOUT / 2;
+        assert!(poll(&mut wait, signal_timeout.as_millis() as i32).unwrap() > 0,
+            "backpressured response did not service SIGCHLD before its write deadline");
+        assert_ne!(wait[0].revents & (libc::POLLRDHUP | libc::POLLHUP), 0);
+        assert!(start.elapsed() < signal_timeout);
+        assert!(server.child.try_wait().unwrap().is_none(), "response failure stopped PID 1");
+        drop((peer, out, err));
+        assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
     }
 
     #[test]
