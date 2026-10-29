@@ -63,7 +63,8 @@ sudo target/debug/kiln exec "$id" -- sh -c 'echo hello >/workspace/message' </de
 sudo target/debug/kiln exec "$id" -- cat /workspace/message </dev/null 2>&1 | cat
 sudo target/debug/kiln ls
 sudo target/debug/kiln rm "$id"
-sudo target/debug/kiln gc                 # clean state from crashed shims
+sudo target/debug/kiln gc                 # clean every stale crashed shim
+sudo target/debug/kiln gc ID...           # clean only these stale sandboxes
 sudo KILN_TRACE=1 target/debug/kiln run -- true  # time each startup phase
 sudo kiln stats                          # running sandboxes, like docker stats
 sudo scripts/metrics-demo.sh             # 3 minutes of load for the dashboard
@@ -202,6 +203,9 @@ scripts/review-regressions.sh
     state look live. `kiln rm` stops one and waits for its resources to be removed, and
     `kiln gc` removes cgroups, network state and run directories left by
     crashed shims, removing child cgroup directories before their parent.
+    Optional ID arguments restrict cleanup to those sandboxes, so a manager
+    can garbage-collect only backends it owns; every selected shim is checked
+    for liveness again before anything is removed.
     Identity files are atomically published with `shim.pid` last; after that
     marker exists, missing, malformed or unreadable metadata fails `ls`/`gc`
     rather than looking like an empty registry or a dead shim. Linux process

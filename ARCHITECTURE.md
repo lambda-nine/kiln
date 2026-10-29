@@ -70,7 +70,10 @@ then does it report status, reuse the exec cgroup, or acknowledge removal.
 background work never outlives its launching exec, and inherited output pipes
 reach EOF after drainage. Process groups only aid signal forwarding. A task
 stuck in an uninterruptible kernel wait can delay drainage indefinitely.
-Sandbox cleanup and `kiln gc` remove nested cgroup directories children-first.
+Sandbox cleanup and `kiln gc [ID...]` remove nested cgroup directories
+children-first. With IDs, GC inspects and removes only that explicit scope;
+without them it retains the operator-facing global scan. Both modes recheck
+recorded shim identity and liveness immediately before cleanup.
 
 PID 1 keeps one signalfd for its whole lifetime and polls it beside the control
 listener. It therefore reaps any unexpectedly adopted child even when no exec
@@ -157,7 +160,8 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 2. **A daemon (`kilnd`) will own sandbox state.** Until the API daemon is added,
    the CLI provides the same lifecycle and `kiln gc` reconciliation: it scans
    persistent run directories and removes cgroups and network state whose shim
-   has died.
+   has died. `kiln gc ID...` gives the daemon a scoped form that cannot remove
+   an unlisted operator-owned sandbox.
 3. **One shim process per sandbox.** `kiln create` detaches a small host shim
    that owns cgroup and network cleanup while PID 1 serves `kiln exec` requests
    through a root-only Unix socket. This also lets sandboxes survive the CLI

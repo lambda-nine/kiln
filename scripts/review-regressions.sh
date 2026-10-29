@@ -177,15 +177,25 @@ sudo "$KILN" rm "$persistent"
 sh scripts/exec-tree-regressions.sh
 
 stale=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 16M)
+unrequested_stale=$(sudo "$KILN" create --memory 64M --pids 16 --disk 16M)
 shim=$(sudo cat "/var/lib/kiln/runs/$stale/shim.pid")
+unrequested_shim=$(sudo cat "/var/lib/kiln/runs/$unrequested_stale/shim.pid")
 ip=$(awk -v id="$stale" '$0 == id { sub(".*/", "", FILENAME); print FILENAME }' /run/kiln/net/leases/*)
 sudo kill -9 "$shim"
+sudo kill -9 "$unrequested_shim"
 i=0
 while kill -0 "$shim" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-sudo "$KILN" gc
+sudo "$KILN" gc "$stale"
 [ ! -e "/var/lib/kiln/runs/$stale" ]
 [ ! -e "/sys/fs/cgroup/kiln/$stale" ]
 [ ! -e "/run/kiln/net/leases/$ip" ]
+[ -e "/var/lib/kiln/runs/$unrequested_stale" ] || {
+    echo "FAIL: scoped GC removed an unrequested stale sandbox"
+    exit 1
+}
+sudo "$KILN" ls | grep -q "^$unrequested_stale[[:space:]]\+stale"
+sudo "$KILN" gc "$unrequested_stale"
+[ ! -e "/var/lib/kiln/runs/$unrequested_stale" ]
 echo "PASS"
 
 echo "10. pids.max refuses exec without destroying a persistent sandbox"

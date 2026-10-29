@@ -71,8 +71,11 @@ enum Command {
     Ls,
     /// Remove a persistent sandbox.
     Rm { id: String },
-    /// Remove state left by crashed sandbox shims.
-    Gc,
+    /// Remove state left by crashed sandbox shims, optionally limited to IDs.
+    Gc {
+        #[arg(value_name = "ID")]
+        ids: Vec<String>,
+    },
     /// Serve DNS to sandboxes on 10.88.0.1:53 (run by the kiln-dns service).
     Dns,
     /// Serve running sandboxes' resource use as Prometheus metrics.
@@ -225,7 +228,7 @@ fn main() -> Result<()> {
         Command::Capabilities { protocol, id } => persistent::capabilities(id.as_deref(), protocol),
         Command::Ls => persistent::list(),
         Command::Rm { id } => persistent::remove(&id),
-        Command::Gc => persistent::gc(),
+        Command::Gc { ids } => persistent::gc(&ids),
         Command::Dns => dns::serve(),
         Command::Metrics { listen } => metrics::serve_metrics(&listen),
         Command::Stats => {
@@ -295,6 +298,17 @@ mod tests {
         assert_eq!(protocol, Some(1));
         assert_eq!(cmd, ["printf", "--protocol=99"]);
         assert!(Cli::try_parse_from(["kiln", "exec", "--protocol=1", "--status-fd=3", "abc", "--", "true"]).is_err());
+    }
+
+    #[test]
+    fn gc_accepts_an_optional_explicit_scope() {
+        let all = Cli::try_parse_from(["kiln", "gc"]).unwrap();
+        let Command::Gc { ids } = all.command else { panic!("not gc") };
+        assert!(ids.is_empty());
+
+        let scoped = Cli::try_parse_from(["kiln", "gc", "abcd-1", "beef-2"]).unwrap();
+        let Command::Gc { ids } = scoped.command else { panic!("not gc") };
+        assert_eq!(ids, ["abcd-1", "beef-2"]);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -437,10 +437,40 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
-pub fn gc() -> Result<()> {
+pub fn gc(ids: &[String]) -> Result<()> {
     let root = Path::new(RUNS_ROOT);
-    for entry in registry_entries(root)? {
-        let dir = entry.path();
+    for (id, dir) in stale_gc_candidates(root, ids)? {
+        crate::cgroup::remove(&id);
+        crate::net::remove_run(&id);
+        fs::remove_dir_all(&dir).with_context(|| format!("remove stale sandbox {id}"))?;
+        eprintln!("kiln: removed stale sandbox {id}");
+    }
+    Ok(())
+}
+
+fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    let entries: Vec<(Option<String>, PathBuf)> = if ids.is_empty() {
+        registry_entries(root)?
+            .into_iter()
+            .map(|entry| (None, entry.path()))
+            .collect()
+    } else {
+        let mut unique = std::collections::BTreeSet::new();
+        for id in ids {
+            validate_id(id)?;
+            unique.insert(id.clone());
+        }
+        unique
+            .into_iter()
+            .map(|id| {
+                let dir = root.join(&id);
+                (Some(id), dir)
+            })
+            .collect()
+    };
+
+    let mut stale = Vec::new();
+    for (id, dir) in entries {
         if !dir
             .join("shim.pid")
             .try_exists()
@@ -448,22 +478,23 @@ pub fn gc() -> Result<()> {
         {
             continue;
         }
-        let id = entry
-            .file_name()
-            .into_string()
-            .map_err(|name| anyhow::anyhow!("sandbox registry entry is not UTF-8: {name:?}"))?;
+        let id = match id {
+            Some(id) => id,
+            None => dir
+                .file_name()
+                .with_context(|| format!("sandbox registry entry has no name: {}", dir.display()))?
+                .to_os_string()
+                .into_string()
+                .map_err(|name| anyhow::anyhow!("sandbox registry entry is not UTF-8: {name:?}"))?,
+        };
         // Validate identity before considering cleanup, even if the control
         // socket is absent. A live shim can be between socket creation and
         // identity publication, or its socket may have been removed.
-        if read_shim(&dir)?.is_live()? {
-            continue;
+        if !read_shim(&dir)?.is_live()? {
+            stale.push((id, dir));
         }
-        crate::cgroup::remove(&id);
-        crate::net::remove_run(&id);
-        fs::remove_dir_all(&dir).with_context(|| format!("remove stale sandbox {id}"))?;
-        eprintln!("kiln: removed stale sandbox {id}");
     }
-    Ok(())
+    Ok(stale)
 }
 
 fn registry_entries(root: &Path) -> Result<Vec<fs::DirEntry>> {
@@ -813,6 +844,7 @@ fn recv_chunk(stream: &UnixStream, bytes: &mut [u8]) -> Result<RecvChunk> {
 #[cfg(test)]
 mod tests {
     use std::os::fd::IntoRawFd;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -1061,6 +1093,59 @@ mod tests {
         let err = read_shim(&dir).unwrap_err().to_string();
         assert!(err.contains("parse sandbox registry file"), "{err}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scoped_gc_selects_only_requested_stale_sandboxes() {
+        let root = std::env::temp_dir().join(format!(
+            "kiln-scoped-gc-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        for id in ["aaaa-1", "bbbb-2"] {
+            let dir = root.join(id);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("shim.pid"), i32::MAX.to_string()).unwrap();
+            fs::write(dir.join("shim.start"), "1").unwrap();
+        }
+        fs::create_dir(root.join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
+        let global = stale_gc_candidates(&root, &[]).unwrap();
+        assert_eq!(
+            global
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["aaaa-1", "bbbb-2"].into_iter().collect()
+        );
+
+        let malformed = root.join("cccc-3");
+        fs::create_dir(&malformed).unwrap();
+        fs::write(malformed.join("shim.pid"), "not-a-pid").unwrap();
+        fs::write(malformed.join("shim.start"), "1").unwrap();
+
+        let scoped = stale_gc_candidates(
+            &root,
+            &["aaaa-1".into(), "aaaa-1".into(), "dddd-4".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["aaaa-1"]
+        );
+        assert!(
+            stale_gc_candidates(&root, &["invalid/id".into()]).is_err(),
+            "a scoped ID must not escape the registry root"
+        );
+        assert!(
+            stale_gc_candidates(&root, &[]).is_err(),
+            "global GC must still fail closed on malformed registry identity"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -7,6 +7,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- `kiln gc ID...` now limits crash cleanup to explicitly named stale
+  sandboxes while retaining global `kiln gc` for operators. Scoped cleanup
+  deduplicates and validates IDs, ignores unrelated registry entries, and
+  rechecks shim identity/liveness before removing resources.
+
 - Decode raw Linux wait statuses so real-time signals 34–64 remain typed
   command outcomes and adopted-child cleanup reaps them successfully. Add
   deterministic test-only PID 1 response-backpressure and signal recovery.
