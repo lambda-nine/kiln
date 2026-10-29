@@ -13,6 +13,7 @@ mod seccomp;
 mod storage;
 mod trace;
 mod userns;
+mod validation;
 
 // Include the build-script helpers in the test target so provenance edge
 // cases are covered by the ordinary `cargo test` release gate.
@@ -239,10 +240,7 @@ fn main() -> Result<()> {
 }
 
 fn validate_writable(paths: &[PathBuf]) -> Result<()> {
-    if let Some(p) = paths.iter().find(|p| !p.is_absolute()) {
-        bail!("--writable needs an absolute path, got {}", p.display());
-    }
-    Ok(())
+    validation::validate_writable_paths(paths)
 }
 
 fn parse_cpus(s: &str) -> Result<Option<f64>> {

@@ -15,8 +15,10 @@ use nix::unistd::{ForkResult, fork, pipe2, read, setsid};
 
 use crate::container::{self, Config};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, FailureKind, Frame, Outcome, Stage};
+use crate::validation::{
+    MAX_ARGC, MAX_EXEC_REQUEST_BYTES as MAX_REQUEST, valid_persistent_id, validate_exec_argv,
+};
 
-const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_REQUEST_FDS: usize = 3;
 const RUNS_ROOT: &str = "/var/lib/kiln/runs";
 /// Exit code of `kiln exec` when kiln itself fails (bad ID, sandbox gone,
@@ -217,19 +219,15 @@ pub fn create(cfg: &Config) -> Result<String> {
 
 pub fn exec(id: &str, cmd: &[String]) -> Result<i32> {
     validate_id(id)?;
-    if cmd.is_empty() {
-        bail!("a command is required");
-    }
-    let mut payload = Vec::new();
+    let encoded_len = validate_exec_argv(cmd)?;
+    let mut payload = Vec::with_capacity(encoded_len);
     payload.extend_from_slice(&(cmd.len() as u32).to_ne_bytes());
     for arg in cmd {
         let bytes = arg.as_bytes();
         payload.extend_from_slice(&(bytes.len() as u32).to_ne_bytes());
         payload.extend_from_slice(bytes);
     }
-    if payload.len() > MAX_REQUEST {
-        bail!("command is too large");
-    }
+    debug_assert_eq!(payload.len(), encoded_len);
     let stdio = [0, 1, 2];
     refuse_terminal_stdio(&stdio)?;
     let mut stream = connect(id)?;
@@ -283,16 +281,14 @@ fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio:
         let fds: Vec<OwnedFd> = stdio.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
         anyhow::ensure!(version == protocol::VERSION, "unsupported persistent-exec protocol {version}");
         validate_id(id)?;
-        anyhow::ensure!(!cmd.is_empty() && cmd.len() <= 4096, "invalid argument count");
-        let mut payload = Vec::new();
+        let encoded_len = validate_exec_argv(cmd)?;
+        let mut payload = Vec::with_capacity(encoded_len);
         payload.extend_from_slice(&(cmd.len() as u32).to_le_bytes());
         for arg in cmd {
-            anyhow::ensure!(!arg.as_bytes().contains(&0), "argument contains NUL");
-            anyhow::ensure!(arg.len() <= MAX_REQUEST && payload.len() + 4 + arg.len() <= MAX_REQUEST,
-                "command is too large");
             payload.extend_from_slice(&(arg.len() as u32).to_le_bytes());
             payload.extend_from_slice(arg.as_bytes());
         }
+        debug_assert_eq!(payload.len(), encoded_len);
         stage = Stage::Connect;
         let mut stream = connect_bounded(id, Instant::now() + protocol::FRAME_TIMEOUT)?;
         stage = Stage::Request;
@@ -576,7 +572,7 @@ fn parse_argv_ordered(data: &[u8], little_endian: bool) -> Result<Vec<CString>> 
         Ok(if little_endian { u32::from_le_bytes(n.to_ne_bytes()) } else { n })
     };
     let argc = take(&mut at)? as usize;
-    if argc == 0 || argc > 4096 {
+    if argc == 0 || argc > MAX_ARGC {
         bail!("invalid argument count");
     }
     let mut argv = Vec::with_capacity(argc);
@@ -585,6 +581,9 @@ fn parse_argv_ordered(data: &[u8], little_endian: bool) -> Result<Vec<CString>> 
         let bytes = data.get(at..at + n).context("truncated argument")?;
         argv.push(CString::new(bytes).context("argument contains a NUL byte")?);
         at += n;
+    }
+    if argv[0].as_bytes().is_empty() {
+        bail!("argv must name a program");
     }
     if at != data.len() {
         bail!("trailing request data");
@@ -681,7 +680,7 @@ fn connect_path_bounded(path: &Path, deadline: Instant) -> Result<UnixStream> {
 }
 
 fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+    if !valid_persistent_id(id) {
         bail!("invalid sandbox ID {id:?}");
     }
     Ok(())
@@ -931,6 +930,18 @@ mod tests {
                 ReadState::Complete(Request::Exec(argv, fds)) if op == 1 => argv[0].to_bytes() == b"true" && fds.len() == 3,
                 _ => false,
             });
+        }
+    }
+
+    #[test]
+    fn raw_exec_protocol_rejects_an_empty_argv0() {
+        for op in [1, 4] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let null = open("/dev/null");
+            send_header(&client, op, 8, &[null.as_raw_fd(); 3]).unwrap();
+            (&client).write_all(&[1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            let error = RequestReader::new().read(&server).unwrap_err().to_string();
+            assert!(error.contains("name a program"), "{error}");
         }
     }
 

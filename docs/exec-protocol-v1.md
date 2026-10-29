@@ -19,7 +19,10 @@ Operation 3 has zero body length and no descriptors. Operation 4 requires
 exactly three descriptors (stdin, stdout, stderr) in one SCM_RIGHTS message
 attached to the header. Its body is argc u32 followed by each argument's byte
 length u32 and those bytes, without a terminator. Require 1–4096 arguments,
-no NUL bytes, no trailing body bytes, and a total body at most 1 MiB.
+nonempty `argv[0]`, no NUL bytes, no trailing body bytes, and a total body at
+most 1 MiB. The body size is `4 + sum(4 + UTF-8 byte length)`. Unicode,
+newlines, other non-NUL controls, later empty arguments and flag-like values
+are literal argv data.
 Descriptors attached to a body, unexpected ancillary messages, ancillary
 truncation and invalid reserved/header fields are rejected and closed.
 One absolute two-second signal-aware receive deadline covers header and body.

@@ -26,6 +26,7 @@ use crate::storage;
 use crate::quota;
 use crate::trace;
 use crate::userns;
+use crate::validation;
 
 const KILN_ROOT: &str = "/var/lib/kiln";
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -59,10 +60,7 @@ struct Layers {
 pub fn run(cfg: &Config) -> Result<i32> {
     // A plain name, so `--image ../../somewhere` can't pick an arbitrary host
     // directory (or another run's upper layer) as the root filesystem.
-    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
-    if cfg.image.is_empty() || cfg.image.starts_with('.') || !cfg.image.chars().all(safe) {
-        bail!("invalid image name {:?}", cfg.image);
-    }
+    validation::validate_image_name(&cfg.image)?;
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
     if !lower.is_dir() {
         bail!(
@@ -130,10 +128,7 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<(
 }
 
 pub fn validate_image(cfg: &Config) -> Result<()> {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.".contains(c);
-    if cfg.image.is_empty() || cfg.image.starts_with('.') || !cfg.image.chars().all(safe) {
-        bail!("invalid image name {:?}", cfg.image);
-    }
+    validation::validate_image_name(&cfg.image)?;
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
     if !lower.is_dir() || lower.metadata()?.uid() != userns::ID_BASE {
         bail!("image {:?} is missing or isn't owned by the sandbox ID range", cfg.image);

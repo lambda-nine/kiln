@@ -7,6 +7,12 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Align CLI and persistent-protocol validation with kilnd's request contract:
+  bounded ASCII image/allowlist fields, canonical non-root writable paths,
+  strict persistent IDs, 1–4096 literal argv entries, nonempty `argv[0]`, no
+  NUL, and a 1 MiB encoded request body. Unicode, newlines, later empty
+  arguments and flag-like values remain literal rather than shell syntax.
+
 - `kiln gc ID...` now limits crash cleanup to explicitly named stale
   sandboxes while retaining global `kiln gc` for operators. Scoped cleanup
   deduplicates and validates IDs, ignores unrelated registry entries, and

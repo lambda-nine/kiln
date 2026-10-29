@@ -28,6 +28,7 @@ use nix::unistd::Pid;
 
 use crate::netlink::{self, Netlink, NftBatch};
 use crate::trace;
+use crate::validation;
 
 const BRIDGE: &str = "kiln0";
 const NETWORK: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 0);
@@ -91,6 +92,12 @@ impl Plan {
     /// Builds the plan from `--net` and `--allow`. Hostnames are resolved now,
     /// on the host; see ARCHITECTURE.md for why an egress proxy would be better.
     pub fn new(net: &str, allow: &[String]) -> Result<Self> {
+        if allow.len() > validation::MAX_ALLOWLIST_ENTRIES {
+            bail!(
+                "at most {} --allow entries are allowed",
+                validation::MAX_ALLOWLIST_ENTRIES
+            );
+        }
         let mode = match (net, allow.is_empty()) {
             ("none", true) => Mode::None,
             ("none", false) => Mode::Allow(allow.iter().map(|a| parse_allowed(a)).collect::<Result<_>>()?),
@@ -122,20 +129,13 @@ impl Plan {
 
 /// `host`, `host:port`, `1.2.3.4`, `1.2.3.0/24` or any of those with `:port`.
 fn parse_allowed(s: &str) -> Result<Allowed> {
-    let (dest, port) = match s.rsplit_once(':') {
-        Some((d, p)) => (d, Some(p.parse::<u16>().with_context(|| format!("invalid port in --allow {s:?}"))?)),
-        None => (s, None),
-    };
-    let literal = match dest.split_once('/') {
-        Some((ip, len)) => ip.parse::<Ipv4Addr>().is_ok() && len.parse::<u8>().is_ok_and(|l| l <= 32),
-        None => dest.parse::<Ipv4Addr>().is_ok(),
-    };
-    let addrs = if literal {
-        vec![dest.to_string()]
+    let entry = validation::parse_allowlist_entry(s)?;
+    let addrs = if entry.ipv4_literal {
+        vec![entry.destination.to_string()]
     } else {
-        let mut ips: Vec<String> = (dest, 0)
+        let mut ips: Vec<String> = (entry.destination, 0)
             .to_socket_addrs()
-            .with_context(|| format!("resolve {dest}"))?
+            .with_context(|| format!("resolve {}", entry.destination))?
             .filter_map(|a| match a.ip() {
                 IpAddr::V4(v4) => Some(v4.to_string()),
                 IpAddr::V6(_) => None,
@@ -144,12 +144,17 @@ fn parse_allowed(s: &str) -> Result<Allowed> {
         ips.sort();
         ips.dedup();
         if ips.is_empty() {
-            bail!("{dest} has no IPv4 address");
+            bail!("{} has no IPv4 address", entry.destination);
         }
         ips
     };
-    let host = (!literal).then(|| dest.to_ascii_lowercase());
-    Ok(Allowed { label: s.to_string(), host, addrs, port })
+    let host = (!entry.ipv4_literal).then(|| entry.destination.to_ascii_lowercase());
+    Ok(Allowed {
+        label: s.to_string(),
+        host,
+        addrs,
+        port: entry.port,
+    })
 }
 
 /// The host's real upstream resolvers. systemd-resolved's 127.0.0.53 only
@@ -699,7 +704,16 @@ mod tests {
     use anyhow::{Context, anyhow};
     use nix::errno::Errno;
 
-    use super::link_already_gone;
+    use super::{Plan, link_already_gone};
+    use crate::validation::MAX_ALLOWLIST_ENTRIES;
+
+    #[test]
+    fn allowlist_count_has_an_exact_boundary_before_resolution() {
+        let allowed = vec!["127.0.0.1".to_string(); MAX_ALLOWLIST_ENTRIES];
+        Plan::new("none", &allowed).unwrap();
+        let excessive = vec!["127.0.0.1".to_string(); MAX_ALLOWLIST_ENTRIES + 1];
+        assert!(Plan::new("none", &excessive).is_err());
+    }
 
     #[test]
     fn only_enodev_means_a_stale_link_is_already_gone() {

@@ -127,6 +127,12 @@ scripts/review-regressions.sh
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal
    (`journalctl -u kiln-dns -f`).
+   Image names are 1–128 ASCII alphanumeric/`-_.` bytes and do not begin with
+   `-` or `.`. At most 64 `--allow` entries are accepted; each is at most 260
+   ASCII bytes and has the form `HOST[:PORT]` or `IPv4[/PREFIX][:PORT]`; ports
+   are 1–65535 and prefixes 0–32. Read-only mode accepts at most 16 UTF-8 `--writable` paths of 1024
+   bytes, each absolute and canonical; `/`, control characters, and empty,
+   `.` or `..` components are rejected.
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous
@@ -223,6 +229,9 @@ keeping stdout/stderr byte-transparent. Use `kiln capabilities --protocol=1`
 for installed CLI capability/provenance, or append an ID to probe its PID 1.
 Create with `--require-exec-protocol=1`, then use
 `kiln exec --protocol=1 --status-fd=N --stdin-fd=I --stdout-fd=O --stderr-fd=E ID -- ARGV...`.
+Exec accepts 1–4096 arguments with a nonempty `argv[0]`, no NUL, and at most a
+1 MiB encoded body. Unicode, newlines, later empty arguments and flag-like
+values after `--` are preserved literally; no host shell interprets them.
 All four private descriptors are required; the status Unix socket stays in the
 host CLI, separate from command output and CLI diagnostics. See the exact
 [protocol and compatibility rules](docs/exec-protocol-v1.md). Protocol v1 is
