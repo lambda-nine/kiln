@@ -6,8 +6,9 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-cargo build --release
-sudo install -m 755 target/release/kiln /usr/local/bin/kiln
+build_dir=${CARGO_TARGET_DIR:-target}
+cargo build --locked --release --target-dir "$build_dir"
+sudo install -m 755 "$build_dir/release/kiln" /usr/local/bin/kiln
 for service in kiln-dns kiln-metrics; do
     sudo install -m 644 "scripts/$service.service" "/etc/systemd/system/$service.service"
 done

@@ -47,6 +47,7 @@ Apple silicon and uses Apple's Virtualization framework with virtiofs (macOS
 brew install lima
 limactl create --name=kiln lima.yaml && limactl start kiln
 limactl shell --workdir "$PWD" kiln      # now in Ubuntu 24.04
+# If set, CARGO_TARGET_DIR is inherited by scripts/install.sh for both build and install.
 sudo scripts/fetch-alpine.sh             # once: unpack Alpine as the "alpine" image
 sudo scripts/setup-storage.sh            # once: XFS with project quotas for --disk
 scripts/install.sh                       # once: /usr/local/bin/kiln + kiln-dns and kiln-metrics services

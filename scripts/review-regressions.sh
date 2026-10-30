@@ -5,6 +5,8 @@
 set -eu
 KILN=${KILN:-/usr/local/bin/kiln}
 
+sh scripts/install-regressions.sh
+
 sh scripts/toolchain-regressions.sh
 
 sh scripts/writable-regressions.sh

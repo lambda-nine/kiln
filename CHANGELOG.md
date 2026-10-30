@@ -5,6 +5,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Build installation with the locked dependency set and install from the active Cargo target directory, including inherited `CARGO_TARGET_DIR` paths.
+
 ### Runtime
 
 - Resolve writable directories through root-relative handles without following symlinks or procfs magic links; reject grants for the sandbox root.
