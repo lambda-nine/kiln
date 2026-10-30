@@ -10,9 +10,11 @@
 //! rename, truncate), not metadata: chmod and chown still work on files the
 //! sandbox owns. Real immutability would need a read-only mount.
 
-use std::fs::{self, File};
+use std::ffi::CString;
+use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -92,11 +94,16 @@ pub fn restrict_writes(writable: &[PathBuf]) -> Result<()> {
     // SAFETY: on success the syscall returns a new fd that we now own.
     let ruleset = unsafe { OwnedFd::from_raw_fd(Errno::result(fd).context("landlock_create_ruleset")? as i32) };
 
-    // Device files like /dev/null must stay writable, but no new devices.
-    allow(&ruleset, Path::new("/dev"), WRITE_FILE | TRUNCATE)?;
+    // Keep resolution anchored to the pivoted root and never follow image
+    // symlinks or procfs magic links, even in a parent component.
+    let root: OwnedFd = File::options().read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/").context("open sandbox root")?.into();
+    let dev = writable_dir(&root, Path::new("/dev"), false)?;
+    allow(&ruleset, &dev, Path::new("/dev"), WRITE_FILE | TRUNCATE)?;
     for dir in DEFAULT_WRITABLE.iter().map(Path::new).chain(writable.iter().map(PathBuf::as_path)) {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        allow(&ruleset, dir, all)?;
+        let handle = writable_dir(&root, dir, true)?;
+        allow(&ruleset, &handle, dir, all)?;
     }
 
     // SAFETY: plain syscall on a ruleset fd we own.
@@ -105,13 +112,41 @@ pub fn restrict_writes(writable: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn allow(ruleset: &OwnedFd, path: &Path, access: u64) -> Result<()> {
-    // O_PATH: we only need a handle naming the directory, not to read it.
-    let dir = File::options()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+/// Equivalent to a RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+/// RESOLVE_NO_MAGICLINKS openat2 walk, with mkdirat for missing components.
+/// Each opened parent is retained until its child is open; pathname swaps
+/// cannot redirect a later component outside the sandbox root.
+fn writable_dir(root: &OwnedFd, path: &Path, create: bool) -> Result<OwnedFd> {
+    crate::validation::validate_writable_paths(&[path.to_owned()])?;
+    let duplicate = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    let mut dir = unsafe { OwnedFd::from_raw_fd(Errno::result(duplicate).context("duplicate root fd")?) };
+    for component in path.as_os_str().as_bytes()[1..].split(|byte| *byte == b'/') {
+        let component = CString::new(component)?;
+        let open = || unsafe { libc::openat(dir.as_raw_fd(), component.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        let mut fd = open();
+        if fd < 0 && Errno::last() == Errno::ENOENT && create {
+            let made = unsafe { libc::mkdirat(dir.as_raw_fd(), component.as_ptr(), 0o755) };
+            if made < 0 && Errno::last() != Errno::EEXIST {
+                return Err(Errno::last()).with_context(|| format!("create writable {}", path.display()));
+            }
+            fd = open();
+        }
+        let child = unsafe { OwnedFd::from_raw_fd(Errno::result(fd)
+            .with_context(|| format!("open writable {} without symlinks", path.display()))?) };
+        let mut root_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        let mut child_stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        Errno::result(unsafe { libc::fstat(root.as_raw_fd(), &mut root_stat) }).context("stat sandbox root")?;
+        Errno::result(unsafe { libc::fstat(child.as_raw_fd(), &mut child_stat) }).context("stat writable directory")?;
+        if root_stat.st_dev == child_stat.st_dev && root_stat.st_ino == child_stat.st_ino {
+            bail!("writable {} resolves to the sandbox root", path.display());
+        }
+        dir = child;
+    }
+    Ok(dir)
+}
+
+fn allow(ruleset: &OwnedFd, dir: &OwnedFd, path: &Path, access: u64) -> Result<()> {
     let rule = PathBeneathAttr { allowed_access: access, parent_fd: dir.as_raw_fd() };
     // SAFETY: rule is a valid path_beneath_attr and both fds are open.
     let ret = unsafe {
@@ -125,4 +160,34 @@ fn allow(ruleset: &OwnedFd, path: &Path, access: u64) -> Result<()> {
     };
     Errno::result(ret).with_context(|| format!("landlock rule for {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn root_fd(path: &Path) -> OwnedFd {
+        File::options().read(true).custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(path).unwrap().into()
+    }
+
+    #[test]
+    fn writable_walk_refuses_symlinks_root_and_magic_links() {
+        let scratch = std::env::temp_dir().join(format!("kiln-writable-{}", std::process::id()));
+        fs::create_dir(&scratch).unwrap();
+        fs::create_dir(scratch.join("etc")).unwrap();
+        symlink("/", scratch.join("root-link")).unwrap();
+        symlink("/etc", scratch.join("etc-link")).unwrap();
+        let root = root_fd(&scratch);
+        for path in ["/", "/root-link", "/root-link/etc", "/etc-link", "/etc-link/must-not-create"] {
+            assert!(writable_dir(&root, Path::new(path), true).is_err(), "{path}");
+        }
+        writable_dir(&root, Path::new("/new/nested"), true).unwrap();
+        assert!(scratch.join("new/nested").is_dir());
+        let host_root = root_fd(Path::new("/"));
+        assert!(writable_dir(&host_root, Path::new("/proc/self/root"), false).is_err());
+        fs::remove_dir_all(scratch).unwrap();
+    }
 }

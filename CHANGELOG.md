@@ -7,6 +7,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Resolve writable directories through root-relative handles without following symlinks or procfs magic links; reject grants for the sandbox root.
+
 - Keep strict Clippy checks passing on Rust 1.88 and 1.99 using stable let chains and integer divisibility checks.
 
 - Align CLI and persistent-protocol validation with kilnd's request contract:

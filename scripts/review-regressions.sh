@@ -7,6 +7,8 @@ KILN=${KILN:-/usr/local/bin/kiln}
 
 sh scripts/toolchain-regressions.sh
 
+sh scripts/writable-regressions.sh
+
 echo "1. Firewall boundary"
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c '
     for p in 22 3000 9090 9840 9841; do

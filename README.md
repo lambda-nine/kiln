@@ -132,7 +132,9 @@ scripts/review-regressions.sh
    ASCII bytes and has the form `HOST[:PORT]` or `IPv4[/PREFIX][:PORT]`; ports
    are 1–65535 and prefixes 0–32. Read-only mode accepts at most 16 UTF-8 `--writable` paths of 1024
    bytes, each absolute and canonical; `/`, control characters, and empty,
-   `.` or `..` components are rejected.
+   `.` or `..` components are rejected. Writable directories are opened from
+   the sandbox root one component at a time without following symlinks or
+   procfs magic links, including image-controlled parent components.
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous
