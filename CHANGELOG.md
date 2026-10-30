@@ -9,6 +9,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Drain the busy listener before disconnect and through the transition to idle;
+  bound total finalization work, kill descendants before it, and retain observed
+  command outcomes when shutdown arrives after execution. Queued partial
+  headers cannot delay removal or become later execs.
+
 - Reserve the final sixteen TCP DNS admissions for sources with no outstanding
   permit, preserving the 256-stream bound under the 128-source partial-frame attack.
 

@@ -42,6 +42,11 @@ const MAX_BUSY_PENDING: usize = 16;
 /// Connections a running exec accepts per wake. The rest stay queued until the
 /// signalfd, the client and the bootstrap channel have been serviced again.
 const MAX_BUSY_ACCEPTS: usize = 8;
+/// Explicit kernel backlog and a finite finalization budget large enough to
+/// consume that backlog (Linux may queue one extra connection). Replenishing
+/// clients cannot make finalization wait for an empty listener indefinitely.
+const CONTROL_BACKLOG: i32 = 128;
+const MAX_BUSY_FINALIZE_BATCHES: usize = (CONTROL_BACKLOG as usize + 1).div_ceil(MAX_BUSY_ACCEPTS);
 
 /// The exec loop's fixed pollfds, ahead of the pending busy headers: signals,
 /// client, listener and bootstrap channel.
@@ -91,6 +96,9 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
     // Readiness may become stale before accept(), especially when signals and
     // connections wake the same poll. Never let PID 1 block in accept().
     listener.set_nonblocking(true).context("set control listener nonblocking")?;
+    // SAFETY: the descriptor is a live, bound Unix listener; listen updates its backlog.
+    Errno::result(unsafe { libc::listen(listener.as_raw_fd(), CONTROL_BACKLOG) })
+        .context("set control listener backlog")?;
     // Blocked signals queue up on the signalfd, so one poll() waits for them,
     // the client hanging up and new requests.
     let signals = SignalFd::with_flags(&all, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
@@ -334,6 +342,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     let _ = setpgid(leader, leader);
 
     let mut status = None;
+    let mut busy = BusyHeaders::new();
     // Every fallible parent operation after fork is inside this region. Its
     // result always crosses direct-child kill, cgroup drainage and reaping.
     let outcome = (|| -> Result<Outcome> {
@@ -343,9 +352,6 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
         }
         let mut bootstrap = BootstrapReader::new();
         let mut release = Some(release_tx);
-        // Local to this region: whichever way the exec ends, these streams and
-        // their descriptors close here and never reach idle or a later launch.
-        let mut busy = BusyHeaders::new();
         loop {
             bootstrap.advance(&joined_rx)?;
             if let Some((stage, errno)) = bootstrap.failure {
@@ -399,6 +405,22 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
     })();
     // An admission failure may leave the child outside the exec cgroup.
     if status.is_none() { let _ = kill(leader, Signal::SIGKILL); }
+    // Classify the queued backlog before cleanup. A new exec connecting while
+    // the old cgroup drains must remain eligible for immediate idle reuse.
+    // Keep classifier errors inside the same mandatory cleanup boundary.
+    let outcome = outcome.and_then(|outcome| {
+        // Kill descendants before any finalization work, even if local callers
+        // continuously refill the bounded listener backlog. finish() still
+        // confirms drainage and reaps before reporting or idle reuse.
+        scope.kill()?;
+        #[cfg(test)]
+        if injected("finalize-signal").is_some() {
+            kill(Pid::this(), Signal::SIGTERM).context("fixture finalization signal")?;
+        }
+        if matches!(outcome, Outcome::Completed(_) | Outcome::Disconnected) {
+            Ok(busy.finish_backlog(listener, signals)?.unwrap_or(outcome))
+        } else { Ok(outcome) }
+    });
     let outcome = match outcome {
         Ok(o) => o,
         Err(e) => {
@@ -710,15 +732,18 @@ fn interrupted(wait: &[libc::pollfd; 3], ready: &[libc::pollfd], busy: &mut Busy
     listener: &UnixListener, signals: &SignalFd) -> Result<Option<Outcome>> {
     poll_error(wait[0].revents, "signalfd")?;
     poll_error(wait[2].revents, "control listener")?;
-    let disconnected = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
-    if wait[1].revents & disconnected != 0 {
-        return Ok(Some(Outcome::Disconnected));
-    }
     let mut completed = busy.advance(ready, wait[2].revents & libc::POLLIN != 0, listener)?;
+    if let Some(outcome) = answer_busy_headers(&mut completed, signals)? { return Ok(Some(outcome)); }
+    // Ready headers, including removal, win over a simultaneous disconnect.
+    let disconnected = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    Ok((wait[1].revents & disconnected != 0).then_some(Outcome::Disconnected))
+}
+
+fn answer_busy_headers(completed: &mut Vec<(UnixStream, Header)>, signals: &SignalFd) -> Result<Option<Outcome>> {
     // Removal wins this pass before anything else is answered.
     let remover = completed.iter().position(|(_, header)| is_remove(header))
         .map(|at| completed.swap_remove(at).0);
-    for (stream, header) in completed {
+    for (stream, header) in completed.drain(..) {
         answer_busy_header(&stream, header, signals)?;
     }
     Ok(remover.map(Outcome::Removed))
@@ -739,6 +764,25 @@ struct BusyHeaders {
 
 impl BusyHeaders {
     fn new() -> Self { Self { pending: Vec::new() } }
+
+    /// Keep connections already queued at exec completion classified as busy,
+    /// even beyond one accept burst. Bound total work as well as each batch;
+    /// leave shutdown signals queued for idle so a completed command retains
+    /// its real outcome. New connections during cleanup are left for idle.
+    fn finish_backlog(&mut self, listener: &UnixListener, signals: &SignalFd) -> Result<Option<Outcome>> {
+        for _ in 0..MAX_BUSY_FINALIZE_BATCHES {
+            let ready = [libc::pollfd { fd: -1, events: 0, revents: libc::POLLIN }; MAX_BUSY_PENDING];
+            let mut completed = self.advance(&ready, true, listener)?;
+            // Incomplete requests cannot become an exec in the next idle turn.
+            self.pending.clear();
+            if let Some(outcome) = answer_busy_headers(&mut completed, signals)? { return Ok(Some(outcome)); }
+            let mut wait = [libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+            poll(&mut wait, 0)?;
+            poll_error(wait[0].revents, "control listener")?;
+            if wait[0].revents & libc::POLLIN == 0 { return Ok(None); }
+        }
+        Ok(None)
+    }
 
     fn watch(&self, slots: &mut [libc::pollfd]) {
         for (slot, entry) in slots.iter_mut().zip(&self.pending) {
@@ -1180,6 +1224,45 @@ mod tests {
         for partial in &partials { assert_eof(partial, BUSY_PROMPT, "partial header carried into idle"); }
         drop((out, err));
         assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
+    }
+
+    #[test]
+    fn shutdown_during_finalization_preserves_completed_side_effects() {
+        let mut server = Server::start();
+        fs::write(server.root.join("inject"), "finalize-signal 15").unwrap();
+        let marker = server.root.join("side-effect");
+        let command = format!("echo committed > {}; exit 37", marker.display());
+        let (outcome, _, _) = server.exec(&["/bin/sh", "-c", &command]);
+        assert_eq!(outcome, ExecOutcome::command(CommandStatus::Exited(37)));
+        assert_eq!(fs::read_to_string(marker).unwrap(), "committed\n");
+        assert!(server.child.wait().unwrap().success(), "idle shutdown did not end the fixture");
+    }
+
+    #[test]
+    fn disconnect_drains_backlog_beyond_one_accept_burst() {
+        let mut server = Server::start();
+        let (active, _out, _err, _pid) = server.start_sleeper();
+        let init = Pid::from_raw(server.child.id() as i32);
+        kill(init, Signal::SIGSTOP).unwrap();
+        let partials: Vec<_> = (0..25).map(|_| server.partial_header()).collect();
+        let marker = server.root.join("must-not-execute");
+        let command = format!("echo bad > {}", marker.display());
+        let (mut competing, _stdout, _stderr) = server.start_exec(&["/bin/sh", "-c", &command]);
+        let mut remover = server.connect();
+        remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        drop(active);
+        let start = Instant::now();
+        kill(init, Signal::SIGCONT).unwrap();
+        let Frame::Outcome(o) = protocol::read_reply(&mut competing, Some(start + BUSY_PROMPT)).unwrap()
+            else { panic!("missing busy outcome") };
+        assert_eq!(o.kind, FailureKind::Busy);
+        remover.set_read_timeout(Some(BUSY_PROMPT)).unwrap();
+        let mut status = [0u8; 4]; remover.read_exact(&mut status).unwrap();
+        assert_eq!(i32::from_ne_bytes(status), 0);
+        assert!(start.elapsed() < BUSY_PROMPT);
+        assert!(!marker.exists(), "a queued busy exec crossed into idle");
+        for partial in &partials { assert_eof(partial, BUSY_PROMPT, "queued partial outlived removal"); }
+        assert!(server.child.wait().unwrap().success());
     }
 
     #[test]

@@ -260,8 +260,17 @@ most eight new connections per wake and evicts the oldest incomplete header
 when the table is full. Headers advance only on nonblocking reads; each keeps
 one absolute two-second deadline. A complete remove is selected before other
 completed headers are answered, regardless of older partial clients. Competing
-exec bodies are never read or allocated. Pending streams and received
-descriptors close when the active exec ends; they cannot turn into later execs.
+exec bodies are never read or allocated. PID 1 initiates cgroup-wide killing before finalization, then consumes at most
+seventeen batches of eight queued connections before waiting for drainage and
+reaping. The listener's explicit backlog is 128; the finalization budget covers
+that initial queue, including Linux's extra slot, without depending on a
+continuously replenished listener becoming empty. Partial headers close without
+waiting. Pending shutdown signals remain queued for idle, so a completed
+command retains its observed outcome and confirmed cleanup instead of being
+reported as never started. Pending streams and descriptors cannot turn into
+later execs. New connections arriving during cleanup remain eligible for
+immediate idle reuse; continuous host-side overload can still refuse requests.
+
 
 ### Persistent-create certainty
 

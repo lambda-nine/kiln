@@ -161,11 +161,16 @@ impl ExecCgroup {
         self.procs.write_all_at(b"0", 0).context("join exec cgroup")
     }
 
+    /// Starts cgroup-wide cancellation without waiting for drainage.
+    pub fn kill(&self) -> Result<()> {
+        self.kill.write_all_at(b"1", 0).context("write exec cgroup.kill")
+    }
+
     /// SIGKILLs everything in the exec cgroup, then waits until it's empty.
     /// The kernel handles processes forking while it kills, so once
     /// `populated` reads 0 nothing the exec started is left.
     pub fn kill_and_wait_empty(&self) -> Result<()> {
-        self.kill.write_all_at(b"1", 0).context("write exec cgroup.kill")?;
+        self.kill()?;
         loop {
             if !self.populated()? {
                 return Ok(());

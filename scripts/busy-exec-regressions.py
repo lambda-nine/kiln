@@ -3,7 +3,10 @@
 import array
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+import os
+import signal
 import socket
+import select
 import struct
 import subprocess
 import sys
@@ -236,8 +239,124 @@ def partial_rights_expire():
     print(f"PASS: partial header's descriptors closed at its deadline ({elapsed:.2f}s)")
 
 
+def disconnect_with_queued_removal(count):
+    # Round-three PoC: stop PID 1 so disconnect and listener readability arrive
+    # in the same poll pass, with a partial frame before the complete removal.
+    with sandbox() as (identifier, clients, rights):
+        active = start_active(identifier, clients, rights)
+        pid = int((run_dir(identifier) / "init.pid").read_text())
+        stopped = False
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            stopped = True
+            partials = []
+            for _ in range(count):
+                partial = connect(identifier)
+                clients.append(partial)
+                partials.append(partial)
+                partial.sendmsg([b"\x04"], rights)
+            remover = connect(identifier)
+            clients.append(remover)
+            remover.settimeout(PROMPT)
+            remover.sendall(b"\x02\0\0\0\0\0\0\0")
+            active.close()
+            start = time.monotonic()
+            os.kill(pid, signal.SIGCONT)
+            stopped = False
+            assert struct.unpack("=i", exact(remover, 4))[0] == 0
+            elapsed = time.monotonic() - start
+            assert elapsed < PROMPT, f"busy-to-idle backlog delayed removal {elapsed:.2f}s"
+            wait_gone(identifier)
+            for partial in partials:
+                assert_closed(partial, "busy-to-idle partial stream survived removal")
+        finally:
+            if stopped:
+                os.kill(pid, signal.SIGCONT)
+    print(f"PASS: simultaneous disconnect and {count} queued partials/remove ({elapsed:.3f}s)")
+
+
+def continuous_connectors_cannot_postpone_descendant_cleanup():
+    flood_code = r'''
+import socket, sys, time
+end = time.monotonic() + 6
+ready = False
+attempts = 0
+while time.monotonic() < end:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(0.05)
+        try:
+            stream.connect(sys.argv[1])
+            stream.sendall(b"\x04")
+            attempts += 1
+            if not ready:
+                print("ready", flush=True)
+                sys.stdin.buffer.read(1)  # Every worker gets one slot before flooding.
+                ready = True
+        except OSError:
+            pass
+print(attempts, flush=True)
+'''
+    with sandbox() as (identifier, clients, rights):
+        active = connect(identifier)
+        clients.append(active)
+        args = [b"sh", b"-c", b"setsid sh -c 'echo ready >/workspace/flood-descendant; exec sleep 30' & exec sleep 30"]
+        body = struct.pack("<I", len(args)) + b"".join(struct.pack("<I", len(arg)) + arg for arg in args)
+        active.sendmsg([b"\x04\0\0\0" + struct.pack("<I", len(body))], rights)
+        active.sendall(body)
+        deadline = time.monotonic() + 5
+        while not (run_dir(identifier) / "upper/workspace/flood-descendant").exists():
+            assert time.monotonic() < deadline, "setsid descendant did not start"
+            time.sleep(0.01)
+        pid = int((run_dir(identifier) / "init.pid").read_text())
+        procs = Path(f"/sys/fs/cgroup/kiln/{identifier}/exec/cgroup.procs")
+        assert len(procs.read_text().split()) >= 2, "no descendant held for cleanup"
+        workers = []
+        stopped = False
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            stopped = True
+            for _ in range(64):
+                partial = connect(identifier)
+                clients.append(partial)
+                partial.sendall(b"\x04")
+            for _ in range(4):
+                workers.append(subprocess.Popen([sys.executable, "-I", "-c", flood_code,
+                    str(run_dir(identifier) / "control.sock")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            for worker in workers:
+                readable, _, _ = select.select([worker.stdout], [], [], 3)
+                assert readable and worker.stdout.readline().strip() == b"ready", "flood did not start"
+            for worker in workers:
+                worker.stdin.write(b"g")
+                worker.stdin.close()
+                worker.stdin = None
+            # The stopped listener fills while four independent connectors keep
+            # replacing accepted sockets. Cancellation must not await quiescence.
+            time.sleep(0.1)
+            active.close()
+            start = time.monotonic()
+            os.kill(pid, signal.SIGCONT)
+            stopped = False
+            children = Path(f"/proc/{pid}/task/{pid}/children")
+            while procs.read_text().strip() or children.read_text().strip():
+                assert time.monotonic() - start < PROMPT, "continuous connections postponed descendant cleanup"
+                time.sleep(0.005)
+            elapsed = time.monotonic() - start
+            assert all(worker.poll() is None for worker in workers), "flood ended before cleanup"
+            print(f"PASS: descendants drained during four continuous connector floods ({elapsed:.3f}s)")
+        finally:
+            if stopped:
+                os.kill(pid, signal.SIGCONT)
+            for worker in workers:
+                worker.terminate()
+            for worker in workers:
+                worker.communicate(timeout=3)
+
+
 for op in (1, 4):
     header_refusal(op)
 partial_then_remove()
 active_disconnect()
+for count in (1, 9, 25, 128):
+    disconnect_with_queued_removal(count)
 partial_rights_expire()
+continuous_connectors_cannot_postpone_descendant_cleanup()

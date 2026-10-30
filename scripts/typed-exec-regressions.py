@@ -96,7 +96,7 @@ def machine(identifier, args, version=1, broken_status=None):
         return child.returncode, bytes(result), out.read(), err.read(), cli_err
 
 
-def raw_exec(identifier, args):
+def raw_exec(identifier, args, allow_early_close=False):
     client = socket.socket(socket.AF_UNIX)
     client.settimeout(5)
     client.connect(f"/var/lib/kiln/runs/{identifier}/control.sock")
@@ -106,7 +106,15 @@ def raw_exec(identifier, args):
         payload += struct.pack("<I", len(arg)) + arg
     with open("/dev/null", "r+b") as null:
         rights = array.array("i", [null.fileno()] * 3)
-        client.sendmsg([struct.pack("<B3xI", 4, len(payload))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+        try:
+            client.sendmsg([struct.pack("<B3xI", 4, len(payload))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+        except (BrokenPipeError, ConnectionResetError):
+            # Cancellation-only peers may race the closing of an incomplete
+            # busy header. Response-bearing calls still require valid framing.
+            if not allow_early_close:
+                client.close()
+                raise
+            return client
     try:
         client.sendall(payload)
     except (BrokenPipeError, ConnectionResetError):
@@ -182,8 +190,8 @@ def run():
         # 40-byte reply unread does not force backpressure; the isolated Rust
         # protocol fixture fills the send buffer to EAGAIN deterministically.
         for _ in range(10):
-            raw_exec(identifier, ["true"]).close()
-        peer = raw_exec(identifier, ["true"])
+            raw_exec(identifier, ["true"], allow_early_close=True).close()
+        peer = raw_exec(identifier, ["true"], allow_early_close=True)
         time.sleep(0.1)
         assert outcome(machine(identifier, ["true"])[1])[4] == 0
         peer.close()
