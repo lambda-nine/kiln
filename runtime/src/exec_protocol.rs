@@ -14,6 +14,8 @@ pub const MAX_DIAGNOSTIC: usize = 2048;
 pub const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 // Assigned in the order specified by the protocol, not package versions.
 pub const REQUIRED_FEATURES: u32 = 0x0f;
+/// Persistent-create failures before allocation have the documented exit 124.
+pub const CREATE_PREFLIGHT_FEATURE: u32 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandStatus {
@@ -121,7 +123,7 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn current() -> Self {
-        Self { features: REQUIRED_FEATURES, control_version: VERSION, status_fd_version: VERSION,
+        Self { features: REQUIRED_FEATURES | CREATE_PREFLIGHT_FEATURE, control_version: VERSION, status_fd_version: VERSION,
             package: env!("CARGO_PKG_VERSION").into(), provenance: env!("KILN_GIT").into() }
     }
 
@@ -327,6 +329,16 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn current_build_advertises_create_preflight_certainty_additively() {
+        let caps = Capabilities::current();
+        caps.require_v1().unwrap();
+        assert_eq!(caps.features & CREATE_PREFLIGHT_FEATURE, CREATE_PREFLIGHT_FEATURE);
+        let mut execution_only = caps;
+        execution_only.features = REQUIRED_FEATURES;
+        execution_only.require_v1().unwrap();
+    }
 
     #[test]
     fn golden_exit_125() {

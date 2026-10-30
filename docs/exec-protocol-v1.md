@@ -129,6 +129,18 @@ bits and both versions equal to 1. Package and provenance are diagnostic
 evidence only. PID 1 returns its own build information, which can differ from
 the installed CLI after an upgrade.
 
+Bit 4 (`0x00000010`) advertises **persistent-create preflight certainty** in
+this build. It is additive to the four required exec bits and does not change
+exec protocol v1 or older PID 1 compatibility. Machine managers that rely on
+create certainty must require this bit from the installed CLI before create.
+`kiln create` returns **124**, with empty stdout, only when validation, missing
+image or another preflight failure occurred before `container::new_id` and
+before any sandbox allocation. CLI syntax/configuration failures are included;
+help/version keep exit 0. Success still prints exactly the new sandbox ID.
+Every other nonzero exit, signal, timeout, missing result or malformed output
+is allocation-ambiguous. Human stderr text is never an absence signal. This
+contract applies only to persistent `create`, not `run` or `exec`.
+
 Golden capabilities for package `0.1.0` and provenance `git test`:
 
 ```text

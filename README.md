@@ -186,7 +186,12 @@ scripts/review-regressions.sh
     `sudo sed -n 's/^GF_SECURITY_ADMIN_PASSWORD=//p' /etc/grafana/kiln-admin.env`.
 
 11. **Persistent sandboxes** (done): `kiln create` starts a detached host shim
-    and a locked-down PID 1, prints the sandbox ID, and returns. `kiln exec`
+    and a locked-down PID 1, prints the sandbox ID, and returns. Persistent
+    `create` exits 124 with empty stdout only when validation, image lookup or
+    another preflight step failed before any ID or resource allocation. Every
+    other failure (including a signal or lost result) leaves allocation
+    ambiguous. Machine callers must first require capability bit `0x10`;
+    stderr is diagnostic, never proof of absence. `kiln exec`
     passes redirected standard streams to PID 1 and runs each command with the
     sandbox's existing namespaces, cgroup limits, seccomp filter and Landlock
     policy. It refuses terminal descriptors until kiln has a controlled PTY

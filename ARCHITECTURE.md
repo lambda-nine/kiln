@@ -259,3 +259,15 @@ one absolute two-second deadline. A complete remove is selected before other
 completed headers are answered, regardless of older partial clients. Competing
 exec bodies are never read or allocated. Pending streams and received
 descriptors close when the active exec ends; they cannot turn into later execs.
+
+### Persistent-create certainty
+
+Global CLI capabilities add bit 4 (`0x10`) for persistent-create preflight
+certainty. `kiln create` exits 124 with empty stdout only for CLI/config
+validation, image validation or other errors before `container::new_id`.
+No sandbox ID, shim, cgroup, run directory, network lease or quota allocation
+has been attempted. The explicit error marker is applied only on that side
+of the boundary; errors after `new_id`, signals and missing/malformed results
+remain ambiguous even if cleanup appears to have succeeded. A caller must
+negotiate the capability before trusting the direct child's exit 124. Other
+commands do not acquire this exit contract.

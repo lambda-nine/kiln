@@ -164,8 +164,26 @@ struct CreateArgs {
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    if let Err(error) = &result && error.is::<persistent::CreatePreflightFailure>() {
+        eprintln!("Error: {error:?}");
+        std::process::exit(persistent::CREATE_PREFLIGHT_EXIT);
+    }
+    result
+}
+
+fn run() -> Result<()> {
     trace::start();
-    match Cli::parse().command {
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        // Clap has not dispatched any command. Preserve normal help/version
+        // statuses; persistent-create syntax errors are definite preflight.
+        if error.exit_code() != 0 && std::env::args_os().nth(1).is_some_and(|a| a == "create") {
+            let _ = error.print();
+            std::process::exit(persistent::CREATE_PREFLIGHT_EXIT);
+        }
+        error.exit()
+    });
+    match cli.command {
         Command::Run(args) => {
             validate_writable(&args.writable)?;
             let cfg = container::Config {
@@ -187,26 +205,28 @@ fn main() -> Result<()> {
             std::process::exit(container::run(&cfg)?);
         }
         Command::Create(args) => {
-            if let Some(version) = args.require_exec_protocol {
-                anyhow::ensure!(version == exec_protocol::VERSION, "unsupported persistent-exec protocol {version}");
-            }
-            validate_writable(&args.writable)?;
-            let cfg = container::Config {
-                limits: cgroup::Limits {
-                    memory: parse_size(&args.memory)?,
-                    cpus: parse_cpus(&args.cpus)?,
-                    pids: parse_max(&args.pids)?,
-                },
-                disk: parse_size(&args.disk)?,
-                net: net::Plan::new(&args.net, &args.allow)?,
-                hostname: args.hostname,
-                image: args.image,
-                keep: true,
-                read_only: args.read_only,
-                writable: args.writable,
-                stats: false,
-                cmd: Vec::new(),
-            };
+            let cfg = persistent::before_allocation((|| -> Result<container::Config> {
+                if let Some(version) = args.require_exec_protocol {
+                    anyhow::ensure!(version == exec_protocol::VERSION, "unsupported persistent-exec protocol {version}");
+                }
+                validate_writable(&args.writable)?;
+                Ok(container::Config {
+                    limits: cgroup::Limits {
+                        memory: parse_size(&args.memory)?,
+                        cpus: parse_cpus(&args.cpus)?,
+                        pids: parse_max(&args.pids)?,
+                    },
+                    disk: parse_size(&args.disk)?,
+                    net: net::Plan::new(&args.net, &args.allow)?,
+                    hostname: args.hostname,
+                    image: args.image,
+                    keep: true,
+                    read_only: args.read_only,
+                    writable: args.writable,
+                    stats: false,
+                    cmd: Vec::new(),
+                })
+            })())?;
             println!("{}", persistent::create(&cfg)?);
             Ok(())
         }
@@ -325,5 +345,31 @@ mod tests {
             assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{version:?}");
             assert!(state == "clean" || state == "dirty", "{version:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod create_certainty_tests {
+    use super::*;
+
+    #[test]
+    fn preflight_errors_are_typed_but_other_failures_are_not() {
+        let error = persistent::before_allocation::<()>(Err(anyhow::anyhow!("invalid config"))).unwrap_err();
+        assert!(error.is::<persistent::CreatePreflightFailure>());
+        assert!(!anyhow::anyhow!("shim failed after allocation").is::<persistent::CreatePreflightFailure>());
+    }
+
+    #[test]
+    fn missing_image_is_rejected_before_id_or_resource_creation() {
+        let cfg = container::Config {
+            limits: cgroup::Limits { memory: Some(64 * 1024 * 1024), cpus: Some(1.0), pids: Some(16) },
+            disk: Some(16 * 1024 * 1024),
+            net: net::Plan::new("none", &[]).unwrap(),
+            hostname: "kiln".into(), image: "round2-missing-image-unit-fixture".into(),
+            keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(),
+        };
+        let error = persistent::create(&cfg).unwrap_err();
+        assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
+        assert!(format!("{error:#}").contains("image"));
     }
 }

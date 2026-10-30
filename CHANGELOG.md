@@ -9,6 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Advertise persistent-create preflight certainty (capability `0x10`): exit
+  124 with empty stdout proves failure before `new_id` or any allocation;
+  every other create failure remains ambiguous for machine callers.
+
 - Read busy headers incrementally beside active-client, signal and listener
   events; bound pending headers and prioritize complete removal over partial
   clients without delaying disconnect cleanup.

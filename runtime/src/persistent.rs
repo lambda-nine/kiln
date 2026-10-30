@@ -189,8 +189,26 @@ enum RecvChunk {
     },
 }
 
+/// Only this error, emitted before `new_id`, proves a persistent create made
+/// no sandbox allocation. All failures after that boundary remain ambiguous.
+#[derive(Debug)]
+pub struct CreatePreflightFailure;
+
+impl std::fmt::Display for CreatePreflightFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("persistent create rejected before allocation")
+    }
+}
+impl std::error::Error for CreatePreflightFailure {}
+
+pub const CREATE_PREFLIGHT_EXIT: i32 = 124;
+
+pub fn before_allocation<T>(result: Result<T>) -> Result<T> {
+    result.context(CreatePreflightFailure)
+}
+
 pub fn create(cfg: &Config) -> Result<String> {
-    container::validate_image(cfg)?;
+    before_allocation(container::validate_image(cfg))?;
     let id = container::new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     // SAFETY: the CLI is single-threaded here.

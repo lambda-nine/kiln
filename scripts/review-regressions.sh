@@ -13,6 +13,8 @@ sh scripts/writable-regressions.sh
 
 sh scripts/private-egress-regressions.sh
 
+sh scripts/create-certainty-regressions.sh
+
 sh scripts/gc-regressions.sh
 
 echo "1. Firewall boundary"
