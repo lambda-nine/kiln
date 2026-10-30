@@ -42,6 +42,9 @@ const TCP_PER_SOURCE: usize = 2;
 /// TCP streams held across all sources: partial, queued and running. Reading
 /// them costs at most one buffer of `MAX_TCP_MESSAGE` each.
 const TCP_MAX_STREAMS: usize = 256;
+/// Only a source with no outstanding stream may use the final slots. Existing
+/// holders cannot fill the global cap with their second partial frame.
+const TCP_NEW_SOURCE_RESERVE: usize = 16;
 /// Connections accepted per reactor turn, so partial frames still get read.
 const ACCEPT_BURST: usize = 32;
 const MAX_TCP_MESSAGE: usize = 4096;
@@ -243,9 +246,10 @@ fn admit_tcp(sources: &Sources, source: IpAddr) -> Option<TcpPermit> {
     let mut guard = sources.lock().unwrap_or_else(|e| e.into_inner());
     let counts = &mut *guard;
     if counts.total >= TCP_MAX_STREAMS { return None; }
-    let count = counts.by_source.entry(source).or_default();
-    if *count >= TCP_PER_SOURCE { return None; }
-    *count += 1;
+    let count = counts.by_source.get(&source).copied().unwrap_or(0);
+    if count >= TCP_PER_SOURCE { return None; }
+    if count != 0 && counts.total >= TCP_MAX_STREAMS - TCP_NEW_SOURCE_RESERVE { return None; }
+    counts.by_source.insert(source, count + 1);
     counts.total += 1;
     Some(TcpPermit { sources: Arc::clone(sources), source })
 }
@@ -703,13 +707,40 @@ mod tests {
     fn tcp_permits_have_a_global_bound() {
         let sources = Sources::default();
         let permits: Vec<_> = (0..TCP_MAX_STREAMS)
-            .map(|i| admit_tcp(&sources, source(i / TCP_PER_SOURCE)).unwrap())
+            .map(|i| admit_tcp(&sources, source(i)).unwrap())
             .collect();
         let latecomer = source(TCP_MAX_STREAMS);
         assert!(admit_tcp(&sources, latecomer).is_none());
         assert!(!sources.lock().unwrap().by_source.contains_key(&latecomer));
         drop(permits);
         assert!(admit_tcp(&sources, latecomer).is_some());
+    }
+
+    #[test]
+    fn tcp_reserves_capacity_for_sources_without_a_permit() {
+        let sources = Sources::default();
+        let mut permits = Vec::new();
+        // Round-three PoC: 128 identities each try to hold two partial frames.
+        for i in 0..128 {
+            for _ in 0..TCP_PER_SOURCE {
+                if let Some(permit) = admit_tcp(&sources, source(i)) { permits.push(permit); }
+            }
+        }
+        assert_eq!(permits.len(), 248);
+        assert!(admit_tcp(&sources, source(127)).is_none());
+        for i in 128..136 {
+            permits.push(admit_tcp(&sources, source(i)).expect("new source uses reserved slot"));
+            assert!(admit_tcp(&sources, source(i)).is_none());
+        }
+        assert_eq!(sources.lock().unwrap().total, TCP_MAX_STREAMS);
+        assert!(admit_tcp(&sources, source(136)).is_none());
+        assert!(!sources.lock().unwrap().by_source.contains_key(&source(136)));
+        drop(permits);
+        let counts = sources.lock().unwrap();
+        assert!(counts.by_source.is_empty());
+        assert_eq!(counts.total, 0);
+        drop(counts);
+        assert!(admit_tcp(&sources, source(127)).is_some());
     }
 
     fn source(i: usize) -> IpAddr {

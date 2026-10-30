@@ -58,6 +58,7 @@ echo "DNS tasks: before=$before peak=$peak"
 
 sudo python3 -I scripts/dns-regressions.py "$KILN"
 sudo python3 -I scripts/dns-fairness-regressions.py "$KILN"
+sudo python3 -I scripts/dns-reserve-regressions.py "$KILN"
 
 echo "3. Inode quota"
 created=$(

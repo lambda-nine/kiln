@@ -240,7 +240,10 @@ The DNS forwarder reserves twelve UDP workers and four TCP workers in separate
 pools. Both queues schedule by source IP in round-robin order, with at most one
 running query per source. UDP permits two queued/running queries per source
 and 256 queued globally. TCP has at most 256 streams globally and two per
-source across partial framing, queued queries and running work. A single
+source across partial framing, queued queries and running work. The final
+sixteen slots admit only a source with no outstanding permit, preventing 128
+sources from filling the cap with two streams each. Enough distinct first
+streams can still fill all 256 slots; the reserve is finite. A single
 nonblocking reactor reads every partial stream; a slow prefix or body consumes
 no worker. Expired streams and queued jobs release their permits. A TCP
 frame's prefix and body share one absolute three-second deadline from accept,

@@ -9,6 +9,9 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Reserve the final sixteen TCP DNS admissions for sources with no outstanding
+  permit, preserving the 256-stream bound under the 128-source partial-frame attack.
+
 - Run the DNS and metrics listeners as separate system users, with only DNS
   retaining bind-service capability. Split bridge setup and privileged quota/
   nft collection into hardened jobs with no listeners; expose snapshot freshness.
