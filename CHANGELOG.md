@@ -5,6 +5,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Document the installed host-service users/capabilities, privileged jobs and
+  metrics freshness contract; record finite DNS reserve and busy-to-idle
+  admission guarantees with their end-to-end regressions.
+
 - Build installation with the locked dependency set and install from the active Cargo target directory, including inherited `CARGO_TARGET_DIR` paths.
 
 ### Runtime

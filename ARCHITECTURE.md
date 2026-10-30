@@ -301,5 +301,12 @@ to open 0700 run directories. Its filesystem writes are restricted to the
 snapshot directory and its syscall filter excludes mounting. The HTTP service
 only reads the snapshot; `kiln_metrics_snapshot_fresh` becomes zero and sandbox
 samples are omitted if collection is missing or more than ten seconds old.
+The collector disables systemd start limiting so its one-second successes do
+not exhaust the default start budget. HTTP only wants the initial collection:
+a failed first job leaves the listener serving freshness zero, and later timer
+successes restore samples without restarting it. Installation migrates existing
+root-only policy files before restarting DNS, including live sandboxes created
+under umask 077. DNS permits the optional resolved runtime directory to be
+absent so `/etc/resolv.conf` remains a working fallback.
 Direct `kiln metrics` without `--snapshot`, and `kiln stats`, still read the
 kernel synchronously with the caller's privileges.

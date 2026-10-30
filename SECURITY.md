@@ -86,7 +86,15 @@ relying on it:
   messages and descriptors attached to a body are rejected; received
   descriptors are owned immediately and close on every error path. A complete
   request may use `shutdown(SHUT_WR)` while reading its response. A full socket
-  close remains cancellation for an active exec.
+  close remains cancellation for an active exec. Ready busy headers are
+  advanced before handling disconnect; before exec cgroup drainage, queued
+  listener connections retain busy classification through at most seventeen
+  batches of eight before returning idle. Cgroup-wide killing starts before
+  finalization, so continuous connectors cannot postpone descendant cleanup.
+  Shutdown signals remain queued for idle and cannot relabel completed side
+  effects as never started. Partial frames cannot take an idle receive deadline
+  ahead of queued removal or become new execs at that transition. Connections
+  arriving during cleanup remain eligible for immediate idle reuse.
 - **Machine exec status.** Persistent-exec protocol v1 uses bounded typed
   replies and an anonymous private Unix status socket owned only by the host
   CLI. Only three explicit workload descriptors cross into PID 1; bootstrap
@@ -108,9 +116,29 @@ relying on it:
   that allocates no controlling terminal for fully untrusted one-shot
   workloads. Persistent `kiln exec` refuses terminal descriptors until kiln
   has a controlled PTY mode.
-- **Rootful host services.** `kiln` runs as root, and so do the `kiln dns` and
-  `kiln metrics` services. The optional Prometheus and Grafana stack also runs
-  on the host. Bugs in any of them are host bugs.
+- **Host service privilege separation.** Sandbox lifecycle commands still need
+  root. Installed `kiln dns` and `kiln metrics` listeners run as distinct system
+  users: DNS retains only `CAP_NET_BIND_SERVICE`; the metrics HTTP service has
+  no capabilities. Their units use `NoNewPrivileges`, a read-only host
+  filesystem, protected home/kernel/cgroups, private temporary files, address
+  family restrictions and system-call filters. Root owns their read-only
+  policy and snapshot inputs, and sandbox control directories remain 0700.
+  Bridge/firewall initialization is a separate root job with `CAP_NET_ADMIN`.
+  Metrics collection is a short-lived root job with `CAP_SYS_ADMIN` for XFS
+  project-quota reads and `CAP_NET_ADMIN` for nft reads; root ownership opens
+  run directories without making them public. These jobs have no listeners,
+  fixed operations and restricted writable paths; the collector's syscall
+  filter excludes mounting. Their capabilities are still broad host privileges,
+  so compromising a collector or setup job remains a host risk. Installed
+  metrics can lag by a collection interval; missing or older-than-ten-second
+  snapshots omit sandbox samples and expose `kiln_metrics_snapshot_fresh 0`.
+  The optional Prometheus and Grafana stack also remains on the host.
+- **Shared DNS capacity.** TCP has a 256-stream global bound, a two-stream
+  per-source bound and an absolute three-second framing deadline. The final
+  sixteen slots admit only a source with no outstanding permit. This prevents
+  128 sources each holding two partial frames from exhausting admission, but
+  enough distinct first streams can fill the finite reserve. UDP workers are
+  separate. Global overload and upstream failure can still deny service.
 - **One supported environment.** kiln is developed and dogfooded on Ubuntu
   24.04 with Linux 6.8 or newer, in the Lima VM described in the README. CI
   builds and runs unprivileged tests on Ubuntu 24.04 x86_64. Other

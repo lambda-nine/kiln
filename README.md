@@ -22,9 +22,11 @@ Known limits:
   are blocked, but untrusted interactive code can still read input, change
   terminal settings and print escape sequences. Redirecting stdio alone does
   not remove `/dev/tty`; see [SECURITY.md](SECURITY.md).
-- kiln runs as root, and so do its host services, `kiln dns` and
-  `kiln metrics`. The optional Prometheus and Grafana stack also runs on the
-  host. A bug in any of them is a bug on the host.
+- Sandbox lifecycle commands need root. Installed DNS and metrics listeners
+  use separate unprivileged accounts; DNS has only `CAP_NET_BIND_SERVICE` and
+  metrics has no capabilities. Bridge setup and quota/nft collection still
+  need privileged jobs with no listeners, described below. These and the
+  optional Prometheus/Grafana stack remain host processes.
 - The supported and dogfooded environment is Ubuntu 24.04 with Linux 6.8 or
   newer, in the Lima VM below. Other distributions and kernels are untested.
 
@@ -76,6 +78,37 @@ published SHA-256, and verifies the detached release signature against the
 pinned Alpine release key. It builds the image in a same-filesystem staging
 directory and atomically exchanges it with the installed image.
 
+### Installed host services
+
+`scripts/install.sh` creates `kiln-dns` and `kiln-metrics` system users with no
+login or home directory, repairs existing DNS policy permissions for upgrades,
+and installs these systemd units:
+
+| Unit | User | Capabilities | Role |
+|---|---|---|---|
+| `kiln-dns.service` | `kiln-dns` | `CAP_NET_BIND_SERVICE` | UDP/TCP on 10.88.0.1:53; read-only DNS policies |
+| `kiln-metrics.service` | `kiln-metrics` | none | HTTP on 127.0.0.1:9840; read-only metrics snapshot |
+| `kiln-network-setup.service` | root | `CAP_NET_ADMIN` | One-shot bridge, forwarding and nft setup before DNS |
+| `kiln-metrics-collect.service` | root | `CAP_SYS_ADMIN`, `CAP_NET_ADMIN` | One-shot XFS quota, nft, cgroup and veth collection |
+
+Both listeners use `NoNewPrivileges`, `ProtectSystem=strict`, protected home,
+kernel and cgroup paths, private temporary files, restricted address families
+and a system-call filter. Neither can replace policies or snapshots, or access
+sandbox control directories. DNS no longer initializes the host network itself;
+start it through systemd so its setup dependency runs first.
+
+The collector timer refreshes an atomic, root-owned snapshot every second.
+XFS project-quota reads require `CAP_SYS_ADMIN`, nft reads require
+`CAP_NET_ADMIN`, and 0700 run directories require their root owner. Keeping
+this job separate avoids granting these privileges to HTTP clients. Its writes
+are confined to `/run/kiln-metrics`; its system-call filter excludes mounting.
+Metrics can lag collection by about one second. Missing snapshots, timestamps
+in the future, or snapshots older than ten seconds expose only
+`kiln_metrics_snapshot_fresh 0`, without stale sandbox samples. HTTP still
+starts when initial collection fails and resumes samples when collection
+recovers. Direct `kiln metrics` (without `--snapshot`) and `kiln stats` read the
+kernel synchronously using the caller's privileges.
+
 ### Tests
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on Ubuntu
@@ -89,6 +122,12 @@ still manual. Run them in the Lima VM after `scripts/install.sh`:
 ```sh
 scripts/review-regressions.sh
 ```
+
+The suite checks listener UIDs and effective capabilities through `/proc`, real
+UDP/TCP DNS forwarding, cgroup/quota/nft metrics, policy migration, collector
+cadence and failure recovery. It also reproduces the round-three 128-source
+DNS attack and the busy-to-idle control backlog, checking descriptor bounds
+and prompt removal.
 
 ## Layers
 
@@ -177,8 +216,9 @@ scripts/review-regressions.sh
 10. **Metrics** (done): `kiln metrics` serves every running sandbox's memory,
     CPU and throttling, PIDs, block I/O, pressure stalls, disk quota use,
     network traffic and rejected packets in the Prometheus text format on
-    127.0.0.1:9840, read straight from cgroup files, XFS quotas, veth
-    counters and nftables. `kiln dns` counts forwarded and refused queries on
+    127.0.0.1:9840. The installed unprivileged exporter serves a snapshot
+    refreshed every second by a privileged job reading cgroup files, XFS
+    quotas, veth counters and nftables. `kiln dns` counts forwarded and refused queries on
     127.0.0.1:9841. `scripts/setup-monitoring.sh` installs Prometheus (scraping
     every 5 s), node_exporter and Grafana with the dashboard below provisioned
     from `monitoring/`. `kiln stats` prints the same numbers as a table.
@@ -219,7 +259,14 @@ scripts/review-regressions.sh
     oldest incomplete header gives way when full, and a complete queued remove
     takes priority over incomplete headers. Each header keeps its two-second
     absolute deadline; partial clients cannot stall removal or disconnect
-    cleanup. A client may half-close its completed request
+    cleanup. Before exec cgroup drainage, the queued listener backlog is
+    consumed in at most seventeen batches of eight before idle admission,
+    after initiating cgroup-wide killing. This preserves busy refusal
+    and closing partial headers even when more than eight connections were
+    queued at cancellation or completion. Connections arriving during cleanup
+    remain eligible for immediate idle reuse. Shutdown arriving after execution
+    preserves the observed command outcome and confirmed cleanup. A client may
+    half-close its completed request
     and keep reading the response; only a full close cancels an active exec.
     Commands start with the normal default `SIGPIPE` behavior. `kiln exec`
     exits with the command's code (128 + signal if it was killed), or 125 when
@@ -535,6 +582,16 @@ found, and what each fix teaches:
 - **Page cache counts as memory.** Writing 60 MB to disk shows ~60 MiB of
   `file` memory in `memory.stat` (and in `memory.current`), with almost no
   `anon` memory. It's reclaimable, so it doesn't cause OOM kills.
+
+### DNS admission under many sources
+
+TCP DNS keeps its 256-stream global bound and two-stream per-source bound
+across partial frames, queued queries and active workers. The final sixteen
+slots admit only sources with no current permit, so 128 sources each trying
+to hold two partial frames leave a new source able to query. The reserve is
+finite: enough distinct first streams can still fill the global cap. UDP has
+its own worker pool, and global overload or unavailable upstream DNS can still
+drop queries. This is bounded admission, not an availability guarantee.
 
 ### From the second review
 
