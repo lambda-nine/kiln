@@ -73,7 +73,10 @@ stuck in an uninterruptible kernel wait can delay drainage indefinitely.
 Sandbox cleanup and `kiln gc [ID...]` remove nested cgroup directories
 children-first. With IDs, GC inspects and removes only that explicit scope;
 without them it retains the operator-facing global scan. Both modes recheck
-recorded shim identity and liveness immediately before cleanup.
+recorded shim identity and liveness immediately before cleanup. Cgroup teardown
+checks drainage and directory removal; network teardown verifies nft object,
+veth, DNS policy and lease absence. A partial cleanup exits nonzero and retains
+the run directory and any unconfirmed lease so a retry can finish it.
 
 PID 1 keeps one signalfd for its whole lifetime and polls it beside the control
 listener. It therefore reaps any unexpectedly adopted child even when no exec

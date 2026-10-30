@@ -9,6 +9,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Fail GC on partial cgroup or network teardown, verify resource absence, and retain registry identity and unconfirmed leases for retry.
+
 - Reject private, link-local and metadata egress before every networked accept; refuse private literals/prefixes and filter hostname resolutions.
 
 - Resolve writable directories through root-relative handles without following symlinks or procfs magic links; reject grants for the sandbox root.

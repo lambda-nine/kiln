@@ -126,7 +126,9 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        remove_tree(&self.path);
+        if let Err(e) = remove_tree(&self.path) {
+            eprintln!("kiln: cgroup cleanup: {e:#}");
+        }
     }
 }
 
@@ -217,34 +219,37 @@ fn parse_populated(events: &str) -> Option<bool> {
 /// Kills everything in a sandbox's cgroup and removes it, children first: a
 /// cgroup with a child cgroup can't be removed, and cgroup.kill only kills
 /// processes. The parent's cgroup.kill also kills its children's processes.
-fn remove_tree(path: &Path) {
-    let _ = fs::write(path.join("cgroup.kill"), "1");
-    let child = path.join(EXEC);
-    let busy = |e: &std::io::Error| e.raw_os_error() == Some(Errno::EBUSY as i32);
-    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
-    // A cgroup directory can only be removed once it has no processes, and
-    // killed processes take a moment to die.
-    for _ in 0..100 {
-        match fs::remove_dir(&child) {
-            Ok(()) => {}
-            Err(e) if gone(&e) => {}
-            Err(e) if busy(&e) => { sleep(Duration::from_millis(10)); continue; }
-            Err(e) => {
-                eprintln!("kiln: failed to remove {}: {e}", child.display());
-                return;
-            }
-        }
-        match fs::remove_dir(path) {
-            Ok(()) => return,
-            Err(e) if gone(&e) => return,
-            Err(e) if busy(&e) => sleep(Duration::from_millis(10)),
-            Err(e) => {
-                eprintln!("kiln: failed to remove {}: {e}", path.display());
-                return;
-            }
-        }
+fn remove_tree(path: &Path) -> Result<()> {
+    if !path.try_exists().with_context(|| format!("inspect {}", path.display()))? {
+        return Ok(());
     }
-    eprintln!("kiln: gave up removing busy cgroup {}", path.display());
+    fs::write(path.join("cgroup.kill"), "1")
+        .with_context(|| format!("kill cgroup {}", path.display()))?;
+    let child = path.join(EXEC);
+    for _ in 0..100 {
+        let events = fs::read_to_string(path.join("cgroup.events"))
+            .with_context(|| format!("read {} events", path.display()))?;
+        match parse_populated(&events) {
+            Some(false) => {}
+            Some(true) => { sleep(Duration::from_millis(10)); continue; }
+            None => bail!("{} events has no populated line", path.display()),
+        }
+        let mut busy = false;
+        for dir in [&child, path] {
+            match fs::remove_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.raw_os_error() == Some(Errno::EBUSY as i32) => { busy = true; break; }
+                Err(e) => return Err(e).with_context(|| format!("remove cgroup {}", dir.display())),
+            }
+        }
+        if !busy {
+            anyhow::ensure!(!path.try_exists()?, "cgroup {} remains after removal", path.display());
+            return Ok(());
+        }
+        sleep(Duration::from_millis(10));
+    }
+    bail!("gave up removing busy cgroup {}; retain run state for retry", path.display())
 }
 
 /// /sys/fs/cgroup/kiln, the parent of every sandbox's cgroup. Its counters are
@@ -267,10 +272,8 @@ pub fn sandboxes() -> Vec<(String, PathBuf)> {
 }
 
 /// Kills and removes a cgroup left behind by a crashed persistent shim.
-pub fn remove(name: &str) {
-    let path = parent_dir().join(name);
-    if !path.is_dir() { return; }
-    remove_tree(&path);
+pub fn remove(name: &str) -> Result<()> {
+    remove_tree(&parent_dir().join(name))
 }
 
 /// A single-value file like `memory.current` or `pids.max`. `None` if it's

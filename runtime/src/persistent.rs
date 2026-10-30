@@ -435,13 +435,27 @@ pub fn list() -> Result<()> {
 
 pub fn gc(ids: &[String]) -> Result<()> {
     let root = Path::new(RUNS_ROOT);
+    let mut failures = Vec::new();
     for (id, dir) in stale_gc_candidates(root, ids)? {
-        crate::cgroup::remove(&id);
-        crate::net::remove_run(&id);
-        fs::remove_dir_all(&dir).with_context(|| format!("remove stale sandbox {id}"))?;
-        eprintln!("kiln: removed stale sandbox {id}");
+        // Attempt both independent resources, but retain identity until every
+        // teardown and its postconditions succeeded.
+        let cgroup = crate::cgroup::remove(&id);
+        let network = crate::net::remove_run(&id);
+        match finish_gc(&dir, cgroup, network) {
+            Ok(()) => eprintln!("kiln: removed stale sandbox {id}"),
+            Err(e) => failures.push(format!("{id}: {e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("partial sandbox cleanup; run state retained for retry: {}", failures.join("; "));
     }
     Ok(())
+}
+
+fn finish_gc(dir: &Path, cgroup: Result<()>, network: Result<()>) -> Result<()> {
+    cgroup.context("cgroup teardown")?;
+    network.context("network teardown")?;
+    fs::remove_dir_all(dir).with_context(|| format!("remove stale sandbox {}", dir.display()))
 }
 
 fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>> {
@@ -1104,6 +1118,20 @@ mod tests {
         let err = read_shim(&dir).unwrap_err().to_string();
         assert!(err.contains("parse sandbox registry file"), "{err}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_teardown_retains_registry_for_retry() {
+        let root = std::env::temp_dir().join(format!("kiln-gc-retry-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("shim.pid"), "123").unwrap();
+        for (cgroup, network) in [(Err(anyhow::anyhow!("busy")), Ok(())),
+            (Ok(()), Err(anyhow::anyhow!("nft failed")))] {
+            assert!(finish_gc(&root, cgroup, network).is_err());
+            assert_eq!(fs::read_to_string(root.join("shim.pid")).unwrap(), "123");
+        }
+        finish_gc(&root, Ok(()), Ok(())).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

@@ -630,18 +630,56 @@ fn reconcile_leases(dir: &Path) {
 
 /// Removes network state for a run whose persistent shim is gone. The normal
 /// path uses `Network::drop`; `kiln gc` calls this crash-recovery path.
-pub fn remove_run(run_id: &str) {
-    let Ok(_lock) = network_lock() else { return };
+pub fn remove_run(run_id: &str) -> Result<()> {
+    let _lock = network_lock()?;
     let dir = Path::new(STATE_DIR).join("leases");
-    let Ok(entries) = fs::read_dir(&dir) else { return };
-    for entry in entries.flatten() {
-        let Ok(owner) = fs::read_to_string(entry.path()) else { continue };
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("read network leases for cleanup"),
+    };
+    for entry in entries {
+        let entry = entry.context("read network lease entry")?;
+        let owner = fs::read_to_string(entry.path()).context("read network lease owner")?;
         if owner.trim() != run_id { continue; }
-        let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
-        let _ = remove_policy(ip);
-        let _ = Netlink::open().and_then(|mut nl| nl.delete_link(&host_if(ip)));
-        let _ = fs::remove_file(dns_policy_path(ip));
-        let _ = fs::remove_file(entry.path());
+        let ip = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid network lease {}", entry.path().display()))?;
+        let tables = run("nft", &["list", "tables"], None)?;
+        if tables.lines().any(|line| line.split_whitespace().eq(["table", "inet", "kiln"])) {
+            remove_policy(ip).context("remove sandbox firewall policy")?;
+            let table = run("nft", &["-n", "list", "table", "inet", "kiln"], None)?;
+            anyhow::ensure!(policy_is_absent(&table, ip), "firewall objects for {ip} remain after teardown");
+        }
+        let link = host_if(ip);
+        if let Err(e) = Netlink::open()?.delete_link(&link) && !link_already_gone(&e) {
+            return Err(e).context("remove sandbox veth");
+        }
+        anyhow::ensure!(!Path::new("/sys/class/net").join(&link).try_exists()?,
+            "veth {link} remains after teardown");
+        remove_state_file(&dns_policy_path(ip))?;
+        // The lease is the retry identity for all objects above: remove it last.
+        remove_state_file(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn policy_is_absent(table: &str, ip: Ipv4Addr) -> bool {
+    let address = ip.to_string();
+    let chain = format!("sb_{}", address.replace('.', "_"));
+    !table.split(|c: char| c.is_whitespace() || "{},;".contains(c))
+        .any(|token| token == address || token == chain)
+}
+
+fn remove_state_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("check {} removal", path.display())),
+        Ok(_) => bail!("{} remains after teardown", path.display()),
     }
 }
 
@@ -733,6 +771,16 @@ mod tests {
             let nft = super::policy(&network, &plan);
             assert!(nft.find("ip daddr @private").unwrap() < nft.find(" accept").unwrap());
         }
+    }
+
+    #[test]
+    fn teardown_checks_map_chain_and_connlimit_absence() {
+        let ip = "10.88.0.2".parse().unwrap();
+        for table in ["elements = { 10.88.0.2 : jump sb_10_88_0_2 }",
+            "chain sb_10_88_0_2 { }", "elements = { 10.88.0.2 ct count 1 }"] {
+            assert!(!super::policy_is_absent(table, ip), "{table}");
+        }
+        assert!(super::policy_is_absent("chain sb_10_88_0_20 { }", ip));
     }
 
     #[test]
