@@ -809,7 +809,7 @@ fn recv_chunk(stream: &UnixStream, bytes: &mut [u8]) -> Result<RecvChunk> {
                 invalid_ancillary = true;
             } else {
                 let payload = length - minimum;
-                if payload % mem::size_of::<RawFd>() != 0 {
+                if !payload.is_multiple_of(mem::size_of::<RawFd>()) {
                     invalid_ancillary = true;
                 } else {
                     rights_messages += 1;

@@ -7,6 +7,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Keep strict Clippy checks passing on Rust 1.88 and 1.99 using stable let chains and integer divisibility checks.
+
 - Align CLI and persistent-protocol validation with kilnd's request contract:
   bounded ASCII image/allowlist fields, canonical non-root writable paths,
   strict persistent IDs, 1–4096 literal argv entries, nonempty `argv[0]`, no

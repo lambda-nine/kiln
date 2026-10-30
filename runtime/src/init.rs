@@ -367,19 +367,17 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
                 }
                 if bootstrap.eof { return Ok(Outcome::Completed(ExecOutcome::command(s))); }
             }
-            if bootstrap.joined {
-                if let Some(tx) = release.take() {
-                    #[cfg(test)]
-                    if let Some(errno) = injected("release") {
-                        return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, errno, "injected release failure"));
-                    }
-                    loop {
-                        match write(&tx, b"1") {
-                            Ok(1) => break,
-                            Err(Errno::EINTR) => continue,
-                            Err(e) => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, e as i32, "release exec bootstrap")),
-                            _ => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, 0, "short bootstrap release")),
-                        }
+            if bootstrap.joined && let Some(tx) = release.take() {
+                #[cfg(test)]
+                if let Some(errno) = injected("release") {
+                    return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, errno, "injected release failure"));
+                }
+                loop {
+                    match write(&tx, b"1") {
+                        Ok(1) => break,
+                        Err(Errno::EINTR) => continue,
+                        Err(e) => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, e as i32, "release exec bootstrap")),
+                        _ => return Ok(launch_failure(Stage::Admission, Cleanup::Unconfirmed, 0, "short bootstrap release")),
                     }
                 }
             }

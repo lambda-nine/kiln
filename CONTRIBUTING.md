@@ -36,6 +36,10 @@ cargo clippy --locked --all-targets -- -D warnings
 git diff --check
 ```
 
+For toolchain compatibility, `sh scripts/toolchain-regressions.sh` also runs
+the Rust 1.88 MSRV tests and strict Clippy on both MSRV and the active toolchain.
+This check is included in the prepared-VM regression suite.
+
 CI also checks the syntax of every tracked shell script and validates every
 tracked JSON file. It does not run `cargo fmt`; the source isn't
 rustfmt-normalized, so don't reformat unrelated code.
