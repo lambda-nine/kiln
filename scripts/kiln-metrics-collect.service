@@ -1,0 +1,35 @@
+[Unit]
+# A successful one-second timer must not exhaust the normal start limit.
+StartLimitIntervalSec=0
+Description=Collect kiln kernel metrics (no listener)
+After=kiln-network-setup.service systemd-tmpfiles-setup.service
+Requires=kiln-network-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kiln metrics-collect
+# XFS project reads need SYS_ADMIN; nft list needs NET_ADMIN. Root ownership
+# opens the 0700 run directories without granting DAC_OVERRIDE to a listener.
+User=root
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Permit the quota read syscall but exclude mount and other privileged APIs.
+SystemCallFilter=@system-service quotactl_fd
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/var/lib/kiln/runs /sys/fs/cgroup /sys/class/net /run/kiln/net
+ReadWritePaths=/run/kiln-metrics
+UMask=0022
+TasksMax=8
+MemoryMax=128M
+TimeoutStartSec=5

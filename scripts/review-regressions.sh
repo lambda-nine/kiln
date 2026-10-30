@@ -7,6 +7,10 @@ KILN=${KILN:-/usr/local/bin/kiln}
 
 sh scripts/install-regressions.sh
 
+sh scripts/service-upgrade-regressions.sh
+
+sudo python3 -I scripts/service-regressions.py "$KILN"
+
 sh scripts/toolchain-regressions.sh
 
 sh scripts/writable-regressions.sh

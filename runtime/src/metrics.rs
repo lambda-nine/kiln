@@ -34,6 +34,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +49,8 @@ use crate::quota;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9840";
 const HTTP_WORKERS: usize = 4;
 const HTTP_QUEUE_CAPACITY: usize = 32;
+const SNAPSHOT: &str = "/run/kiln-metrics/metrics.prom";
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
 
 /// Everything known about one running sandbox.
 struct Sandbox {
@@ -353,9 +356,40 @@ fn io_families<'a>(m: &mut Exposition, prefix: &str, rows: impl Iterator<Item = 
     }
 }
 
-/// `kiln metrics`: serve `render()` at /metrics for Prometheus to scrape.
-pub fn serve_metrics(listen: &str) -> Result<()> {
-    serve(listen, render)
+/// A fixed-path, short-lived collector: no client input and no listener. The
+/// root-owned directory is never writable by either network-facing service.
+pub fn publish_snapshot() -> Result<()> {
+    let temporary = format!("{SNAPSHOT}.new");
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true)
+        .mode(0o644).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&temporary)
+        .context("open metrics snapshot")?;
+    file.write_all(render().as_bytes()).context("write metrics snapshot")?;
+    fs::rename(&temporary, SNAPSHOT).context("publish metrics snapshot")
+}
+
+fn snapshot_at(path: &Path, now: impl FnOnce() -> SystemTime) -> String {
+    // Check metadata on the opened inode so an atomic refresh cannot pair an
+    // old body with a new timestamp. Stale/missing state never looks current.
+    let fresh = || -> Option<String> {
+        let mut file = fs::File::open(path).ok()?;
+        let modified = file.metadata().ok()?.modified().ok()?;
+        let age = now().duration_since(modified).ok()?;
+        if age > SNAPSHOT_MAX_AGE { return None; }
+        let mut body = String::new();
+        file.read_to_string(&mut body).ok()?;
+        Some(body)
+    };
+    let body = fresh();
+    let success = usize::from(body.is_some());
+    format!("{}# HELP kiln_metrics_snapshot_fresh Collector snapshot is present and at most ten seconds old.\n# TYPE kiln_metrics_snapshot_fresh gauge\nkiln_metrics_snapshot_fresh {success}\n", body.unwrap_or_default())
+}
+
+fn snapshot() -> String { snapshot_at(Path::new(SNAPSHOT), SystemTime::now) }
+
+/// The installed HTTP service reads only a collector snapshot; direct CLI
+/// scrapes and `stats` retain their synchronous kernel reads.
+pub fn serve_metrics(listen: &str, use_snapshot: bool) -> Result<()> {
+    serve(listen, if use_snapshot { snapshot } else { render })
 }
 
 /// A minimal HTTP/1.1 server: enough for Prometheus, which sends one GET per
@@ -463,5 +497,27 @@ pub fn print_stats() {
             s.net.as_ref().map_or("-".into(), |n| n.ip.to_string()),
             s.net.as_ref().map_or("-".into(), |n| n.rejected.to_string()),
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_snapshot_and_missing_or_stale_collector() {
+        let path = std::env::temp_dir().join(format!("kiln-snapshot-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(snapshot_at(&path, SystemTime::now).ends_with("kiln_metrics_snapshot_fresh 0\n"));
+        fs::write(&path, "kiln_sandboxes_running 7\n").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let fresh = snapshot_at(&path, || modified + SNAPSHOT_MAX_AGE);
+        assert!(fresh.starts_with("kiln_sandboxes_running 7\n"));
+        assert!(fresh.ends_with("kiln_metrics_snapshot_fresh 1\n"));
+        let stale = snapshot_at(&path, || modified + SNAPSHOT_MAX_AGE + Duration::from_secs(1));
+        assert!(!stale.contains("kiln_sandboxes_running"));
+        assert!(stale.ends_with("kiln_metrics_snapshot_fresh 0\n"));
+        assert!(snapshot_at(&path, || modified - Duration::from_secs(1)).ends_with("kiln_metrics_snapshot_fresh 0\n"));
+        fs::remove_file(path).unwrap();
     }
 }

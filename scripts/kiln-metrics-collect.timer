@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh kiln kernel metrics every second
+
+[Timer]
+OnBootSec=1s
+OnUnitActiveSec=1s
+AccuracySec=100ms
+Unit=kiln-metrics-collect.service
+
+[Install]
+WantedBy=timers.target

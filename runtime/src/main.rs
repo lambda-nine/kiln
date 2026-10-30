@@ -79,11 +79,20 @@ enum Command {
     },
     /// Serve DNS to sandboxes on 10.88.0.1:53 (run by the kiln-dns service).
     Dns,
+    /// Prepare the host bridge and firewall (privileged, no listener).
+    #[command(hide = true)]
+    NetworkSetup,
+    /// Publish a metrics snapshot (privileged, no listener).
+    #[command(hide = true)]
+    MetricsCollect,
     /// Serve running sandboxes' resource use as Prometheus metrics.
     Metrics {
         /// Address to listen on; /metrics is the scrape path.
         #[arg(long, default_value = metrics::DEFAULT_LISTEN)]
         listen: String,
+        /// Serve the fixed collector snapshot instead of reading the kernel.
+        #[arg(long)]
+        snapshot: bool,
     },
     /// Show running sandboxes' resource use, sampled over one second.
     Stats,
@@ -251,7 +260,9 @@ fn run() -> Result<()> {
         Command::Rm { id } => persistent::remove(&id),
         Command::Gc { ids } => persistent::gc(&ids),
         Command::Dns => dns::serve(),
-        Command::Metrics { listen } => metrics::serve_metrics(&listen),
+        Command::NetworkSetup => net::ensure_bridge(),
+        Command::MetricsCollect => metrics::publish_snapshot(),
+        Command::Metrics { listen, snapshot } => metrics::serve_metrics(&listen, snapshot),
         Command::Stats => {
             metrics::print_stats();
             Ok(())

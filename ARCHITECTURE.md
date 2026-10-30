@@ -271,3 +271,23 @@ of the boundary; errors after `new_id`, signals and missing/malformed results
 remain ambiguous even if cleanup appears to have succeeded. A caller must
 negotiate the capability before trusting the direct child's exit 124. Other
 commands do not acquire this exit contract.
+
+### Host service privileges
+
+Installed listeners use separate system users: `kiln-dns` has only
+`CAP_NET_BIND_SERVICE`, and `kiln-metrics` has no capabilities. Both have a
+read-only host filesystem, protected home/kernel/cgroups, private temporary
+files, an address-family allowlist and a system-call filter. Neither may write
+DNS policies, metrics snapshots or sandbox control state.
+
+The short-lived root `kiln-network-setup` job prepares the bridge, forwarding
+sysctl and nft rules with `CAP_NET_ADMIN` before DNS starts. It has no listener.
+`kiln-metrics-collect` also has no listener: once a second it publishes a
+root-owned atomic snapshot under `/run/kiln-metrics`. It needs `CAP_NET_ADMIN`
+for nft reads and `CAP_SYS_ADMIN` for XFS project-quota reads, and root ownership
+to open 0700 run directories. Its filesystem writes are restricted to the
+snapshot directory and its syscall filter excludes mounting. The HTTP service
+only reads the snapshot; `kiln_metrics_snapshot_fresh` becomes zero and sandbox
+samples are omitted if collection is missing or more than ten seconds old.
+Direct `kiln metrics` without `--snapshot`, and `kiln stats`, still read the
+kernel synchronously with the caller's privileges.

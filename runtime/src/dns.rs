@@ -54,7 +54,6 @@ const METRICS_LISTEN: &str = "127.0.0.1:9841";
 static QUERIES: Mutex<BTreeMap<(&str, String), u64>> = Mutex::new(BTreeMap::new());
 
 pub fn serve() -> Result<()> {
-    net::ensure_bridge()?;
     let Some(&upstream) = net::host_resolvers().first() else {
         bail!("no upstream resolver found in /run/systemd/resolve/resolv.conf or /etc/resolv.conf");
     };

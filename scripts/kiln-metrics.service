@@ -1,18 +1,34 @@
 [Unit]
 Description=kiln Prometheus exporter for sandbox resource use (127.0.0.1:9840)
-After=network-online.target
+After=network-online.target kiln-metrics-collect.service
+Wants=kiln-metrics-collect.service
+Wants=kiln-metrics-collect.timer
 
 [Service]
-ExecStart=/usr/local/bin/kiln metrics --listen 127.0.0.1:9840
+User=kiln-metrics
+Group=kiln-metrics
+ExecStart=/usr/local/bin/kiln metrics --snapshot --listen 127.0.0.1:9840
 Restart=on-failure
-# Read-only: it reads cgroup files, XFS quotas (quotactl needs
-# CAP_SYS_ADMIN to read other projects) and nftables counters (`nft list`
-# needs CAP_NET_ADMIN), and writes nothing.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+TasksMax=16
+MemoryMax=128M
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/run/kiln-metrics
+InaccessiblePaths=-/var/lib/kiln -/run/kiln/net -/sys/fs/cgroup/kiln
 
 [Install]
 WantedBy=multi-user.target

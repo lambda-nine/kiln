@@ -15,6 +15,7 @@
 //! Firewall rules go through `nft`, the same tool you'd type.
 
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -309,6 +310,10 @@ pub fn prepare(run_id: &str, plan: &Plan) -> Result<Option<Network>> {
     let policy_file = dns_policy_path(network.ip);
     fs::create_dir_all(policy_file.parent().expect("has parent")).context("create dns policy dir")?;
     fs::write(&policy_file, plan.dns_policy()).context("write dns policy")?;
+    // The installed forwarder is unprivileged, even if the creating CLI has
+    // umask 077. Only the root-owned directory's owner may replace policies.
+    fs::set_permissions(&policy_file, fs::Permissions::from_mode(0o644))
+        .context("make DNS policy readable")?;
     trace::mark("host: net: lease");
     {
         let _lock = network_lock()?;

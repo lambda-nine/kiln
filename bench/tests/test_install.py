@@ -48,6 +48,17 @@ if [ "$1" = install ] && [ "$2" = -m ] && [ "$3" = 755 ]; then
 fi
 exit 0
 ''')
+        self._executable("getent", '''#!/bin/sh
+case "$2" in
+    kiln-dns) uid=991 ;;
+    kiln-metrics) uid=992 ;;
+    *) exit 1 ;;
+esac
+printf '%s:x:%s:%s::/nonexistent:/usr/sbin/nologin\\n' "$2" "${ACCOUNT_UID:-$uid}" "$uid"
+''')
+        self._executable("id", '''#!/bin/sh
+case "$2" in kiln-dns) echo 991 ;; kiln-metrics) echo 992 ;; *) exit 1 ;; esac
+''')
         self._executable("systemctl", "#!/bin/sh\nexit 0\n")
         self.env = os.environ.copy()
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
@@ -89,6 +100,13 @@ exit 0
             Path(self.env["INSTALL_RECORD"]).read_text(),
             "target/release/kiln\n",
         )
+
+    def test_refuses_an_existing_root_service_account(self):
+        env = self.env.copy()
+        env["ACCOUNT_UID"] = "0"
+        result = subprocess.run(["sh", "scripts/install.sh"], cwd=self.root / "repo",
+                                env=env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_absolute_target_directory_with_spaces(self):
         target_dir = self.root / "absolute target directory"

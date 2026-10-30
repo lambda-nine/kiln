@@ -9,6 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Run the DNS and metrics listeners as separate system users, with only DNS
+  retaining bind-service capability. Split bridge setup and privileged quota/
+  nft collection into hardened jobs with no listeners; expose snapshot freshness.
+
 - Advertise persistent-create preflight certainty (capability `0x10`): exit
   124 with empty stdout proves failure before `new_id` or any allocation;
   every other create failure remains ambiguous for machine callers.
