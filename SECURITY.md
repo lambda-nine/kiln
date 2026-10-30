@@ -43,6 +43,11 @@ relying on it:
 - **One shared host UID range.** Every sandbox maps its IDs 0-65535 to the same
   host range, 2000000000-2000065535. The user ID does not separate one sandbox
   from another.
+- **Private egress.** Full and allowlist modes reject private, link-local and
+  metadata ranges before accepting destinations. Explicit IPs and prefixes
+  overlapping those ranges are refused. Hostname resolution filters private
+  answers and requires a remaining public IPv4 address; nft enforces the same
+  guard for every packet. Only the bridge DNS service is reachable on the host.
 - **seccomp denylist.** The filter blocks a list of risky syscalls and
   namespace creation. Everything else is allowed; an allowlist would be
   stricter.

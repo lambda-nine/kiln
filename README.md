@@ -123,7 +123,10 @@ scripts/review-regressions.sh
    the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
    that reject private and link-local ranges (the VM's LAN, the Mac, cloud
    metadata). `--allow HOST[:PORT]` or `--allow IP[/PREFIX][:PORT]`
-   (repeatable) allows only those destinations. Sandboxes can't reach the host or each other. DNS goes only
+   (repeatable) allows only public destinations. Private, link-local and metadata
+   ranges are rejected before allowlist accepts in every networked mode.
+   Explicit IPs and prefixes overlapping those ranges are refused; hostname
+   answers are filtered to public IPv4 addresses and fail if none remain. Sandboxes can't reach the host or each other. DNS goes only
    to `kiln dns`, a small forwarder on the bridge (10.88.0.1) run by the
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal

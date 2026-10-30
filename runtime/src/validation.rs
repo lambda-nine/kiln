@@ -5,6 +5,18 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
+/// Shared by literal/resolution validation and the packet-time nft guard.
+pub const PRIVATE_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
+
+pub fn overlaps_private(address: Ipv4Addr, prefix: u8) -> bool {
+    PRIVATE_RANGES.split(", ").any(|range| {
+        let (network, bits) = range.split_once('/').unwrap();
+        let shared = prefix.min(bits.parse::<u8>().unwrap());
+        let mask = if shared == 0 { 0 } else { u32::MAX << (32 - shared) };
+        u32::from(address) & mask == u32::from(network.parse::<Ipv4Addr>().unwrap()) & mask
+    })
+}
+
 pub const MAX_ALLOWLIST_ENTRY_BYTES: usize = 260;
 pub const MAX_ALLOWLIST_ENTRIES: usize = 64;
 pub const MAX_ARGC: usize = 4096;
@@ -13,6 +25,7 @@ pub const MAX_IMAGE_BYTES: usize = 128;
 pub const MAX_WRITABLE_PATHS: usize = 16;
 pub const MAX_WRITABLE_PATH_BYTES: usize = 1024;
 
+#[derive(Debug)]
 pub struct AllowlistEntry<'a> {
     pub destination: &'a str,
     pub port: Option<u16>,
@@ -84,6 +97,12 @@ pub fn parse_allowlist_entry(entry: &str) -> Result<AllowlistEntry<'_>> {
         }
         false
     };
+    if ipv4_literal {
+        let (address, prefix) = destination.split_once('/').unwrap_or((destination, "32"));
+        if overlaps_private(address.parse()?, prefix.parse()?) {
+            bail!("--allow {entry:?} overlaps private or link-local ranges (including metadata)");
+        }
+    }
     Ok(AllowlistEntry {
         destination,
         port,
@@ -163,7 +182,7 @@ mod tests {
         for image in ["", ".hidden", "-flag", "../etc", "snow-雪", "a/b"] {
             assert!(validate_image_name(image).is_err(), "{image:?}");
         }
-        for entry in ["example.com", "sub-domain.example:443", "127.0.0.1", "10.0.0.0/8:53"] {
+        for entry in ["example.com", "sub-domain.example:443", "1.1.1.1", "8.8.8.0/24:53"] {
             parse_allowlist_entry(entry).unwrap();
         }
         for entry in [
@@ -205,6 +224,17 @@ mod tests {
         );
         for path in ["/", "data", "/a/../b", "/a/./b", "/a//b", "/a/", "/a\nb"] {
             assert!(validate_writable_paths(&[PathBuf::from(path)]).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn private_literals_and_overlapping_prefixes_are_rejected() {
+        for value in ["169.254.169.254:80", "10.0.0.0/8", "127.0.0.1", "100.64.0.1",
+            "172.16.0.0/12", "192.168.1.1:443", "0.0.0.0/0", "8.0.0.0/6"] {
+            assert!(parse_allowlist_entry(value).unwrap_err().to_string().contains("private"), "{value}");
+        }
+        for value in ["8.8.8.8:53", "1.1.1.0/24", "11.0.0.0/8"] {
+            assert!(parse_allowlist_entry(value).is_ok(), "{value}");
         }
     }
 

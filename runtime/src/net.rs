@@ -38,7 +38,7 @@ const PREFIX: u8 = 16;
 /// the nftables rules they refer to.
 const STATE_DIR: &str = "/run/kiln/net";
 
-const PRIVATE_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
+use crate::validation::PRIVATE_RANGES;
 
 const FORWARD_RULES: &[&str] = &[
     "type filter hook forward priority filter; policy accept;",
@@ -137,14 +137,14 @@ fn parse_allowed(s: &str) -> Result<Allowed> {
             .to_socket_addrs()
             .with_context(|| format!("resolve {}", entry.destination))?
             .filter_map(|a| match a.ip() {
-                IpAddr::V4(v4) => Some(v4.to_string()),
-                IpAddr::V6(_) => None,
+                IpAddr::V4(v4) if !validation::overlaps_private(v4, 32) => Some(v4.to_string()),
+                _ => None,
             })
             .collect();
         ips.sort();
         ips.dedup();
         if ips.is_empty() {
-            bail!("{} has no IPv4 address", entry.destination);
+            bail!("{} has no public IPv4 address; private and link-local addresses (including metadata) are rejected", entry.destination);
         }
         ips
     };
@@ -404,10 +404,12 @@ fn policy(network: &Network, plan: &Plan) -> String {
     nft += "add counter inet kiln egress_rejected\n";
     let reject = "counter name \"egress_rejected\" counter reject with icmpx admin-prohibited";
 
+    if !matches!(plan.mode, Mode::None) {
+        nft += &rule(&format!("ip daddr @private {reject} comment \"private ranges\""));
+    }
     match &plan.mode {
         Mode::None => {}
         Mode::Full => {
-            nft += &rule(&format!("ip daddr @private {reject} comment \"private ranges\""));
             nft += &rule("accept");
         }
         Mode::Allow(allowed) => {
@@ -709,10 +711,28 @@ mod tests {
 
     #[test]
     fn allowlist_count_has_an_exact_boundary_before_resolution() {
-        let allowed = vec!["127.0.0.1".to_string(); MAX_ALLOWLIST_ENTRIES];
+        let allowed = vec!["1.1.1.1".to_string(); MAX_ALLOWLIST_ENTRIES];
         Plan::new("none", &allowed).unwrap();
-        let excessive = vec!["127.0.0.1".to_string(); MAX_ALLOWLIST_ENTRIES + 1];
+        let excessive = vec!["1.1.1.1".to_string(); MAX_ALLOWLIST_ENTRIES + 1];
         assert!(Plan::new("none", &excessive).is_err());
+    }
+
+    #[test]
+    fn hostname_resolution_filters_private_addresses() {
+        let error = super::parse_allowed("localhost:80").err().expect("private hostname accepted");
+        assert!(error.to_string().contains("no public IPv4 address"));
+    }
+
+    #[test]
+    fn every_networked_policy_rejects_private_before_accepting() {
+        let network = std::mem::ManuallyDrop::new(super::Network {
+            ip: "10.88.0.2".parse().unwrap(), lease: std::path::PathBuf::new(),
+        });
+        for plan in [Plan::new("full", &[]).unwrap(),
+            Plan::new("none", &["1.1.1.1:443".into()]).unwrap()] {
+            let nft = super::policy(&network, &plan);
+            assert!(nft.find("ip daddr @private").unwrap() < nft.find(" accept").unwrap());
+        }
     }
 
     #[test]

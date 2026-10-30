@@ -214,3 +214,12 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 ~~metrics~~ → kilnd with long-lived sandboxes and exec → harness (with memory;
 first user is the idea-marathon app) → ~~cold-start work~~ ([docs/benchmarks.md](docs/benchmarks.md);
 a pool of pre-created sandboxes in kilnd is the next step) → k3s operator.
+
+### Private egress invariant
+
+Every networked mode rejects the shared nft `@private` ranges before any
+allowlist or full-mode accept. Explicit private/link-local IPv4 destinations
+and prefixes overlapping those ranges (including metadata) are validation
+errors. Hostname resolution discards those addresses and fails if no public
+IPv4 answer remains. The packet-time guard remains active for DNS changes;
+the bridge DNS service is the only permitted host-side exception.
