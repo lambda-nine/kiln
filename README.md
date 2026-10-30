@@ -121,12 +121,15 @@ scripts/review-regressions.sh
 6. **Networking** (done): every sandbox has its own network namespace.
    `--net none` (default) is loopback only. `--net full` gets a veth pair on
    the `kiln0` bridge (10.88.0.0/16), NAT to the internet, and nftables rules
-   that reject private and link-local ranges (the VM's LAN, the Mac, cloud
-   metadata). `--allow HOST[:PORT]` or `--allow IP[/PREFIX][:PORT]`
-   (repeatable) allows only public destinations. Private, link-local and metadata
-   ranges are rejected before allowlist accepts in every networked mode.
-   Explicit IPs and prefixes overlapping those ranges are refused; hostname
-   answers are filtered to public IPv4 addresses and fail if none remain. Sandboxes can't reach the host or each other. DNS goes only
+   that reject non-public IPv4 destinations before any allowlist or full-mode
+   accept. `--allow HOST[:PORT]` or `--allow IP[/PREFIX][:PORT]` (repeatable)
+   permits only public unicast IPv4 destinations. The canonical deny set covers
+   0/8, RFC 1918, CGNAT, loopback, link-local/metadata, 192.0.0/24,
+   documentation, deprecated 6to4 relay (192.88.99/24), benchmarking
+   (198.18/15), multicast and reserved/future-use space (including limited
+   broadcast). Explicit IPs and overlapping prefixes are refused; hostname
+   answers are filtered by the same set and fail if none remain. The nft guard
+   checks every packet, including after DNS changes in full mode. Sandboxes can't reach the host or each other. DNS goes only
    to `kiln dns`, a small forwarder on the bridge (10.88.0.1) run by the
    `kiln-dns` systemd service: with `--allow` it resolves only the allowed
    names (and their subdomains), and it logs every query to the journal

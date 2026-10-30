@@ -9,6 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Share one complete non-public IPv4 deny set across literals/prefixes,
+  hostname answers and the allowlist/full-mode nft guard, including special-use,
+  documentation, multicast, reserved and limited broadcast destinations.
+
 - Restore fixed-header busy refusal for legacy and typed execs: close received descriptors and reply without reading the refused body or delaying queued removal.
 
 - Bound DNS TCP frames by one absolute deadline and a 4096-byte cap; limit each source to two TCP admissions and reserve separate UDP workers.

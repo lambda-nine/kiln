@@ -220,14 +220,19 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 first user is the idea-marathon app) → ~~cold-start work~~ ([docs/benchmarks.md](docs/benchmarks.md);
 a pool of pre-created sandboxes in kilnd is the next step) → k3s operator.
 
-### Private egress invariant
+### Public unicast IPv4 egress invariant
 
-Every networked mode rejects the shared nft `@private` ranges before any
-allowlist or full-mode accept. Explicit private/link-local IPv4 destinations
-and prefixes overlapping those ranges (including metadata) are validation
-errors. Hostname resolution discards those addresses and fails if no public
-IPv4 answer remains. The packet-time guard remains active for DNS changes;
-the bridge DNS service is the only permitted host-side exception.
+The canonical `NON_PUBLIC_IPV4_RANGES` set in `validation.rs` drives literal
+and prefix overlap checks, hostname-answer filtering, and the nft `@private`
+set (the name is retained for upgrades). It covers 0/8, RFC 1918, CGNAT,
+loopback, link-local/metadata, all of 192.0.0/24, documentation ranges,
+deprecated 192.88.99/24 relay space, 198.18/15 benchmarking, 224/4 multicast,
+and 240/4 reserved/future-use including limited broadcast. Every networked
+mode rejects that set before any allowlist or full-mode accept. Hostnames must
+have a public unicast IPv4 answer; non-public answers are discarded. The
+packet-time guard also prevents a public-first hostname from rebinding into
+the deny set in full mode. The bridge DNS service is the only permitted
+host-side exception. IPv6 destinations are unsupported.
 
 ### Shared DNS admission
 

@@ -5,11 +5,13 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-/// Shared by literal/resolution validation and the packet-time nft guard.
-pub const PRIVATE_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
+/// Canonical destination deny set, shared by validation, hostname answer
+/// filtering and nft. The reserved 240/4 includes limited broadcast /32.
+/// Conservatively reject all of 192.0.0/24 and the deprecated 6to4 relay /24.
+pub const NON_PUBLIC_IPV4_RANGES: &str = "0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4";
 
-pub fn overlaps_private(address: Ipv4Addr, prefix: u8) -> bool {
-    PRIVATE_RANGES.split(", ").any(|range| {
+pub fn overlaps_non_public(address: Ipv4Addr, prefix: u8) -> bool {
+    NON_PUBLIC_IPV4_RANGES.split(", ").any(|range| {
         let (network, bits) = range.split_once('/').unwrap();
         let shared = prefix.min(bits.parse::<u8>().unwrap());
         let mask = if shared == 0 { 0 } else { u32::MAX << (32 - shared) };
@@ -99,8 +101,8 @@ pub fn parse_allowlist_entry(entry: &str) -> Result<AllowlistEntry<'_>> {
     };
     if ipv4_literal {
         let (address, prefix) = destination.split_once('/').unwrap_or((destination, "32"));
-        if overlaps_private(address.parse()?, prefix.parse()?) {
-            bail!("--allow {entry:?} overlaps private or link-local ranges (including metadata)");
+        if overlaps_non_public(address.parse()?, prefix.parse()?) {
+            bail!("--allow {entry:?} overlaps non-public IPv4 ranges (including private, metadata and special-use destinations)");
         }
     }
     Ok(AllowlistEntry {
@@ -235,6 +237,27 @@ mod tests {
         }
         for value in ["8.8.8.8:53", "1.1.1.0/24", "11.0.0.0/8"] {
             assert!(parse_allowlist_entry(value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn every_non_public_range_and_overlap_is_rejected() {
+        for range in NON_PUBLIC_IPV4_RANGES.split(", ") {
+            let (network, prefix) = range.split_once('/').unwrap();
+            let address: Ipv4Addr = network.parse().unwrap();
+            let bits: u8 = prefix.parse().unwrap();
+            let host_mask = u32::MAX >> bits;
+            for ip in [address, Ipv4Addr::from(u32::from(address) | host_mask)] {
+                assert!(parse_allowlist_entry(&ip.to_string()).is_err(), "{ip}");
+            }
+            assert!(parse_allowlist_entry(range).is_err(), "{range}");
+            assert!(overlaps_non_public(address, bits.saturating_sub(1)), "{range}");
+        }
+        for ip in ["255.255.255.255", "192.0.0.9", "198.19.255.255", "239.255.255.255"] {
+            assert!(parse_allowlist_entry(ip).is_err(), "{ip}");
+        }
+        for range in ["1.0.0.0/8", "192.1.0.0/16", "198.20.0.0/16", "223.255.255.255"] {
+            assert!(parse_allowlist_entry(range).is_ok(), "{range}");
         }
     }
 

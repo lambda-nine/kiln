@@ -38,7 +38,7 @@ const PREFIX: u8 = 16;
 /// the nftables rules they refer to.
 const STATE_DIR: &str = "/run/kiln/net";
 
-use crate::validation::PRIVATE_RANGES;
+use crate::validation::NON_PUBLIC_IPV4_RANGES;
 
 const FORWARD_RULES: &[&str] = &[
     "type filter hook forward priority filter; policy accept;",
@@ -69,7 +69,7 @@ const POSTROUTING_RULES: &[&str] = &[
 pub enum Mode {
     /// Loopback only.
     None,
-    /// Anything except private and link-local ranges.
+    /// Public unicast IPv4 destinations, excluding the canonical non-public set.
     Full,
     /// Only these destinations (plus DNS).
     Allow(Vec<Allowed>),
@@ -133,18 +133,11 @@ fn parse_allowed(s: &str) -> Result<Allowed> {
     let addrs = if entry.ipv4_literal {
         vec![entry.destination.to_string()]
     } else {
-        let mut ips: Vec<String> = (entry.destination, 0)
+        let ips = public_ipv4_answers((entry.destination, 0)
             .to_socket_addrs()
-            .with_context(|| format!("resolve {}", entry.destination))?
-            .filter_map(|a| match a.ip() {
-                IpAddr::V4(v4) if !validation::overlaps_private(v4, 32) => Some(v4.to_string()),
-                _ => None,
-            })
-            .collect();
-        ips.sort();
-        ips.dedup();
+            .with_context(|| format!("resolve {}", entry.destination))?);
         if ips.is_empty() {
-            bail!("{} has no public IPv4 address; private and link-local addresses (including metadata) are rejected", entry.destination);
+            bail!("{} has no public IPv4 address; non-public addresses (including private, metadata and special-use destinations) are rejected", entry.destination);
         }
         ips
     };
@@ -155,6 +148,16 @@ fn parse_allowed(s: &str) -> Result<Allowed> {
         addrs,
         port: entry.port,
     })
+}
+
+fn public_ipv4_answers(answers: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<String> {
+    let mut ips: Vec<String> = answers.into_iter().filter_map(|a| match a.ip() {
+        IpAddr::V4(v4) if !validation::overlaps_non_public(v4, 32) => Some(v4.to_string()),
+        _ => None,
+    }).collect();
+    ips.sort();
+    ips.dedup();
+    ips
 }
 
 /// The host's real upstream resolvers. systemd-resolved's 127.0.0.53 only
@@ -405,7 +408,7 @@ fn policy(network: &Network, plan: &Plan) -> String {
     let reject = "counter name \"egress_rejected\" counter reject with icmpx admin-prohibited";
 
     if !matches!(plan.mode, Mode::None) {
-        nft += &rule(&format!("ip daddr @private {reject} comment \"private ranges\""));
+        nft += &rule(&format!("ip daddr @private {reject} comment \"non-public IPv4 destinations\""));
     }
     match &plan.mode {
         Mode::None => {}
@@ -502,7 +505,7 @@ fn repair_base(listing: &str) -> Result<()> {
     if !private_set_matches(blocks.get("set private")) {
         nft += "add set inet kiln private { type ipv4_addr; flags interval; }\n\
                 flush set inet kiln private\n";
-        nft += &format!("add element inet kiln private {{ {PRIVATE_RANGES} }}\n");
+        nft += &format!("add element inet kiln private {{ {NON_PUBLIC_IPV4_RANGES} }}\n");
     }
     for (object, decl) in [
         ("map egress", "{ type ipv4_addr : verdict; }"),
@@ -558,7 +561,7 @@ fn top_level_blocks(listing: &str) -> HashMap<String, Vec<String>> {
     blocks
 }
 
-/// The private set must be an interval set holding exactly PRIVATE_RANGES.
+/// The private set must be an interval set holding exactly NON_PUBLIC_IPV4_RANGES.
 /// Its elements may be wrapped over several lines.
 fn private_set_matches(body: Option<&Vec<String>>) -> bool {
     let Some(body) = body else { return false };
@@ -573,7 +576,7 @@ fn private_set_matches(body: Option<&Vec<String>>) -> bool {
     };
     body.first().is_some_and(|l| l == "type ipv4_addr")
         && body.iter().any(|l| l == "flags interval")
-        && sorted(elements.0) == sorted(PRIVATE_RANGES)
+        && sorted(elements.0) == sorted(NON_PUBLIC_IPV4_RANGES)
 }
 
 /// Leases the lowest free address. Creating the lease file with O_EXCL is
@@ -759,6 +762,15 @@ mod tests {
     fn hostname_resolution_filters_private_addresses() {
         let error = super::parse_allowed("localhost:80").err().expect("private hostname accepted");
         assert!(error.to_string().contains("no public IPv4 address"));
+    }
+
+    #[test]
+    fn public_first_non_public_second_answers_keep_only_public_unicast() {
+        for range in super::NON_PUBLIC_IPV4_RANGES.split(", ") {
+            let ip = range.split_once('/').unwrap().0;
+            let answers = ["1.1.1.1:0".parse().unwrap(), format!("{ip}:0").parse().unwrap()];
+            assert_eq!(super::public_ipv4_answers(answers), ["1.1.1.1"], "{range}");
+        }
     }
 
     #[test]
