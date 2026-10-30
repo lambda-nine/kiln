@@ -226,3 +226,12 @@ and prefixes overlapping those ranges (including metadata) are validation
 errors. Hostname resolution discards those addresses and fails if no public
 IPv4 answer remains. The packet-time guard remains active for DNS changes;
 the bridge DNS service is the only permitted host-side exception.
+
+### Shared DNS admission
+
+The DNS forwarder reserves twelve workers and 256 queued jobs for UDP; four
+workers and 32 queued jobs handle TCP. Each source may hold at most two
+queued/running TCP permits. A TCP frame's length prefix and body share one
+absolute three-second deadline from accept (including queue time), and query
+and upstream response frames are capped at 4096 bytes before allocation.
+Slow TCP senders cannot occupy the workers reserved for UDP.

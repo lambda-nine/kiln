@@ -9,6 +9,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Bound DNS TCP frames by one absolute deadline and a 4096-byte cap; limit each source to two TCP admissions and reserve separate UDP workers.
+
 - Fail GC on partial cgroup or network teardown, verify resource absence, and retain registry identity and unconfirmed leases for retry.
 
 - Reject private, link-local and metadata egress before every networked accept; refuse private literals/prefixes and filter hostname resolutions.

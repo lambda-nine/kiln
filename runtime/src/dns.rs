@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -25,7 +25,11 @@ use crate::net;
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const HEADER_LEN: usize = 12;
-const WORKERS: usize = 16;
+const UDP_WORKERS: usize = 12;
+const TCP_WORKERS: usize = 4;
+const TCP_PER_SOURCE: usize = 2;
+const TCP_QUEUE_CAPACITY: usize = 32;
+const MAX_TCP_MESSAGE: usize = 4096;
 const QUEUE_CAPACITY: usize = 256;
 /// Localhost only: the sandboxes' side of the host is the bridge, and the
 /// input chain rejects them anyway.
@@ -50,21 +54,18 @@ pub fn serve() -> Result<()> {
     });
 
     let udp = Arc::new(udp);
-    let (jobs_tx, jobs_rx) = mpsc::sync_channel(QUEUE_CAPACITY);
-    let jobs_rx = Arc::new(Mutex::new(jobs_rx));
-    for _ in 0..WORKERS {
-        let jobs_rx = Arc::clone(&jobs_rx);
-        let udp = Arc::clone(&udp);
-        thread::spawn(move || worker(jobs_rx, udp, upstream));
-    }
-
-    let tcp_jobs = jobs_tx.clone();
+    // Separate bounded pools reserve UDP capacity even when TCP is saturated.
+    let jobs_tx = start_workers(UDP_WORKERS, QUEUE_CAPACITY, &udp, upstream);
+    let tcp_jobs = start_workers(TCP_WORKERS, TCP_QUEUE_CAPACITY, &udp, upstream);
+    let sources = Arc::new(Mutex::new(BTreeMap::new()));
     thread::spawn(move || {
         for stream in tcp.incoming().flatten() {
-            // A full queue means the service is already at its configured
-            // concurrency bound. Dropping the stream makes the client retry
-            // without consuming another host task.
-            let _ = tcp_jobs.try_send(Job::Tcp(stream));
+            let deadline = Instant::now() + UPSTREAM_TIMEOUT;
+            let Ok(from) = stream.peer_addr() else { continue };
+            let Some(permit) = admit_tcp(&sources, from.ip()) else { continue };
+            // The permit covers queued and running work and is released even
+            // when a full queue drops this stream. Queuing consumes its deadline.
+            let _ = tcp_jobs.try_send(Job::Tcp(stream, deadline, permit));
         }
     });
 
@@ -78,8 +79,41 @@ pub fn serve() -> Result<()> {
 }
 
 enum Job {
-    Tcp(TcpStream),
+    Tcp(TcpStream, Instant, TcpPermit),
     Udp(Vec<u8>, SocketAddr),
+}
+
+type Sources = Arc<Mutex<BTreeMap<IpAddr, usize>>>;
+
+struct TcpPermit { sources: Sources, source: IpAddr }
+
+fn admit_tcp(sources: &Sources, source: IpAddr) -> Option<TcpPermit> {
+    let mut counts = sources.lock().unwrap_or_else(|e| e.into_inner());
+    let count = counts.entry(source).or_default();
+    if *count >= TCP_PER_SOURCE { return None; }
+    *count += 1;
+    Some(TcpPermit { sources: Arc::clone(sources), source })
+}
+
+impl Drop for TcpPermit {
+    fn drop(&mut self) {
+        let mut counts = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = counts.get_mut(&self.source) {
+            *count -= 1;
+            if *count == 0 { counts.remove(&self.source); }
+        }
+    }
+}
+
+fn start_workers(count: usize, capacity: usize, udp: &Arc<UdpSocket>, upstream: Ipv4Addr) -> mpsc::SyncSender<Job> {
+    let (tx, rx) = mpsc::sync_channel(capacity);
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..count {
+        let jobs = Arc::clone(&rx);
+        let udp = Arc::clone(udp);
+        thread::spawn(move || worker(jobs, udp, upstream));
+    }
+    tx
 }
 
 fn worker(jobs: Arc<Mutex<mpsc::Receiver<Job>>>, udp: Arc<UdpSocket>, upstream: Ipv4Addr) {
@@ -89,8 +123,8 @@ fn worker(jobs: Arc<Mutex<mpsc::Receiver<Job>>>, udp: Arc<UdpSocket>, upstream: 
             receiver.recv()
         };
         match job {
-            Ok(Job::Tcp(stream)) => {
-                let _ = serve_tcp(stream, upstream);
+            Ok(Job::Tcp(stream, deadline, _permit)) => {
+                let _ = serve_tcp(stream, upstream, deadline);
             }
             Ok(Job::Udp(query, from)) => {
                 if let Some(reply) = answer(&query, from, upstream, Transport::Udp) {
@@ -109,12 +143,11 @@ enum Transport {
 }
 
 /// DNS over TCP: each message is prefixed with its length as a u16.
-fn serve_tcp(mut stream: TcpStream, upstream: Ipv4Addr) -> Result<()> {
-    stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
+fn serve_tcp(mut stream: TcpStream, upstream: Ipv4Addr, deadline: Instant) -> Result<()> {
     let from = stream.peer_addr()?;
-    let query = read_tcp_message(&mut stream)?;
+    let query = read_tcp_message(&mut stream, deadline)?;
     if let Some(reply) = answer(&query, from, upstream, Transport::Tcp) {
-        write_tcp_message(&mut stream, &reply)?;
+        write_tcp_message(&mut stream, &reply, Instant::now() + UPSTREAM_TIMEOUT)?;
     }
     Ok(())
 }
@@ -240,23 +273,58 @@ fn forward_udp(query: &[u8], upstream: Ipv4Addr) -> Result<Vec<u8>> {
 }
 
 fn forward_tcp(query: &[u8], upstream: Ipv4Addr) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect_timeout(&SocketAddr::from((upstream, 53)), UPSTREAM_TIMEOUT)?;
-    stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
-    write_tcp_message(&mut stream, query)?;
-    read_tcp_message(&mut stream)
+    let deadline = Instant::now() + UPSTREAM_TIMEOUT;
+    let mut stream = TcpStream::connect_timeout(&SocketAddr::from((upstream, 53)), remaining(deadline)?)?;
+    write_tcp_message(&mut stream, query, deadline)?;
+    read_tcp_message(&mut stream, deadline)
 }
 
-fn read_tcp_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn remaining(deadline: Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() { bail!("DNS TCP frame deadline exceeded"); }
+    Ok(left)
+}
+
+fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => bail!("truncated DNS TCP frame"),
+            Ok(n) => bytes = &mut bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("read DNS TCP frame"),
+        }
+    }
+    remaining(deadline)?;
+    Ok(())
+}
+
+fn read_tcp_message(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>> {
     let mut len = [0u8; 2];
-    stream.read_exact(&mut len)?;
-    let mut msg = vec![0u8; u16::from_be_bytes(len) as usize];
-    stream.read_exact(&mut msg)?;
+    read_exact_until(stream, &mut len, deadline)?;
+    let size = u16::from_be_bytes(len) as usize;
+    if !(HEADER_LEN..=MAX_TCP_MESSAGE).contains(&size) {
+        bail!("DNS TCP message size must be {HEADER_LEN}..={MAX_TCP_MESSAGE} bytes");
+    }
+    let mut msg = vec![0u8; size];
+    read_exact_until(stream, &mut msg, deadline)?;
     Ok(msg)
 }
 
-fn write_tcp_message(stream: &mut TcpStream, msg: &[u8]) -> Result<()> {
-    stream.write_all(&(msg.len() as u16).to_be_bytes())?;
-    stream.write_all(msg)?;
+fn write_tcp_message(stream: &mut TcpStream, msg: &[u8], deadline: Instant) -> Result<()> {
+    if msg.len() > MAX_TCP_MESSAGE { bail!("DNS TCP message too large"); }
+    let mut frame = (msg.len() as u16).to_be_bytes().to_vec();
+    frame.extend_from_slice(msg);
+    let mut bytes = frame.as_slice();
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => bail!("short DNS TCP write"),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("write DNS TCP frame"),
+        }
+    }
     Ok(())
 }
 
@@ -269,5 +337,58 @@ fn qtype_name(qtype: u16) -> String {
         28 => "AAAA".into(),
         65 => "HTTPS".into(),
         n => format!("TYPE{n}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn tcp_frame_has_one_deadline_despite_header_and_body_progress() {
+        let (mut client, mut server) = pair();
+        let writer = thread::spawn(move || {
+            for byte in [0, 12].into_iter().chain(std::iter::repeat_n(0, 12)) {
+                if client.write_all(&[byte]).is_err() { break; }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let start = Instant::now();
+        assert!(read_tcp_message(&mut server, start + Duration::from_millis(180)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(450));
+        drop(server);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_size_cap_rejects_before_waiting_for_body() {
+        let (mut client, mut server) = pair();
+        client.write_all(&((MAX_TCP_MESSAGE + 1) as u16).to_be_bytes()).unwrap();
+        let start = Instant::now();
+        assert!(read_tcp_message(&mut server, start + Duration::from_secs(3)).unwrap_err()
+            .to_string().contains("message size"));
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn tcp_source_permits_cover_queued_work_and_release_on_drop() {
+        let sources = Arc::new(Mutex::new(BTreeMap::new()));
+        let first = "10.88.0.2".parse().unwrap();
+        let second = "10.88.0.3".parse().unwrap();
+        let a = admit_tcp(&sources, first).unwrap();
+        let b = admit_tcp(&sources, first).unwrap();
+        assert!(admit_tcp(&sources, first).is_none());
+        let other = admit_tcp(&sources, second).unwrap();
+        drop(a);
+        let replacement = admit_tcp(&sources, first).unwrap();
+        drop((b, other, replacement));
+        assert!(sources.lock().unwrap().is_empty());
     }
 }

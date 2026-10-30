@@ -532,8 +532,11 @@ in their code and service configuration:
 
 - **The DNS forwarder could be made to start unlimited threads.** It spawned
   one per query, so any networked sandbox could exhaust the host's tasks.
-  Now 16 workers take jobs from a queue of 256; when it's full, new datagrams
-  and TCP connections are dropped and clients retry, which DNS clients do
+  Now 12 UDP workers use a queue of 256 and four separate TCP workers use
+  a queue of 32. TCP admission allows two queued/running connections per
+  source, frames are capped at 4096 bytes, and prefix plus body share an
+  absolute three-second deadline from acceptance. When queues are full, new
+  requests are dropped and clients retry, which DNS clients do
   anyway. The `kiln-dns` unit also caps tasks (`TasksMax=64`) and memory.
   Anything a sandbox can talk to is part of the wall.
 - **The metrics server handled one connection at a time.** One slow client
