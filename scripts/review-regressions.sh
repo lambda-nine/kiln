@@ -244,6 +244,7 @@ sh scripts/pid1-lifecycle-regressions.sh
 
 echo "12. Persistent control protocol"
 sh scripts/control-protocol-regressions.sh
+sudo python3 -I scripts/busy-exec-regressions.py "$KILN"
 
 echo "13. Persistent registry identity"
 sh scripts/shim-identity-regressions.sh

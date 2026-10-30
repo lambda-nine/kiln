@@ -27,8 +27,15 @@ Descriptors attached to a body, unexpected ancillary messages, ancillary
 truncation and invalid reserved/header fields are rejected and closed.
 One absolute two-second signal-aware receive deadline covers header and body.
 A complete request may half-close its write side while retaining its reader;
-a full close cancels an active exec. A busy exec returns a failure for that
-request; capability probes remain available while an exec runs.
+a full close cancels an active exec. While busy, both legacy and typed execs
+are classified from the fixed header: their descriptors close before a busy
+reply is sent, and no refused body is read. A partial body cannot delay a
+queued removal. Linux may close this socket with `ECONNRESET` because the
+refused request body is unread: only a complete, validated Busy frame with
+no child started is accepted before that reset. All other resets, truncated
+frames and trailing bytes remain protocol failures. Clients also read this
+acknowledgement if the early refusal interrupts their body write.
+Capability probes remain available while an exec runs.
 
 ## Reply framing
 

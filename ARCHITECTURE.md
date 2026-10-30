@@ -96,7 +96,9 @@ three stdio descriptors for exec, none for removal, rejects ancillary
 truncation and descriptors attached to the payload, and closes every received
 descriptor on errors. After a complete request, `shutdown(SHUT_WR)` explicitly
 means "request finished; response still wanted"; a full close cancels an active
-exec.
+exec. Competing legacy and typed execs are refused from the fixed header
+while busy: received descriptors close before the busy reply, and no body
+bytes are consumed. A partial competing body cannot delay queued removal.
 
 The shim atomically publishes `shim.start` followed by `shim.pid`, using a
 same-directory rename for each file; the PID file is the completed identity

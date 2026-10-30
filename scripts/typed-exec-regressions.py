@@ -107,14 +107,26 @@ def raw_exec(identifier, args):
     with open("/dev/null", "r+b") as null:
         rights = array.array("i", [null.fileno()] * 3)
         client.sendmsg([struct.pack("<B3xI", 4, len(payload))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
-    client.sendall(payload)
+    try:
+        client.sendall(payload)
+    except (BrokenPipeError, ConnectionResetError):
+        # An early busy refusal can interrupt a body send. The caller still
+        # must validate the explicit Busy frame, never infer one from errno.
+        pass
     return client
 
 
 def receive(client):
     data = bytearray()
     while True:
-        part = client.recv(2089)
+        try:
+            part = client.recv(2089)
+        except ConnectionResetError:
+            # Header-only refusal leaves body bytes unread in PID 1. Match
+            # the production decoder: only a complete Busy frame permits RST.
+            result = outcome(bytes(data))
+            assert result[:3] == (2, 0, 1) and result[5:7] == (5, 1)
+            return bytes(data)
         if not part:
             return bytes(data)
         data.extend(part)

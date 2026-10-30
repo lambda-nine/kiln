@@ -9,6 +9,8 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Restore fixed-header busy refusal for legacy and typed execs: close received descriptors and reply without reading the refused body or delaying queued removal.
+
 - Bound DNS TCP frames by one absolute deadline and a 4096-byte cap; limit each source to two TCP admissions and reserve separate UDP workers.
 
 - Fail GC on partial cgroup or network teardown, verify resource absence, and retain registry identity and unconfirmed leases for retry.

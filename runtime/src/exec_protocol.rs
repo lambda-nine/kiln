@@ -269,6 +269,16 @@ pub fn read_reply(stream: &mut UnixStream, overall: Option<Instant>) -> Result<F
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                // Header-only busy refusal intentionally leaves request bytes
+                // unread. Linux may terminate that Unix stream with ECONNRESET
+                // after delivering the complete reply instead of a clean EOF.
+                let frame = Frame::decode(&bytes).context("reset before complete busy reply")?;
+                ensure!(matches!(&frame, Frame::Outcome(o) if o.kind == FailureKind::Busy
+                    && o.cleanup == Cleanup::NoChildStarted && o.status.is_none()),
+                    "reset without complete busy reply");
+                return Ok(frame);
+            }
             Err(e) => return Err(e).context("incomplete control response"),
         }
     }
@@ -416,6 +426,22 @@ mod tests {
         let (mut tx, mut rx) = UnixStream::pair().unwrap();
         tx.write_all(&bytes).unwrap(); // A valid frame without EOF is incomplete.
         assert!(read_reply(&mut rx, Some(Instant::now() + Duration::from_millis(20))).is_err());
+    }
+
+    #[test]
+    fn reset_after_unread_request_accepts_only_one_complete_busy_frame() {
+        let busy = Frame::Outcome(Outcome::failure(FailureKind::Busy, Stage::Validate,
+            Cleanup::NoChildStarted, 0, "active")).encode().unwrap();
+        let command = Frame::Outcome(Outcome::command(CommandStatus::Exited(0))).encode().unwrap();
+        let mut trailing = busy.clone(); trailing.push(0);
+        for (bytes, accepted) in [(busy.clone(), true), (busy[..20].to_vec(), false),
+            (command, false), (trailing, false)] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.write_all(b"unread request body").unwrap();
+            server.write_all(&bytes).unwrap();
+            drop(server);
+            assert_eq!(read_reply(&mut client, Some(Instant::now() + FRAME_TIMEOUT)).is_ok(), accepted);
+        }
     }
 
     #[test]

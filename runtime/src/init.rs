@@ -20,7 +20,7 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
-use crate::persistent::{EXEC_FAILED, ReadState, Request, RequestReader};
+use crate::persistent::{EXEC_FAILED, HeaderReader, ReadState, Request, RequestReader};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, CommandStatus, FailureKind,
     Frame, Outcome as ExecOutcome, Stage};
 
@@ -718,19 +718,19 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
         return Ok(None);
     }
     let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
-    let mut reader = RequestReader::new();
-    let request = loop {
+    let mut reader = HeaderReader::new();
+    let header = loop {
         if Instant::now() >= deadline {
             eprintln!("kiln: bad request during exec: framing deadline exceeded");
             return Ok(None);
         }
         match reader.read(&stream) {
-            Ok(ReadState::Complete(request)) => {
+            Ok(ReadState::Complete(header)) => {
                 if Instant::now() >= deadline {
                     eprintln!("kiln: bad request during exec: framing deadline exceeded");
                     return Ok(None);
                 }
-                break request;
+                break header;
             }
             Ok(ReadState::Pending) => match wait_for_frame(&stream, signals, deadline) {
                 Ok(FrameWake::Client) => continue,
@@ -746,21 +746,27 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
             }
         }
     };
-    match request {
-        Request::Remove => Ok(Some(stream)),
-        Request::Capabilities => {
+    match header.op {
+        2 if header.len == 0 && header.fds.is_empty() => Ok(Some(stream)),
+        3 if header.len == 0 && header.fds.is_empty() => {
             respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
             Ok(None)
         }
-        Request::Exec(_, _) | Request::TypedExec(_, _) => {
-            let typed = matches!(request, Request::TypedExec(_, _));
-            drop(request);
+        1 | 4 if header.fds.len() == 3 && header.len as usize <= crate::validation::MAX_EXEC_REQUEST_BYTES => {
+            let typed = header.op == 4;
+            // A competing exec can be classified from its fixed header. Close
+            // its descriptors before replying; never read or allocate its body.
+            drop(header);
             eprintln!("kiln: refused an exec request while another exec runs");
             let bytes = if typed {
                 Frame::Outcome(ExecOutcome::failure(FailureKind::Busy, Stage::Validate,
                     Cleanup::NoChildStarted, 0, "another exec is active")).encode()?
             } else { EXEC_FAILED.to_ne_bytes().to_vec() };
             respond(&stream, &bytes, signals, false);
+            Ok(None)
+        }
+        _ => {
+            eprintln!("kiln: invalid request header during exec");
             Ok(None)
         }
     }
@@ -883,13 +889,21 @@ mod tests {
             (o, stdout, stderr)
         }
         fn start_exec(&self, args: &[&str]) -> (UnixStream, OwnedFd, OwnedFd) {
+            let mut body = (args.len() as u32).to_le_bytes().to_vec();
+            for arg in args { body.extend_from_slice(&(arg.len() as u32).to_le_bytes()); body.extend_from_slice(arg.as_bytes()); }
+            let (stream, out, err) = self.start_exec_header(4, body.len() as u32);
+            if let Err(e) = (&stream).write_all(&body) {
+                assert!(matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "{e}");
+            }
+            (stream, out, err)
+        }
+        fn start_exec_header(&self, op: u8, len: u32) -> (UnixStream, OwnedFd, OwnedFd) {
             let stream = self.connect();
             let input = fs::File::open("/dev/null").unwrap();
             let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
             let (err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
-            let mut body = (args.len() as u32).to_le_bytes().to_vec();
-            for arg in args { body.extend_from_slice(&(arg.len() as u32).to_le_bytes()); body.extend_from_slice(arg.as_bytes()); }
-            let mut header = vec![4, 0, 0, 0]; header.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            let mut header = vec![op, 0, 0, 0];
+            header.extend_from_slice(&if op == 4 { len.to_le_bytes() } else { len.to_ne_bytes() });
             let fds: [RawFd; 3] = [input.as_raw_fd(), out_tx.as_raw_fd(), err_tx.as_raw_fd()];
             let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(12) as usize }];
             let mut iov = libc::iovec { iov_base: header.as_mut_ptr().cast(), iov_len: 8 };
@@ -902,7 +916,6 @@ mod tests {
                 std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast(), 3);
                 assert_eq!(libc::sendmsg(stream.as_raw_fd(), &msg, 0), 8);
             }
-            (&stream).write_all(&body).unwrap();
             (stream, out_rx, err_rx)
         }
     }
@@ -957,6 +970,8 @@ mod tests {
         assert!(matches!(protocol::read_reply(&mut probe, Some(Instant::now() + Duration::from_secs(5))).unwrap(), Frame::Capabilities(_)));
         let busy = server.exec(&["/bin/true"]).0;
         assert_eq!((busy.kind, busy.cleanup), (FailureKind::Busy, Cleanup::NoChildStarted));
+        let large = "x".repeat(700_000);
+        assert_eq!(server.exec(&["/bin/true", &large]).0.kind, FailureKind::Busy);
         drop((active, out, err));
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
@@ -970,6 +985,41 @@ mod tests {
         assert_eq!((o.kind, o.stage, o.cleanup, o.status), (FailureKind::CleanupFailed,
             Stage::Cleanup, Cleanup::Unconfirmed, Some(CommandStatus::Exited(125))));
         assert_eq!(out, b"retained"); assert!(err.is_empty());
+    }
+
+    #[test]
+    fn busy_exec_headers_close_fds_without_waiting_for_body_or_removal() {
+        for op in [1, 4] {
+            let server = Server::start();
+            let marker = server.root.join("busy-started");
+            let command = format!("echo ready > {}; exec /bin/sleep 30", marker.display());
+            let (_active, _out, _err) = server.start_exec(&["/bin/sh", "-c", &command]);
+            server.wait_for("busy-started");
+            let start = Instant::now();
+            let (mut busy, out, err) = server.start_exec_header(op, 1024 * 1024);
+            busy.write_all(b"x").unwrap();
+            // Removal is already queued while the refused body is incomplete.
+            let mut remover = server.connect();
+            remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            if op == 4 {
+                let Frame::Outcome(o) = protocol::read_reply(&mut busy,
+                    Some(start + Duration::from_millis(800))).unwrap() else { panic!("missing busy outcome") };
+                assert_eq!((o.kind, o.cleanup), (FailureKind::Busy, Cleanup::NoChildStarted));
+            } else {
+                busy.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+                let mut code = [0u8; 4]; busy.read_exact(&mut code).unwrap();
+                assert_eq!(i32::from_ne_bytes(code), EXEC_FAILED);
+            }
+            for fd in [out, err] {
+                let mut pollfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 400) }, 1, "refused descriptors still open");
+                assert_eq!(fs::File::from(fd).read(&mut [0u8; 1]).unwrap(), 0);
+            }
+            remover.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+            let mut status = [0u8; 4]; remover.read_exact(&mut status).unwrap();
+            assert_eq!(i32::from_ne_bytes(status), 0);
+            assert!(start.elapsed() < Duration::from_millis(800));
+        }
     }
 
     #[test]

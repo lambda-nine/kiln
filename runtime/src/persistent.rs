@@ -296,7 +296,17 @@ fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio:
         // From the first send onward a partial transfer may have reached PID 1.
         cleanup = Cleanup::Unconfirmed;
         send_header(&stream, 4, payload.len() as u32, &stdio)?;
-        stream.write_all(&payload)?;
+        if let Err(error) = stream.write_all(&payload) {
+            // Busy may be returned as soon as the header arrives, before a
+            // large body can finish writing. Only that explicit no-child
+            // acknowledgement overrides an interrupted request write.
+            let reply = protocol::read_reply(&mut stream, Some(Instant::now() + protocol::FRAME_TIMEOUT));
+            if let Ok(Frame::Outcome(o)) = reply && o.kind == FailureKind::Busy
+                && o.cleanup == Cleanup::NoChildStarted && o.status.is_none() {
+                return Ok(o);
+            }
+            return Err(error).context("send exec request body");
+        }
         drop(fds);
         stage = Stage::Report;
         match protocol::read_reply(&mut stream, None)? {
