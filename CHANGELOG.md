@@ -9,6 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Schedule DNS work by source IP: bound each UDP source's backlog and worker
+  share, and frame TCP incrementally before source-fair worker admission.
+  Keep the separate pools, absolute TCP deadline and 4096-byte frame cap.
+
 - Share one complete non-public IPv4 deny set across literals/prefixes,
   hostname answers and the allowlist/full-mode nft guard, including special-use,
   documentation, multicast, reserved and limited broadcast destinations.

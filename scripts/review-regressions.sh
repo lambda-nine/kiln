@@ -51,6 +51,7 @@ echo "DNS tasks: before=$before peak=$peak"
 [ "$peak" -le 24 ] || { echo "FAIL: DNS task count is still query-proportional"; exit 1; }
 
 sudo python3 -I scripts/dns-regressions.py "$KILN"
+sudo python3 -I scripts/dns-fairness-regressions.py "$KILN"
 
 echo "3. Inode quota"
 created=$(

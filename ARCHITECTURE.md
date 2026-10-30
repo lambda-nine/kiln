@@ -236,9 +236,15 @@ host-side exception. IPv6 destinations are unsupported.
 
 ### Shared DNS admission
 
-The DNS forwarder reserves twelve workers and 256 queued jobs for UDP; four
-workers and 32 queued jobs handle TCP. Each source may hold at most two
-queued/running TCP permits. A TCP frame's length prefix and body share one
-absolute three-second deadline from accept (including queue time), and query
-and upstream response frames are capped at 4096 bytes before allocation.
-Slow TCP senders cannot occupy the workers reserved for UDP.
+The DNS forwarder reserves twelve UDP workers and four TCP workers in separate
+pools. Both queues schedule by source IP in round-robin order, with at most one
+running query per source. UDP permits two queued/running queries per source
+and 256 queued globally. TCP has at most 256 streams globally and two per
+source across partial framing, queued queries and running work. A single
+nonblocking reactor reads every partial stream; a slow prefix or body consumes
+no worker. Expired streams and queued jobs release their permits. A TCP
+frame's prefix and body share one absolute three-second deadline from accept,
+including queue time, and query/upstream response frames are capped at 4096
+bytes before allocation. Upstream calls can still occupy workers for three
+seconds, and global capacity limits can drop queries; scheduling fairness is
+not a service guarantee when all capacity or the upstream is unavailable.
