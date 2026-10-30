@@ -9,6 +9,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Read busy headers incrementally beside active-client, signal and listener
+  events; bound pending headers and prioritize complete removal over partial
+  clients without delaying disconnect cleanup.
+
 - Schedule DNS work by source IP: bound each UDP source's backlog and worker
   share, and frame TCP incrementally before source-fair worker admission.
   Keep the separate pools, absolute TCP deadline and 4096-byte frame cap.

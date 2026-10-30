@@ -208,7 +208,13 @@ scripts/review-regressions.sh
     nonblockingly while polling the same signalfd, with one absolute two-second
     deadline for the header and payload. An incomplete or malformed root-side
     client is dropped without leaking its passed descriptors, so later exec or
-    removal requests still run. A client may half-close its completed request
+    removal requests still run. During an active exec, PID 1 incrementally
+    watches up to sixteen partial competing headers beside the active client,
+    signals and listener, accepting at most eight connections per wake. The
+    oldest incomplete header gives way when full, and a complete queued remove
+    takes priority over incomplete headers. Each header keeps its two-second
+    absolute deadline; partial clients cannot stall removal or disconnect
+    cleanup. A client may half-close its completed request
     and keep reading the response; only a full close cancels an active exec.
     Commands start with the normal default `SIGPIPE` behavior. `kiln exec`
     exits with the command's code (128 + signal if it was killed), or 125 when

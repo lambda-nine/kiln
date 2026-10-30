@@ -248,3 +248,14 @@ including queue time, and query/upstream response frames are capped at 4096
 bytes before allocation. Upstream calls can still occupy workers for three
 seconds, and global capacity limits can drop queries; scheduling fairness is
 not a service guarantee when all capacity or the upstream is unavailable.
+
+### Busy control admission
+
+While an exec runs, PID 1 polls its active client, signalfd, bootstrap pipe,
+listener and at most sixteen incomplete busy headers together. It accepts at
+most eight new connections per wake and evicts the oldest incomplete header
+when the table is full. Headers advance only on nonblocking reads; each keeps
+one absolute two-second deadline. A complete remove is selected before other
+completed headers are answered, regardless of older partial clients. Competing
+exec bodies are never read or allocated. Pending streams and received
+descriptors close when the active exec ends; they cannot turn into later execs.

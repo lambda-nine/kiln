@@ -20,7 +20,7 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
-use crate::persistent::{EXEC_FAILED, HeaderReader, ReadState, Request, RequestReader};
+use crate::persistent::{EXEC_FAILED, Header, HeaderReader, ReadState, Request, RequestReader};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, CommandStatus, FailureKind,
     Frame, Outcome as ExecOutcome, Stage};
 
@@ -34,6 +34,18 @@ pub const FORWARDED: [Signal; 4] =
 /// One absolute window for a complete local control frame, from its first
 /// accept through its final payload byte. Progress does not reset it.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Connections a running exec keeps with an incomplete header. One header holds
+/// at most three descriptors, so this also bounds what they can pin in PID 1.
+const MAX_BUSY_PENDING: usize = 16;
+
+/// Connections a running exec accepts per wake. The rest stay queued until the
+/// signalfd, the client and the bootstrap channel have been serviced again.
+const MAX_BUSY_ACCEPTS: usize = 8;
+
+/// The exec loop's fixed pollfds, ahead of the pending busy headers: signals,
+/// client, listener and bootstrap channel.
+const EXEC_WATCH: usize = 4;
 
 /// Starts `argv` as a child and supervises it until it exits. Returns its
 /// shell-style exit code (128 + signal number if it was killed).
@@ -196,11 +208,6 @@ enum FramingOutcome {
     Stop(i32),
 }
 
-enum FrameWake {
-    Client,
-    Signal,
-}
-
 /// Reads one idle request without abandoning PID 1's signal duties. Framing
 /// has one absolute deadline; a slow byte stream cannot extend it by making
 /// occasional progress.
@@ -227,7 +234,7 @@ fn receive_idle_request(stream: &mut UnixStream, signals: &SignalFd) -> Result<F
         if let ReadState::Complete(request) = state {
             return Ok(FramingOutcome::Request(request));
         }
-        let _ = wait_for_frame(stream, signals, deadline)?;
+        wait_for_frame(stream, signals, deadline)?;
     }
 }
 
@@ -248,12 +255,15 @@ fn read_frame_before_deadline<T>(
     Ok((state, stop))
 }
 
-fn wait_for_frame(stream: &UnixStream, signals: &SignalFd, deadline: Instant) -> Result<FrameWake> {
+fn poll_millis(remaining: Duration) -> i32 {
+    remaining.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+}
+
+fn wait_for_frame(stream: &UnixStream, signals: &SignalFd, deadline: Instant) -> Result<()> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("control request framing deadline exceeded")?;
-    let millis = remaining.as_nanos().div_ceil(1_000_000);
-    let timeout = millis.min(i32::MAX as u128) as i32;
+    let timeout = poll_millis(remaining);
     let mut wait = [
         libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         libc::pollfd {
@@ -266,12 +276,7 @@ fn wait_for_frame(stream: &UnixStream, signals: &SignalFd, deadline: Instant) ->
         return Err(anyhow::anyhow!("control request framing deadline exceeded"));
     }
     poll_error(wait[0].revents, "signalfd")?;
-    socket_poll_error(wait[1].revents, "control request")?;
-    if wait[0].revents & libc::POLLIN != 0 {
-        Ok(FrameWake::Signal)
-    } else {
-        Ok(FrameWake::Client)
-    }
+    socket_poll_error(wait[1].revents, "control request")
 }
 
 /// Runs one exec request inside the exec cgroup. Process groups and sessions
@@ -338,17 +343,26 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
         }
         let mut bootstrap = BootstrapReader::new();
         let mut release = Some(release_tx);
+        // Local to this region: whichever way the exec ends, these streams and
+        // their descriptors close here and never reach idle or a later launch.
+        let mut busy = BusyHeaders::new();
         loop {
             bootstrap.advance(&joined_rx)?;
             if let Some((stage, errno)) = bootstrap.failure {
                 return Ok(launch_failure(stage, Cleanup::Unconfirmed, errno, "exec bootstrap failed"));
             }
             let mut wait = watch(signals, client, listener);
-            let mut fds = [wait[0], wait[1], wait[2], libc::pollfd {
-                fd: if bootstrap.eof { -1 } else { joined_rx.as_raw_fd() }, events: libc::POLLIN, revents: 0 }];
-            poll(&mut fds, if bootstrap.joined && release.is_some() { 0 } else { -1 })?;
+            // Negative descriptors in the unused slots are ignored by poll().
+            let mut fds = [libc::pollfd { fd: -1, events: 0, revents: 0 }; EXEC_WATCH + MAX_BUSY_PENDING];
+            fds[..3].copy_from_slice(&wait);
+            fds[3] = libc::pollfd {
+                fd: if bootstrap.eof { -1 } else { joined_rx.as_raw_fd() }, events: libc::POLLIN, revents: 0 };
+            busy.watch(&mut fds[EXEC_WATCH..]);
+            poll(&mut fds, if bootstrap.joined && release.is_some() { 0 } else { busy.timeout() })?;
             wait.copy_from_slice(&fds[..3]);
-            if let Some(outcome) = interrupted(&wait, listener, signals)? { return Ok(outcome); }
+            if let Some(outcome) = interrupted(&wait, &fds[EXEC_WATCH..], &mut busy, listener, signals)? {
+                return Ok(outcome);
+            }
             while let Some(info) = signals.read_signal().context("read signalfd")? {
                 match Signal::try_from(info.ssi_signo as i32) {
                     Ok(Signal::SIGCHLD) => if let Some(s) = reap(Some(leader))? { status = Some(s); },
@@ -690,67 +704,127 @@ fn prepare_command_signals() {
 }
 
 /// Whether the exec must stop because its client hung up or `kiln rm` came.
-fn interrupted(wait: &[libc::pollfd; 3], listener: &UnixListener,
-    signals: &SignalFd) -> Result<Option<Outcome>> {
+/// Headers are only read here, never waited for, so a slow connection can't
+/// keep the exec loop from its client, its signals or the listener.
+fn interrupted(wait: &[libc::pollfd; 3], ready: &[libc::pollfd], busy: &mut BusyHeaders,
+    listener: &UnixListener, signals: &SignalFd) -> Result<Option<Outcome>> {
     poll_error(wait[0].revents, "signalfd")?;
     poll_error(wait[2].revents, "control listener")?;
     let disconnected = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
     if wait[1].revents & disconnected != 0 {
         return Ok(Some(Outcome::Disconnected));
     }
-    if wait[2].revents & libc::POLLIN != 0 {
-        return Ok(accept_while_busy(listener, signals)?.map(Outcome::Removed));
+    let mut completed = busy.advance(ready, wait[2].revents & libc::POLLIN != 0, listener)?;
+    // Removal wins this pass before anything else is answered.
+    let remover = completed.iter().position(|(_, header)| is_remove(header))
+        .map(|at| completed.swap_remove(at).0);
+    for (stream, header) in completed {
+        answer_busy_header(&stream, header, signals)?;
     }
-    Ok(None)
+    Ok(remover.map(Outcome::Removed))
 }
 
-/// Handles a connection that arrives while an exec runs. Execs run one at a
-/// time, so another exec request fails with EXEC_FAILED instead of queueing.
-/// Returns a `kiln rm` connection, which interrupts the running exec.
-fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Option<UnixStream>> {
-    let stream = match listener.accept() {
-        Ok((stream, _)) => stream,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(e) => return Err(e).context("accept exec request"),
-    };
-    if let Err(e) = stream.set_nonblocking(true) {
-        eprintln!("kiln: set busy request nonblocking: {e}");
-        return Ok(None);
+/// One connection whose fixed header hasn't fully arrived while an exec runs.
+struct BusyHeader {
+    stream: UnixStream,
+    reader: HeaderReader,
+    deadline: Instant,
+}
+
+/// Connections accepted during an exec, oldest first. Their deadlines are
+/// therefore in order too, and the first one is the next to expire.
+struct BusyHeaders {
+    pending: Vec<BusyHeader>,
+}
+
+impl BusyHeaders {
+    fn new() -> Self { Self { pending: Vec::new() } }
+
+    fn watch(&self, slots: &mut [libc::pollfd]) {
+        for (slot, entry) in slots.iter_mut().zip(&self.pending) {
+            *slot = libc::pollfd { fd: entry.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        }
     }
-    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
-    let mut reader = HeaderReader::new();
-    let header = loop {
-        if Instant::now() >= deadline {
-            eprintln!("kiln: bad request during exec: framing deadline exceeded");
-            return Ok(None);
-        }
-        match reader.read(&stream) {
-            Ok(ReadState::Complete(header)) => {
-                if Instant::now() >= deadline {
-                    eprintln!("kiln: bad request during exec: framing deadline exceeded");
-                    return Ok(None);
-                }
-                break header;
-            }
-            Ok(ReadState::Pending) => match wait_for_frame(&stream, signals, deadline) {
-                Ok(FrameWake::Client) => continue,
-                Ok(FrameWake::Signal) => return Ok(None),
-                Err(e) => {
-                    eprintln!("kiln: bad request during exec: {e:#}");
-                    return Ok(None);
-                }
-            },
-            Err(e) => {
-                eprintln!("kiln: bad request during exec: {e:#}");
-                return Ok(None);
+
+    /// How long poll() may sleep before the oldest header expires.
+    fn timeout(&self) -> i32 {
+        self.pending.first().map_or(-1, |oldest| {
+            poll_millis(oldest.deadline.saturating_duration_since(Instant::now()))
+        })
+    }
+
+    /// Reads the streams `ready` reports, expires the overdue ones and then
+    /// accepts a bounded number of new ones. Returns the requests whose headers
+    /// are now complete; no request body is read or allocated.
+    fn advance(&mut self, ready: &[libc::pollfd], listening: bool,
+        listener: &UnixListener) -> Result<Vec<(UnixStream, Header)>> {
+        let now = Instant::now();
+        let mut completed = Vec::new();
+        for (entry, slot) in std::mem::take(&mut self.pending).into_iter().zip(ready) {
+            if slot.revents == 0 && now < entry.deadline {
+                self.pending.push(entry);
+            } else {
+                self.read(entry, &mut completed);
             }
         }
-    };
+        if !listening { return Ok(completed); }
+        for _ in 0..MAX_BUSY_ACCEPTS {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e).context("accept exec request"),
+            };
+            if let Err(e) = stream.set_nonblocking(true) {
+                eprintln!("kiln: set busy request nonblocking: {e}");
+                continue;
+            }
+            // Read before storing: a complete request never needs a slot, so a
+            // full table can't turn away a removal already in the queue.
+            self.read(BusyHeader {
+                stream,
+                reader: HeaderReader::new(),
+                deadline: Instant::now() + REQUEST_READ_TIMEOUT,
+            }, &mut completed);
+        }
+        Ok(completed)
+    }
+
+    /// Advances one header once. An error drops the stream and whatever
+    /// descriptors its reader holds; it belongs to that request alone.
+    fn read(&mut self, mut entry: BusyHeader, completed: &mut Vec<(UnixStream, Header)>) {
+        let read = read_frame_before_deadline(
+            entry.deadline,
+            || entry.reader.read(&entry.stream),
+            || Ok(None),
+            Instant::now,
+        );
+        match read {
+            Ok((ReadState::Complete(header), _)) => completed.push((entry.stream, header)),
+            Ok((ReadState::Pending, _)) => {
+                // Older streams give way, so a flood of partial headers can't
+                // keep the listener's later connections from being read.
+                if self.pending.len() == MAX_BUSY_PENDING {
+                    self.pending.remove(0);
+                    eprintln!("kiln: dropped the oldest incomplete request during exec");
+                }
+                self.pending.push(entry);
+            }
+            Err(e) => eprintln!("kiln: bad request during exec: {e:#}"),
+        }
+    }
+}
+
+fn is_remove(header: &Header) -> bool {
+    header.op == 2 && header.len == 0 && header.fds.is_empty()
+}
+
+/// Answers a complete header that arrived while an exec runs. Execs run one at
+/// a time, so another exec request fails with EXEC_FAILED instead of queueing.
+fn answer_busy_header(stream: &UnixStream, header: Header, signals: &SignalFd) -> Result<()> {
     match header.op {
-        2 if header.len == 0 && header.fds.is_empty() => Ok(Some(stream)),
+        2 if is_remove(&header) => eprintln!("kiln: dropped a second removal during exec"),
         3 if header.len == 0 && header.fds.is_empty() => {
-            respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
-            Ok(None)
+            respond(stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
         }
         1 | 4 if header.fds.len() == 3 && header.len as usize <= crate::validation::MAX_EXEC_REQUEST_BYTES => {
             let typed = header.op == 4;
@@ -762,14 +836,11 @@ fn accept_while_busy(listener: &UnixListener, signals: &SignalFd) -> Result<Opti
                 Frame::Outcome(ExecOutcome::failure(FailureKind::Busy, Stage::Validate,
                     Cleanup::NoChildStarted, 0, "another exec is active")).encode()?
             } else { EXEC_FAILED.to_ne_bytes().to_vec() };
-            respond(&stream, &bytes, signals, false);
-            Ok(None)
+            respond(stream, &bytes, signals, false);
         }
-        _ => {
-            eprintln!("kiln: invalid request header during exec");
-            Ok(None)
-        }
+        _ => eprintln!("kiln: invalid request header during exec"),
     }
+    Ok(())
 }
 
 /// Reaps every child that has exited, including orphans that were reparented
@@ -898,6 +969,10 @@ mod tests {
             (stream, out, err)
         }
         fn start_exec_header(&self, op: u8, len: u32) -> (UnixStream, OwnedFd, OwnedFd) {
+            self.start_exec_prefix(op, len, 8)
+        }
+        /// Sends the descriptors with the first `sent` bytes of an exec header.
+        fn start_exec_prefix(&self, op: u8, len: u32, sent: usize) -> (UnixStream, OwnedFd, OwnedFd) {
             let stream = self.connect();
             let input = fs::File::open("/dev/null").unwrap();
             let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
@@ -906,7 +981,7 @@ mod tests {
             header.extend_from_slice(&if op == 4 { len.to_le_bytes() } else { len.to_ne_bytes() });
             let fds: [RawFd; 3] = [input.as_raw_fd(), out_tx.as_raw_fd(), err_tx.as_raw_fd()];
             let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(12) as usize }];
-            let mut iov = libc::iovec { iov_base: header.as_mut_ptr().cast(), iov_len: 8 };
+            let mut iov = libc::iovec { iov_base: header.as_mut_ptr().cast(), iov_len: sent };
             unsafe {
                 let mut msg: libc::msghdr = std::mem::zeroed();
                 msg.msg_iov = &mut iov; msg.msg_iovlen = 1;
@@ -914,13 +989,55 @@ mod tests {
                 let c = libc::CMSG_FIRSTHDR(&msg); (*c).cmsg_level = libc::SOL_SOCKET;
                 (*c).cmsg_type = libc::SCM_RIGHTS; (*c).cmsg_len = libc::CMSG_LEN(12) as usize;
                 std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast(), 3);
-                assert_eq!(libc::sendmsg(stream.as_raw_fd(), &msg, 0), 8);
+                assert_eq!(libc::sendmsg(stream.as_raw_fd(), &msg, 0), sent as isize);
             }
             (stream, out_rx, err_rx)
+        }
+        /// Starts a sleeping exec and returns once it runs, with its host PID.
+        fn start_sleeper(&self) -> (UnixStream, OwnedFd, OwnedFd, i32) {
+            let marker = self.root.join("sleeper-pid");
+            let command = format!("echo $$ > {0}.pending; mv {0}.pending {0}; exec /bin/sleep 30", marker.display());
+            let (active, out, err) = self.start_exec(&["/bin/sh", "-c", &command]);
+            self.wait_for("sleeper-pid");
+            let pid = fs::read_to_string(marker).unwrap().trim().parse().unwrap();
+            (active, out, err, pid)
+        }
+        /// A capabilities round trip. The listener is first-in first-out, so an
+        /// answer also proves every earlier connection has been accepted.
+        fn probe(&self) {
+            let mut probe = self.connect();
+            probe.write_all(&[3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            assert!(matches!(protocol::read_reply(&mut probe, Some(Instant::now() + BUSY_PROMPT)).unwrap(),
+                Frame::Capabilities(_)));
+        }
+        fn partial_header(&self) -> UnixStream {
+            let partial = self.connect();
+            (&partial).write_all(&[4]).unwrap();
+            partial
         }
     }
     impl Drop for Server {
         fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = fs::remove_dir_all(&self.root); }
+    }
+
+    /// Below the two seconds one stalled header used to cost; normally a few ms.
+    const BUSY_PROMPT: Duration = Duration::from_millis(1500);
+
+    /// The descriptors' other end has closed: the read side reports EOF.
+    fn assert_closed(fd: OwnedFd, within: Duration, what: &str) {
+        let mut pollfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, within.as_millis() as i32) }, 1, "{what}");
+        assert_eq!(fs::File::from(fd).read(&mut [0u8; 1]).unwrap(), 0, "{what}");
+    }
+
+    /// PID 1 closed this stream. A byte it never read turns EOF into a reset.
+    fn assert_eof(mut stream: &UnixStream, within: Duration, what: &str) {
+        stream.set_read_timeout(Some(within)).unwrap();
+        match stream.read(&mut [0u8; 1]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("{what}: {other:?}"),
+        }
     }
 
     #[test]
@@ -1020,6 +1137,72 @@ mod tests {
             assert_eq!(i32::from_ne_bytes(status), 0);
             assert!(start.elapsed() < Duration::from_millis(800));
         }
+    }
+
+    #[test]
+    fn queued_removal_preempts_partial_busy_headers() {
+        let mut server = Server::start();
+        let (mut active, _out, _err, _pid) = server.start_sleeper();
+        // More partial headers than the table holds, ahead of the removal.
+        let partials: Vec<_> = (0..MAX_BUSY_PENDING + MAX_BUSY_ACCEPTS + 1).map(|_| server.partial_header()).collect();
+        let start = Instant::now();
+        let mut remover = server.connect();
+        remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        remover.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut status = [0u8; 4]; remover.read_exact(&mut status).unwrap();
+        assert_eq!(i32::from_ne_bytes(status), 0);
+        assert!(start.elapsed() < BUSY_PROMPT, "partial headers delayed removal: {:?}", start.elapsed());
+        let Frame::Outcome(o) = protocol::read_reply(&mut active, Some(Instant::now() + BUSY_PROMPT)).unwrap()
+            else { panic!("missing removal outcome") };
+        assert_eq!((o.kind, o.cleanup), (FailureKind::Stopped, Cleanup::Drained));
+        for partial in &partials { assert_eof(partial, BUSY_PROMPT, "partial header outlived removal"); }
+        assert!(server.child.wait().unwrap().success(), "removal did not end the fixture");
+    }
+
+    #[test]
+    fn active_disconnect_preempts_partial_busy_headers() {
+        let server = Server::start();
+        let (active, out, err, pid) = server.start_sleeper();
+        let partials: Vec<_> = (0..4).map(|_| server.partial_header()).collect();
+        let (rights, rights_out, rights_err) = server.start_exec_prefix(4, 1024, 1);
+        // Every partial header is now in the table, and none of them holds up
+        // a later complete request.
+        server.probe();
+        let start = Instant::now();
+        drop(active);
+        while kill(Pid::from_raw(pid), None).is_ok() {
+            assert!(start.elapsed() < BUSY_PROMPT, "disconnect waited on partial headers");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_closed(rights_out, BUSY_PROMPT, "partial descriptors outlived the exec");
+        assert_closed(rights_err, BUSY_PROMPT, "partial descriptors outlived the exec");
+        assert_eof(&rights, BUSY_PROMPT, "partial descriptors' stream outlived the exec");
+        for partial in &partials { assert_eof(partial, BUSY_PROMPT, "partial header carried into idle"); }
+        drop((out, err));
+        assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
+    }
+
+    #[test]
+    fn partial_busy_header_descriptors_close_at_its_deadline() {
+        let server = Server::start();
+        let (active, out, err, _pid) = server.start_sleeper();
+        let start = Instant::now();
+        let (partial, partial_out, partial_err) = server.start_exec_prefix(4, 1024, 1);
+        server.probe();
+        let mut held = libc::pollfd { fd: partial_out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut held, 1, 500) }, 0, "descriptors closed before the deadline");
+        // Nothing else wakes the exec loop: only the deadline's own timeout can.
+        let limit = REQUEST_READ_TIMEOUT + BUSY_PROMPT;
+        assert_closed(partial_out, limit, "expired header kept its descriptors");
+        assert_closed(partial_err, limit, "expired header kept its descriptors");
+        assert_eof(&partial, limit, "expired header kept its stream");
+        let elapsed = start.elapsed();
+        assert!(elapsed >= REQUEST_READ_TIMEOUT - Duration::from_millis(100) && elapsed < limit, "{elapsed:?}");
+        // The active exec is untouched and still refuses competitors.
+        server.probe();
+        let busy = server.exec(&["/bin/true"]).0;
+        assert_eq!((busy.kind, busy.cleanup), (FailureKind::Busy, Cleanup::NoChildStarted));
+        drop((active, out, err));
     }
 
     #[test]
