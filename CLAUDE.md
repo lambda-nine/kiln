@@ -70,8 +70,7 @@ ones. Read these before changing anything:
   of `ip`/`nsenter`, batched nft), the v2 benchmark campaign, the design paper
   (`docs/paper/`) and the performance white paper (`docs/whitepaper/`).
 - **The reusable harness/control daemon will live beside this repository** as
-  `~/Projects/lambda-nine/kilnd`. Idea Marathon remains a separate product and
-  will consume that harness. ARCHITECTURE.md's target diagram shows the
+  `~/Projects/lambda-nine/kilnd`. ARCHITECTURE.md's target diagram shows the
   long-term shape; the daemon is not part of this repository.
 
 ## Next, roughly in order

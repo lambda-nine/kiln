@@ -216,8 +216,8 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 ## Build order
 
 ~~kiln-init~~ → ~~disk quota~~ → ~~user namespaces~~ → ~~seccomp/Landlock~~ → ~~networking~~ →
-~~metrics~~ → kilnd with long-lived sandboxes and exec → harness (with memory;
-first user is the idea-marathon app) → ~~cold-start work~~ ([docs/benchmarks.md](docs/benchmarks.md);
+~~metrics~~ → kilnd with long-lived sandboxes and exec → harness (with memory)
+→ ~~cold-start work~~ ([docs/benchmarks.md](docs/benchmarks.md);
 a pool of pre-created sandboxes in kilnd is the next step) → k3s operator.
 
 ### Public unicast IPv4 egress invariant

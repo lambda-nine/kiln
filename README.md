@@ -3,6 +3,27 @@
 A small Linux sandbox runtime, written in Rust, for running AI agent tool calls.
 Built layer by layer to learn how containers actually work.
 
+**Status: experimental** (see [Security status](#security-status) below).
+Developed and tested on Ubuntu 24.04 with Linux 6.8+ in the Lima VM described
+in [Dev setup](#dev-setup-macos); CI runs the unprivileged checks on Ubuntu
+24.04 x86_64. Other distributions and kernels are untested. Report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md). Licensed under
+[Apache-2.0](LICENSE).
+
+| Lambda IX repository | What it is |
+|----------------------|------------|
+| **kiln** (this repository) | The sandbox runtime: namespaces, cgroups v2, overlayfs, seccomp, Landlock and nftables on the host kernel |
+| [kilnd](https://github.com/lambda-nine/kilnd) | Per-node control daemon with a gRPC API; drives the installed `kiln` CLI and has an experimental Firecracker backend, disabled for production |
+| [kiln-guest](https://github.com/lambda-nine/kiln-guest) | Builds a Firecracker guest image that runs kiln inside a microVM ("VM outside, kiln inside") |
+| [kiln-harness](https://github.com/lambda-nine/kiln-harness) | Provider-neutral agent loop on top of kilnd's API |
+
+**Quickstart.** On an Ubuntu 24.04 machine (Linux 6.8+, cgroups v2) with
+root, install what [`lima.yaml`](lima.yaml) provisions in the VM
+(`sudo apt-get install -y build-essential iproute2 nftables xfsprogs` and Rust
+1.88+ through rustup), clone the repository and run the commands in
+[Dev setup](#dev-setup-macos) from its "now in Ubuntu 24.04" line on. On a
+Mac, start with `brew install lima` and the Lima VM in that section.
+
 ## Security status
 
 kiln is an **experimental, shared-kernel** runtime. Every sandbox runs on the

@@ -5,6 +5,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Prepare the repository for public visibility: open the README with status,
+  the four Lambda IX repositories, a quickstart and the license; drop a
+  reference to an unrelated project from ARCHITECTURE.md and the agent notes;
+  ignore `dist/`.
+
 - Document the installed host-service users/capabilities, privileged jobs and
   metrics freshness contract; record finite DNS reserve and busy-to-idle
   admission guarantees with their end-to-end regressions.
