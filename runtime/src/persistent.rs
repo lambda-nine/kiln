@@ -14,6 +14,7 @@ use nix::fcntl::OFlag;
 use nix::unistd::{ForkResult, fork, pipe2, read, setsid};
 
 use crate::container::{self, Config};
+use crate::exec_options::{self, ExecOptions};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, FailureKind, Frame, Outcome, Stage};
 use crate::validation::{
     MAX_ARGC, MAX_EXEC_REQUEST_BYTES as MAX_REQUEST, valid_persistent_id, validate_exec_argv,
@@ -30,6 +31,8 @@ pub const EXEC_FAILED: i32 = 125;
 pub enum Request {
     Exec(Vec<CString>, Vec<OwnedFd>),
     TypedExec(Vec<CString>, Vec<OwnedFd>),
+    /// Operation 5: operation 4's argv block followed by an exec options frame.
+    OptionsExec(Vec<CString>, ExecOptions, Vec<OwnedFd>),
     Capabilities,
     Remove,
 }
@@ -90,7 +93,7 @@ impl HeaderReader {
         }
         Ok(ReadState::Complete(Header {
             op: self.bytes[0],
-            len: if matches!(self.bytes[0], 3 | 4) {
+            len: if is_typed(self.bytes[0]) {
                 u32::from_le_bytes(self.bytes[4..].try_into().unwrap())
             } else { u32::from_ne_bytes(self.bytes[4..].try_into().unwrap()) },
             fds: mem::take(&mut self.fds),
@@ -127,14 +130,14 @@ impl RequestReader {
             let ReadState::Complete(header) = self.header.read(stream)? else {
                 return Ok(ReadState::Pending);
             };
-            if header.len as usize > MAX_REQUEST {
+            if header.len as usize > max_body(header.op) {
                 bail!("request is too large");
             }
             match header.op {
-                1 | 4 if header.fds.len() != MAX_REQUEST_FDS => {
+                1 | 4 | 5 if header.fds.len() != MAX_REQUEST_FDS => {
                     bail!("exec request needs stdin, stdout and stderr")
                 }
-                1 | 4 => {
+                1 | 4 | 5 => {
                     self.body = vec![0; header.len as usize];
                     self.frame = Some(header);
                 }
@@ -172,11 +175,28 @@ impl RequestReader {
         }
 
         let header = self.frame.take().unwrap();
-        let argv = parse_argv_ordered(&self.body, header.op == 4)?;
         self.complete = true;
+        if header.op == 5 {
+            let (argv, at) = parse_argv_prefix(&self.body, true)?;
+            if at > MAX_REQUEST {
+                bail!("command is too large");
+            }
+            let options = ExecOptions::decode(&self.body[at..])?;
+            return Ok(ReadState::Complete(Request::OptionsExec(argv, options, header.fds)));
+        }
+        let argv = parse_argv_ordered(&self.body, header.op == 4)?;
         Ok(ReadState::Complete(if header.op == 4 { Request::TypedExec(argv, header.fds) }
             else { Request::Exec(argv, header.fds) }))
     }
+}
+
+/// Operations 3, 4 and 5 use little-endian lengths; 1 and 2 keep native order.
+fn is_typed(op: u8) -> bool { matches!(op, 3..=5) }
+
+/// The largest body an operation may announce. Operation 5 adds at most one
+/// exec options frame to operation 4's argv block.
+pub fn max_body(op: u8) -> usize {
+    if op == 5 { MAX_REQUEST + exec_options::MAX_FRAME } else { MAX_REQUEST }
 }
 
 enum RecvChunk {
@@ -282,38 +302,41 @@ pub fn capabilities(id: Option<&str>, version: u16) -> Result<()> {
 /// Own the private status socket before validating the rest, so host-side
 /// failures can still be reported. No workload FD is ever used for diagnostics.
 pub fn machine_exec(id: &str, cmd: &[String], version: u16, status: RawFd,
-    stdio: [RawFd; 3]) -> Result<i32> {
+    stdio: [RawFd; 3], options: Option<RawFd>) -> Result<i32> {
     validate_status_fd(status)?;
     restore_cloexec(status)?;
     let status = unsafe { OwnedFd::from_raw_fd(status) };
-    let outcome = machine_request(id, cmd, version, status.as_raw_fd(), stdio);
+    let outcome = machine_request(id, cmd, version, status.as_raw_fd(), stdio, options);
     protocol::write_bounded(status.as_raw_fd(), &Frame::Outcome(outcome.clone()).encode()?, || Ok(()))?;
     Ok(outcome.projection())
 }
 
-fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio: [RawFd; 3]) -> Outcome {
+fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio: [RawFd; 3],
+    options_fd: Option<RawFd>) -> Outcome {
     let mut cleanup = Cleanup::NoChildStarted;
     let mut stage = Stage::Validate;
     let run = (|| -> Result<Outcome> {
         validate_machine_stdio(status, stdio)?;
         let fds: Vec<OwnedFd> = stdio.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+        let options = options_fd.map(|fd| read_options_fd(fd, status, stdio)).transpose()?;
         anyhow::ensure!(version == protocol::VERSION, "unsupported persistent-exec protocol {version}");
         validate_id(id)?;
-        let encoded_len = validate_exec_argv(cmd)?;
-        let mut payload = Vec::with_capacity(encoded_len);
-        payload.extend_from_slice(&(cmd.len() as u32).to_le_bytes());
-        for arg in cmd {
-            payload.extend_from_slice(&(arg.len() as u32).to_le_bytes());
-            payload.extend_from_slice(arg.as_bytes());
-        }
-        debug_assert_eq!(payload.len(), encoded_len);
+        let (op, payload) = typed_request(cmd, options.as_deref())?;
         stage = Stage::Connect;
+        if options.is_some() {
+            let path = container::run_dir(id).join("control.sock");
+            if let Some(refusal) = require_exec_options(&path, &mut stage)
+                .with_context(|| format!("probe sandbox {id}"))? {
+                return Ok(refusal);
+            }
+            stage = Stage::Connect;
+        }
         let mut stream = connect_bounded(id, Instant::now() + protocol::FRAME_TIMEOUT)?;
         stage = Stage::Request;
         stream.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
         // From the first send onward a partial transfer may have reached PID 1.
         cleanup = Cleanup::Unconfirmed;
-        send_header(&stream, 4, payload.len() as u32, &stdio)?;
+        send_header(&stream, op, payload.len() as u32, &stdio)?;
         if let Err(error) = stream.write_all(&payload) {
             // Busy may be returned as soon as the header arrives, before a
             // large body can finish writing. Only that explicit no-child
@@ -342,12 +365,97 @@ fn machine_request(id: &str, cmd: &[String], version: u16, status: RawFd, stdio:
                 Stage::Validate => FailureKind::InvalidRequest,
                 Stage::Connect if errno == libc::ENOENT => FailureKind::NotFound,
                 Stage::Connect => FailureKind::Unavailable,
+                Stage::Handshake => FailureKind::Protocol,
                 Stage::Report => FailureKind::Protocol,
                 _ => FailureKind::Io,
             };
             Outcome::failure(kind, stage, cleanup, errno, &format!("{e:#}"))
         }
     }
+}
+
+/// The operation and body of a typed exec. Operation 4's body is unchanged by
+/// options support; operation 5 appends the validated frame, byte for byte as
+/// the caller sealed it.
+fn typed_request(cmd: &[String], options: Option<&[u8]>) -> Result<(u8, Vec<u8>)> {
+    let encoded_len = validate_exec_argv(cmd)?;
+    let mut payload = Vec::with_capacity(encoded_len + options.map_or(0, <[u8]>::len));
+    payload.extend_from_slice(&(cmd.len() as u32).to_le_bytes());
+    for arg in cmd {
+        payload.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+        payload.extend_from_slice(arg.as_bytes());
+    }
+    debug_assert_eq!(payload.len(), encoded_len);
+    Ok(match options {
+        Some(frame) => { payload.extend_from_slice(frame); (5, payload) }
+        None => (4, payload),
+    })
+}
+
+/// Asks the sandbox's PID 1 for its capabilities on a separate connection
+/// before any exec byte is sent. Returns the refusal outcome when PID 1 does
+/// not advertise exec options; nothing reaches it except operation 3.
+fn require_exec_options(path: &Path, stage: &mut Stage) -> Result<Option<Outcome>> {
+    let deadline = Instant::now() + protocol::FRAME_TIMEOUT;
+    let mut probe = connect_path_bounded(path, deadline)?;
+    *stage = Stage::Handshake;
+    probe.set_write_timeout(Some(deadline.checked_duration_since(Instant::now())
+        .context("capability exchange deadline")?))?;
+    send_header(&probe, 3, 0, &[])?;
+    let Frame::Capabilities(capabilities) = protocol::read_reply(&mut probe, Some(deadline))? else {
+        bail!("expected sandbox capabilities");
+    };
+    if capabilities.require_v1().is_err() || capabilities.features & protocol::EXEC_OPTIONS_FEATURE == 0 {
+        return Ok(Some(Outcome::failure(FailureKind::Incompatible, Stage::Handshake, Cleanup::NoChildStarted, 0,
+            &format!("sandbox PID 1 does not support exec options (features {:#010x}); recreate the sandbox",
+                capabilities.features))));
+    }
+    Ok(None)
+}
+
+/// Reads the exec options frame from the caller's sealed memfd: exactly
+/// F_SEAL_SEAL|SHRINK|GROW|WRITE, so its bytes can't change after this read.
+/// The descriptor is closed on return. The path in the frame is never opened,
+/// stat'ed or chdir'ed here; it is sandbox-interior data.
+fn read_options_fd(fd: RawFd, status: RawFd, stdio: [RawFd; 3]) -> Result<Vec<u8>> {
+    anyhow::ensure!(fd >= 3 && fd != status && !stdio.contains(&fd),
+        "exec options fd must be distinct from the other descriptors and >=3");
+    restore_cloexec(fd).context("invalid exec options fd")?;
+    let file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    anyhow::ensure!(flags >= 0 && flags & libc::O_PATH == 0
+        && matches!(flags & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR), "exec options fd must be readable");
+    let mut info = unsafe { mem::zeroed::<libc::stat>() };
+    anyhow::ensure!(unsafe { libc::fstat(fd, &mut info) } == 0, "invalid exec options fd");
+    // memfd_create files are unlinked regular files named "/memfd:NAME".
+    let link = fs::read_link(format!("/proc/self/fd/{fd}")).context("inspect exec options fd")?;
+    anyhow::ensure!(info.st_mode & libc::S_IFMT == libc::S_IFREG && info.st_nlink == 0
+        && link.as_os_str().as_bytes().starts_with(b"/memfd:"), "exec options fd must be a memfd");
+    let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+    anyhow::ensure!(seals == exec_options::REQUIRED_SEALS,
+        "exec options memfd must have exactly the write, shrink, grow and seal seals (has {seals:#x})");
+    for workload in stdio {
+        let mut other = unsafe { mem::zeroed::<libc::stat>() };
+        anyhow::ensure!(unsafe { libc::fstat(workload, &mut other) } == 0
+            && (other.st_dev, other.st_ino) != (info.st_dev, info.st_ino), "exec options fd aliases workload stdio");
+    }
+    let size = usize::try_from(info.st_size).ok().filter(|&n| n <= exec_options::MAX_FRAME)
+        .context("exec options exceed the frame bound")?;
+    let mut frame = vec![0u8; size];
+    let mut at = 0;
+    // pread: the shared file offset belongs to the caller and is ignored.
+    while at < size {
+        match std::os::unix::fs::FileExt::read_at(&file, &mut frame[at..], at as u64) {
+            Ok(0) => bail!("exec options memfd changed size"),
+            Ok(n) => at += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("read exec options"),
+        }
+    }
+    anyhow::ensure!(std::os::unix::fs::FileExt::read_at(&file, &mut [0u8; 1], size as u64)? == 0,
+        "exec options memfd changed size");
+    ExecOptions::decode(&frame)?;
+    Ok(frame)
 }
 
 fn restore_cloexec(fd: RawFd) -> Result<()> {
@@ -608,6 +716,16 @@ fn process_disappeared(error: &std::io::Error) -> bool {
 }
 
 fn parse_argv_ordered(data: &[u8], little_endian: bool) -> Result<Vec<CString>> {
+    let (argv, at) = parse_argv_prefix(data, little_endian)?;
+    if at != data.len() {
+        bail!("trailing request data");
+    }
+    Ok(argv)
+}
+
+/// Parses one argv block from the start of `data` and returns it with the
+/// number of bytes it used.
+fn parse_argv_prefix(data: &[u8], little_endian: bool) -> Result<(Vec<CString>, usize)> {
     let mut at = 0;
     let take = |at: &mut usize| -> Result<u32> {
         let n = take_u32(data, at)?;
@@ -627,10 +745,7 @@ fn parse_argv_ordered(data: &[u8], little_endian: bool) -> Result<Vec<CString>> 
     if argv[0].as_bytes().is_empty() {
         bail!("argv must name a program");
     }
-    if at != data.len() {
-        bail!("trailing request data");
-    }
-    Ok(argv)
+    Ok((argv, at))
 }
 
 /// Whether `fd` is a terminal.
@@ -755,7 +870,7 @@ fn redirect_stdio() {
 fn send_header(stream: &UnixStream, op: u8, len: u32, fds: &[RawFd]) -> Result<()> {
     let mut header = [0u8; 8];
     header[0] = op;
-    header[4..].copy_from_slice(&if matches!(op, 3 | 4) { len.to_le_bytes() } else { len.to_ne_bytes() });
+    header[4..].copy_from_slice(&if is_typed(op) { len.to_le_bytes() } else { len.to_ne_bytes() });
     send_with_fds(stream, &header, fds)
 }
 
@@ -939,7 +1054,7 @@ mod tests {
             let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
             let (err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
             let stdio = [input.into_raw_fd(), out_tx.into_raw_fd(), err_tx.into_raw_fd()];
-            assert_eq!(machine_exec("invalid/id", &["true".into()], version, status.into_raw_fd(), stdio).unwrap(), 125);
+            assert_eq!(machine_exec("invalid/id", &["true".into()], version, status.into_raw_fd(), stdio, None).unwrap(), 125);
             let Frame::Outcome(o) = protocol::read_reply(&mut receiver, Some(Instant::now() + protocol::FRAME_TIMEOUT)).unwrap()
                 else { panic!("not an outcome") };
             assert_eq!((o.kind, o.stage, o.cleanup), (if version == 1 { FailureKind::InvalidRequest }
@@ -1219,5 +1334,226 @@ mod tests {
     fn esrch_means_the_process_disappeared() {
         assert!(process_disappeared(&std::io::Error::from_raw_os_error(libc::ESRCH)));
         assert!(!process_disappeared(&std::io::Error::from_raw_os_error(libc::EACCES)));
+    }
+
+    fn options(cwd: Option<&str>, env: &[(&str, &str)]) -> ExecOptions {
+        ExecOptions::new(cwd.map(Into::into),
+            env.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()).unwrap()
+    }
+
+    /// A sealed memfd holding `bytes`, with `seals` added after writing.
+    fn memfd(bytes: &[u8], allow_sealing: bool, seals: i32) -> OwnedFd {
+        let flags = libc::MFD_CLOEXEC | if allow_sealing { libc::MFD_ALLOW_SEALING } else { 0 };
+        let fd = unsafe { libc::memfd_create(c"kiln-test-options".as_ptr(), flags) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        fs::File::from(fd.try_clone().unwrap()).write_all(bytes).unwrap();
+        if seals != 0 { assert_eq!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) }, 0); }
+        fd
+    }
+
+    /// Distinct status and stdio numbers for read_options_fd's checks.
+    fn machine_fds() -> (UnixStream, UnixStream, [fs::File; 3]) {
+        let (status, peer) = UnixStream::pair().unwrap();
+        (status, peer, [open("/dev/null"), open("/dev/null"), open("/dev/null")])
+    }
+
+    fn raw(files: &[fs::File; 3]) -> [RawFd; 3] { [files[0].as_raw_fd(), files[1].as_raw_fd(), files[2].as_raw_fd()] }
+
+    #[test]
+    fn operation_4_bytes_are_unchanged_and_operation_5_appends_the_frame() {
+        // Operation 4's golden, as before exec options existed.
+        let (op, body) = typed_request(&["true".into()], None).unwrap();
+        assert_eq!((op, body.as_slice()), (4, &b"\x01\0\0\0\x04\0\0\0true"[..]));
+        let (client, mut server) = UnixStream::pair().unwrap();
+        send_header(&client, op, body.len() as u32, &[]).unwrap();
+        let mut header = [0u8; 8]; server.read_exact(&mut header).unwrap();
+        assert_eq!(header, [4, 0, 0, 0, 12, 0, 0, 0]);
+        // Operation 5: the same argv block, then the options golden (45 bytes).
+        let frame = options(Some("/w"), &[("B", "2"), ("A", "")]).encode();
+        let (op, body5) = typed_request(&["true".into()], Some(&frame)).unwrap();
+        assert_eq!((op, &body5[..12]), (5, &body[..]));
+        assert_eq!(&body5[12..], frame.as_slice());
+        assert_eq!(body5.len(), 57);
+        let (client, mut server) = UnixStream::pair().unwrap();
+        send_header(&client, op, body5.len() as u32, &[]).unwrap();
+        server.read_exact(&mut header).unwrap();
+        assert_eq!(header, [5, 0, 0, 0, 57, 0, 0, 0]);
+    }
+
+    #[test]
+    fn operation_5_parses_at_every_split() {
+        let expected = options(Some("/tmp/../w"), &[("PATH", "/opt/bin"), ("V", "雪 x")]);
+        let (op, body) = typed_request(&["sh".into(), "-c".into(), "env".into()], Some(&expected.encode())).unwrap();
+        let mut message = vec![op, 0, 0, 0];
+        message.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        message.extend_from_slice(&body);
+        let null = open("/dev/null");
+        for split in 1..=message.len() {
+            let (client, server) = UnixStream::pair().unwrap();
+            send_with_fds(&client, &message[..split], &[null.as_raw_fd(); 3]).unwrap();
+            (&client).write_all(&message[split..]).unwrap();
+            let mut reader = RequestReader::new();
+            let request = loop {
+                if let ReadState::Complete(request) = reader.read(&server).unwrap() { break request; }
+            };
+            let Request::OptionsExec(argv, options, fds) = request else { panic!("split {split}: not operation 5") };
+            assert_eq!(argv.iter().map(|a| a.to_str().unwrap()).collect::<Vec<_>>(), ["sh", "-c", "env"]);
+            assert_eq!((options, fds.len()), (expected.clone(), 3), "split {split}");
+        }
+    }
+
+    #[test]
+    fn operation_5_is_revalidated_by_the_reader() {
+        let good = options(Some("/w"), &[("A", "1")]).encode();
+        let argv = typed_request(&["true".into()], None).unwrap().1;
+        let mut bad_cwd = good.clone(); bad_cwd[24] = b'w';
+        let mut bad_name = good.clone(); bad_name[30] = b'1';
+        let mut trailing = good.clone(); trailing.push(0);
+        let cases: [(Vec<u8>, &str); 5] = [
+            (argv.clone(), "truncated exec options header"),
+            ([argv.clone(), bad_cwd].concat(), "cwd must start with /"),
+            ([argv.clone(), bad_name].concat(), "must match"),
+            ([argv.clone(), trailing].concat(), "length does not match"),
+            ([b"\x01\0\0\0\0\0\0\0".to_vec(), good.clone()].concat(), "name a program"),
+        ];
+        for (body, expected) in cases {
+            let (client, server) = UnixStream::pair().unwrap();
+            let null = open("/dev/null");
+            send_header(&client, 5, body.len() as u32, &[null.as_raw_fd(); 3]).unwrap();
+            (&client).write_all(&body).unwrap();
+            let error = format!("{:#}", RequestReader::new().read(&server).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
+        for (op, len, ok) in [(5, MAX_REQUEST + exec_options::MAX_FRAME, true), (5, MAX_REQUEST + exec_options::MAX_FRAME + 1, false),
+            (4, MAX_REQUEST + 1, false)] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let null = open("/dev/null");
+            send_header(&client, op, len as u32, &[null.as_raw_fd(); 3]).unwrap();
+            let read = RequestReader::new().read(&server);
+            assert_eq!(read.is_ok(), ok, "op {op} len {len}");
+        }
+        // Operation 5's argv block keeps operation 4's 1 MiB bound.
+        let big = typed_request(&["x".repeat(MAX_REQUEST - 8)], None).unwrap().1;
+        assert_eq!(big.len(), MAX_REQUEST);
+        let mut too_big = big.clone(); too_big[4] += 1; too_big.push(b'x');
+        let (client, server) = UnixStream::pair().unwrap();
+        let null = open("/dev/null");
+        let body = [too_big, good].concat();
+        send_header(&client, 5, body.len() as u32, &[null.as_raw_fd(); 3]).unwrap();
+        let writer = std::thread::spawn(move || (&client).write_all(&body).unwrap());
+        let mut reader = RequestReader::new();
+        let error = loop {
+            match reader.read(&server) { Ok(ReadState::Pending) => continue, Ok(_) => panic!("accepted"), Err(e) => break e };
+        };
+        writer.join().unwrap();
+        assert!(error.to_string().contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn options_fd_must_be_an_exactly_sealed_memfd() {
+        let (status, _peer, stdio) = machine_fds();
+        let stdio_fds = raw(&stdio);
+        let frame = options(Some("/w"), &[("A", "1")]).encode();
+        let all = exec_options::REQUIRED_SEALS;
+        let fd = memfd(&frame, true, all);
+        // Taking the frame closes the caller's descriptor.
+        let number = fd.into_raw_fd();
+        assert_eq!(read_options_fd(number, status.as_raw_fd(), stdio_fds).unwrap(), frame);
+        assert_eq!(unsafe { libc::fcntl(number, libc::F_GETFD) }, -1);
+        // The caller's file offset is irrelevant: the frame is read with pread.
+        let fd = memfd(&frame, true, all);
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 9, libc::SEEK_SET) }, 9);
+        assert_eq!(read_options_fd(fd.into_raw_fd(), status.as_raw_fd(), stdio_fds).unwrap(), frame);
+
+        let refused = |fd: RawFd, expected: &str| {
+            let error = format!("{:#}", read_options_fd(fd, status.as_raw_fd(), stdio_fds).unwrap_err());
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        for missing in [libc::F_SEAL_SEAL, libc::F_SEAL_SHRINK, libc::F_SEAL_GROW, libc::F_SEAL_WRITE] {
+            refused(memfd(&frame, true, all & !missing).into_raw_fd(), "exactly");
+        }
+        refused(memfd(&frame, true, 0).into_raw_fd(), "exactly");
+        refused(memfd(&frame, false, 0).into_raw_fd(), "exactly");
+        refused(memfd(&frame, true, all | libc::F_SEAL_FUTURE_WRITE).into_raw_fd(), "exactly");
+        let regular = std::env::temp_dir().join(format!("kiln-options-{}", std::process::id()));
+        fs::write(&regular, &frame).unwrap();
+        refused(fs::File::open(&regular).unwrap().into_raw_fd(), "must be a memfd");
+        fs::remove_file(&regular).unwrap();
+        let (pipe_rx, _pipe_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        refused(pipe_rx.into_raw_fd(), "must be a memfd");
+        refused(fs::File::open("/").unwrap().into_raw_fd(), "must be a memfd");
+        // One byte past the bound, sealed, is refused before it is read.
+        refused(memfd(&vec![0; exec_options::MAX_FRAME + 1], true, all).into_raw_fd(), "frame bound");
+        // Sealed but malformed or out-of-bounds contents.
+        let mut bad = frame.clone(); bad[24] = b'w';
+        refused(memfd(&bad, true, all).into_raw_fd(), "cwd must start with /");
+        refused(memfd(&[], true, all).into_raw_fd(), "truncated");
+        // A write-only or O_PATH descriptor of a valid memfd can't be read.
+        let fd = memfd(&frame, true, all);
+        let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        refused(fs::OpenOptions::new().write(true).open(&path).unwrap().into_raw_fd(), "readable");
+        let opath = unsafe { libc::open(std::ffi::CString::new(path).unwrap().as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(opath >= 0);
+        refused(opath, "readable");
+        // Private numbers only, distinct from status and stdio; no aliasing.
+        refused(status.as_raw_fd(), "distinct");
+        refused(stdio_fds[1], "distinct");
+        refused(2, "distinct");
+        refused(9999, "invalid exec options fd");
+        let shared = memfd(&frame, true, all);
+        let alias = shared.try_clone().unwrap();
+        let error = format!("{:#}", read_options_fd(alias.into_raw_fd(), status.as_raw_fd(),
+            [stdio_fds[0], shared.as_raw_fd(), stdio_fds[2]]).unwrap_err());
+        assert!(error.contains("aliases workload stdio"), "{error}");
+    }
+
+    #[test]
+    fn options_refuse_a_pid1_without_the_feature_before_sending_an_exec() {
+        for (features, refused) in [(0x1f, true), (0x0f, true), (0x2f, false), (0x3f, false), (0x2e, true)] {
+            let path = std::env::temp_dir().join(format!("kiln-options-probe-{}-{features}.sock", std::process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0u8; 8];
+                stream.read_exact(&mut header).unwrap();
+                let caps = Capabilities { features, ..Capabilities::current() };
+                stream.write_all(&Frame::Capabilities(caps).encode().unwrap()).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut rest = Vec::new();
+                stream.read_to_end(&mut rest).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                // Exactly one connection carrying only the operation 3 header.
+                (header, rest, listener.accept().is_err())
+            });
+            let mut stage = Stage::Connect;
+            let outcome = require_exec_options(&path, &mut stage).unwrap();
+            let (header, rest, no_second) = server.join().unwrap();
+            assert_eq!((header, rest.len(), no_second), ([3, 0, 0, 0, 0, 0, 0, 0], 0, true));
+            assert_eq!(outcome.is_some(), refused, "{features:#x}");
+            if let Some(o) = outcome {
+                assert_eq!((o.kind, o.stage, o.cleanup, o.status), (FailureKind::Incompatible, Stage::Handshake,
+                    Cleanup::NoChildStarted, None));
+            }
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_options_fd_is_reported_on_status_with_no_child() {
+        let (status, mut receiver) = UnixStream::pair().unwrap();
+        let input = fs::File::open("/dev/null").unwrap();
+        let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let (_err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let unsealed = memfd(&options(None, &[]).encode(), true, 0);
+        let stdio = [input.into_raw_fd(), out_tx.into_raw_fd(), err_tx.into_raw_fd()];
+        assert_eq!(machine_exec("1-1", &["true".into()], 1, status.into_raw_fd(), stdio,
+            Some(unsealed.into_raw_fd())).unwrap(), 125);
+        let Frame::Outcome(o) = protocol::read_reply(&mut receiver, Some(Instant::now() + protocol::FRAME_TIMEOUT)).unwrap()
+            else { panic!("not an outcome") };
+        assert_eq!((o.kind, o.stage, o.cleanup), (FailureKind::InvalidRequest, Stage::Validate, Cleanup::NoChildStarted));
+        let mut out = Vec::new();
+        fs::File::from(out_rx).read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
     }
 }

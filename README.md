@@ -327,6 +327,17 @@ first supplied by the resulting kiln commit introducing that document, based
 on `3b42552`; package version `0.1.0` alone does not establish compatibility.
 Recreate older persistent sandboxes explicitly after checking their capabilities.
 
+A machine caller can also give one command a working directory and
+environment overrides: write an exec options frame into a memfd, seal it
+(`F_SEAL_SEAL|SHRINK|GROW|WRITE`), and add `--exec-options-fd=P`. The command
+gets `HOME=/root`, the default `PATH` and `TERM=xterm` overlaid by the
+overrides, and starts in the cwd, or fails as LaunchFailed/Chdir with the
+errno if `chdir` fails; there's no fallback to `/`. Values never appear on a
+command line. This needs capability bit `0x20` on the sandbox's PID 1, which
+the CLI checks before sending anything; older sandboxes still run plain execs.
+The frame layout and limits are in the
+[protocol document](docs/exec-protocol-v1.md#exec-options-operation-5).
+
 ## Notes
 
 - **PID 1 ignores signals from inside its own namespace.** `kill -9 $$` inside

@@ -18,6 +18,14 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Add exec options: typed operation 5 (operation 4's argv block plus a
+  strict, versioned cwd/environment frame), `kiln exec --exec-options-fd=N`
+  for a memfd sealed with exactly write/shrink/grow/seal, capability bit
+  `0x20`, and launch stage 14 Chdir. The command's environment is
+  `HOME`/`PATH`/`TERM` overlaid by the overrides, sorted by name; `chdir`
+  runs after descriptor closure with no fallback to `/`. The CLI refuses a
+  PID 1 without `0x20` before sending; operation 4 is byte-for-byte unchanged.
+
 - Drain the busy listener before disconnect and through the transition to idle;
   bound total finalization work, kill descendants before it, and retain observed
   command outcomes when shutdown arrives after execution. Queued partial

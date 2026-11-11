@@ -107,6 +107,14 @@ relying on it:
   Reply writes are bounded and tolerate peer failure without stopping PID 1.
   Protocol v1 is first supplied by the resulting kiln commit based on
   `3b42552`; see [exact bytes and compatibility](docs/exec-protocol-v1.md).
+  Exec options (cwd and environment, capability `0x20`) arrive in an
+  exactly sealed memfd, never on a host command line, and are validated by
+  the CLI and again by PID 1. The command's `chdir` runs after descriptor
+  closure, so it cannot reach an inherited directory through
+  `/proc/self/fd/N`; it is resolved with the workload's own credentials,
+  Landlock and seccomp inside the sandbox's root. Values are not secret in
+  this design: they are visible to the command and to anything that can read
+  its environment.
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the

@@ -16,6 +16,10 @@ pub const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 pub const REQUIRED_FEATURES: u32 = 0x0f;
 /// Persistent-create failures before allocation have the documented exit 124.
 pub const CREATE_PREFLIGHT_FEATURE: u32 = 0x10;
+/// PID 1 accepts typed operation 5 (exec options: cwd and environment), and
+/// the CLI accepts `--exec-options-fd`. Additive: older PID 1 instances
+/// without it still serve operation 4.
+pub const EXEC_OPTIONS_FEATURE: u32 = 0x20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandStatus {
@@ -51,7 +55,7 @@ wire_enum!(FailureKind {
 wire_enum!(Stage {
     None = 0, Validate = 1, Connect = 2, Request = 3, Prepare = 4, Fork = 5,
     Admission = 6, Stdio = 7, Exec = 8, Wait = 9, Cleanup = 10,
-    Report = 11, Capture = 12, Handshake = 13,
+    Report = 11, Capture = 12, Handshake = 13, Chdir = 14,
 });
 wire_enum!(Cleanup { Unconfirmed = 0, NoChildStarted = 1, Drained = 2 });
 
@@ -86,7 +90,7 @@ impl Outcome {
         if self.kind == FailureKind::LaunchFailed {
             return match self.stage {
                 Stage::Exec => 127,
-                Stage::Admission | Stage::Stdio => 126,
+                Stage::Admission | Stage::Stdio | Stage::Chdir => 126,
                 _ => 125,
             };
         }
@@ -123,7 +127,8 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn current() -> Self {
-        Self { features: REQUIRED_FEATURES | CREATE_PREFLIGHT_FEATURE, control_version: VERSION, status_fd_version: VERSION,
+        Self { features: REQUIRED_FEATURES | CREATE_PREFLIGHT_FEATURE | EXEC_OPTIONS_FEATURE,
+            control_version: VERSION, status_fd_version: VERSION,
             package: env!("CARGO_PKG_VERSION").into(), provenance: env!("KILN_GIT").into() }
     }
 
@@ -335,9 +340,21 @@ mod tests {
         let caps = Capabilities::current();
         caps.require_v1().unwrap();
         assert_eq!(caps.features & CREATE_PREFLIGHT_FEATURE, CREATE_PREFLIGHT_FEATURE);
+        assert_eq!(caps.features, 0x3f);
         let mut execution_only = caps;
         execution_only.features = REQUIRED_FEATURES;
         execution_only.require_v1().unwrap();
+    }
+
+    #[test]
+    fn chdir_launch_failure_is_stage_14_and_projects_126() {
+        let o = Outcome::failure(FailureKind::LaunchFailed, Stage::Chdir, Cleanup::Drained, libc::ENOENT, "chdir");
+        let bytes = Frame::Outcome(o.clone()).encode().unwrap();
+        assert_eq!(&bytes[16..32], b"\x02\x00\x02\x00\x00\x00\x00\x00\x06\x00\x0e\x00\x02\x00\x00\x00");
+        assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Outcome(o.clone()));
+        assert_eq!(o.projection(), 126);
+        let mut unknown = bytes.clone(); unknown[26] = 15;
+        assert!(Frame::decode(&unknown).is_err());
     }
 
     #[test]

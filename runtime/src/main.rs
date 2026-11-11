@@ -1,6 +1,7 @@
 mod cgroup;
 mod container;
 mod dns;
+mod exec_options;
 mod exec_protocol;
 mod init;
 mod landlock;
@@ -58,6 +59,9 @@ enum Command {
         stdout_fd: Option<i32>,
         #[arg(long, requires = "status_fd")]
         stderr_fd: Option<i32>,
+        /// Sealed memfd holding an exec options frame (cwd and environment).
+        #[arg(long, requires = "status_fd")]
+        exec_options_fd: Option<i32>,
         id: String,
         #[arg(required = true, trailing_var_arg = true)]
         cmd: Vec<String>,
@@ -239,10 +243,10 @@ fn run() -> Result<()> {
             println!("{}", persistent::create(&cfg)?);
             Ok(())
         }
-        Command::Exec { id, cmd, protocol, status_fd, stdin_fd, stdout_fd, stderr_fd } => {
+        Command::Exec { id, cmd, protocol, status_fd, stdin_fd, stdout_fd, stderr_fd, exec_options_fd } => {
             let result = match (protocol, status_fd, stdin_fd, stdout_fd, stderr_fd) {
                 (Some(version), Some(status), Some(input), Some(output), Some(error)) =>
-                    persistent::machine_exec(&id, &cmd, version, status, [input, output, error]),
+                    persistent::machine_exec(&id, &cmd, version, status, [input, output, error], exec_options_fd),
                 (None, None, None, None, None) => persistent::exec(&id, &cmd),
                 _ => Err(anyhow::anyhow!("machine exec requires protocol and all four private descriptors")),
             };
@@ -327,6 +331,12 @@ mod tests {
         assert_eq!(protocol, Some(1));
         assert_eq!(cmd, ["printf", "--protocol=99"]);
         assert!(Cli::try_parse_from(["kiln", "exec", "--protocol=1", "--status-fd=3", "abc", "--", "true"]).is_err());
+        let cli = Cli::try_parse_from(["kiln", "exec", "--protocol=1", "--status-fd=3", "--stdin-fd=4",
+            "--stdout-fd=5", "--stderr-fd=6", "--exec-options-fd=7", "abc", "--", "env", "--exec-options-fd=8"]).unwrap();
+        let Command::Exec { cmd, exec_options_fd, .. } = cli.command else { panic!("not exec") };
+        assert_eq!((exec_options_fd, cmd.as_slice()), (Some(7), &["env".to_string(), "--exec-options-fd=8".into()][..]));
+        // Options are a machine-exec feature only.
+        assert!(Cli::try_parse_from(["kiln", "exec", "--exec-options-fd=7", "abc", "--", "true"]).is_err());
     }
 
     #[test]

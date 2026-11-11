@@ -2,6 +2,7 @@
 """Refused or incomplete busy headers must not hold up removal or disconnects."""
 import array
 from contextlib import ExitStack, contextmanager
+import fcntl
 from pathlib import Path
 import os
 import signal
@@ -131,9 +132,11 @@ def init_fds(identifier):
 def header_refusal(op):
     with sandbox() as (identifier, clients, rights):
         start_active(identifier, clients, rights)
-        if op == 4:
+        if op != 1:
             # A real machine client must still observe Busy if refusal
             # interrupts a body larger than the Unix socket send buffer.
+            # Operation 5 also probes capabilities first, which a busy PID 1
+            # still answers.
             with ExitStack() as stack:
                 files = [stack.enter_context(open("/dev/null", "r+b")) for _ in range(3)]
                 rx, tx = socket.socketpair()
@@ -141,16 +144,26 @@ def header_refusal(op):
                 stack.callback(tx.close)
                 rx.settimeout(0.8)
                 fds = [tx.fileno(), *(f.fileno() for f in files)]
+                options = []
+                if op == 5:
+                    # An empty exec options frame (docs/exec-protocol-v1.md).
+                    memfd = os.memfd_create("busy-options", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+                    stack.callback(os.close, memfd)
+                    os.write(memfd, struct.pack("<8sHHIII", b"KILNOPT\0", 1, 0, 24, 0, 0))
+                    fcntl.fcntl(memfd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK
+                                | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE)
+                    fds.append(memfd)
+                    options = [f"--exec-options-fd={memfd}"]
                 args = [KILN, "exec", "--protocol=1", f"--status-fd={fds[0]}",
                         f"--stdin-fd={fds[1]}", f"--stdout-fd={fds[2]}", f"--stderr-fd={fds[3]}",
-                        identifier, "--", "sh", "-c", "true", *(["x" * 60000] * 12)]
+                        *options, identifier, "--", "sh", "-c", "true", *(["x" * 60000] * 12)]
                 child = subprocess.run(args, pass_fds=fds, capture_output=True, timeout=5)
                 assert child.returncode == 125 and not child.stdout and not child.stderr, child
                 tx.close()
                 typed_busy(rx)
         refused = connect(identifier)
         clients.append(refused)
-        order = "<I" if op == 4 else "=I"
+        order = "=I" if op == 1 else "<I"
         start = time.monotonic()
         refused.sendmsg([bytes([op, 0, 0, 0]) + struct.pack(order, 1024 * 1024)], rights)
         refused.sendall(b"x")
@@ -352,7 +365,7 @@ print(attempts, flush=True)
                 worker.communicate(timeout=3)
 
 
-for op in (1, 4):
+for op in (1, 4, 5):
     header_refusal(op)
 partial_then_remove()
 active_disconnect()

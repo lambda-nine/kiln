@@ -118,6 +118,8 @@ workload stderr. All post-fork paths drain and reap before a command result;
 cleanup failure reports unconfirmed cleanup and ends PID 1. Replies are bounded
 to 2088 bytes and writes are nonblocking, signal-aware and request-local on
 peer failure. Busy requests receive typed rejection; probes work during exec.
+Operation 5 is operation 4 plus an exec options frame (cwd and environment
+overrides, capability bit `0x20`); see "Exec options" below.
 The machine CLI relays one frame on a private status socket, sends only three
 explicit workload descriptors into PID 1 and preserves human exit projections.
 Capabilities describe the responding binary/PID 1, never a minimum package
@@ -283,6 +285,25 @@ of the boundary; errors after `new_id`, signals and missing/malformed results
 remain ambiguous even if cleanup appears to have succeeded. A caller must
 negotiate the capability before trusting the direct child's exit 124. Other
 commands do not acquire this exit contract.
+
+### Exec options
+
+kilnd's `ExecRequest.cwd` and `env` reach kiln as data, never as host argv or
+environment. The helper writes one strict frame into a memfd sealed against
+writes, size changes and further sealing, and passes it as
+`kiln exec --exec-options-fd=N`; the CLI checks the seals, validates the
+frame and copies it unchanged into operation 5 after confirming that the
+sandbox's PID 1 advertises bit `0x20` (an older PID 1 is refused before any
+exec byte is sent, and still serves operation 4). PID 1 validates the frame
+again and builds the command's environment from the fixed base
+`HOME`/`PATH`/`TERM` overlaid by the overrides, sorted by name. Its forked
+child runs `chdir` only after closing every descriptor but stdio and the
+bootstrap channel and resetting signals, immediately before `execvp`, so no
+inherited directory can become the cwd through `/proc/self/fd/N`; a failure is
+LaunchFailed with stage Chdir and the errno, after the usual drain, with no
+fallback to `/`. PID 1 itself never changes its cwd or environment. The byte
+layout, bounds and goldens are in
+[the protocol specification](docs/exec-protocol-v1.md#exec-options-operation-5).
 
 ### Host service privileges
 

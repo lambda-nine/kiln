@@ -20,7 +20,8 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::{ForkResult, Pid, execvp, fork, pipe2, read, setpgid, write};
 
 use crate::cgroup::ExecCgroup;
-use crate::persistent::{EXEC_FAILED, Header, HeaderReader, ReadState, Request, RequestReader};
+use crate::exec_options::{ExecOptions, LaunchOptions};
+use crate::persistent::{EXEC_FAILED, Header, HeaderReader, ReadState, Request, RequestReader, max_body};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, CommandStatus, FailureKind,
     Frame, Outcome as ExecOutcome, Stage};
 
@@ -113,7 +114,7 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
             Ok(FramingOutcome::Stop(code)) => return Ok(code),
             Err(e) => { eprintln!("kiln: bad exec request: {e:#}"); continue; }
         };
-        let (argv, fds, typed) = match request {
+        let (argv, fds, typed, options) = match request {
             Request::Remove => {
                 respond(&stream, &0i32.to_ne_bytes(), &signals, true);
                 return Ok(0);
@@ -122,12 +123,13 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
                 respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, &signals, true);
                 continue;
             }
-            Request::Exec(argv, fds) => (argv, fds, false),
-            Request::TypedExec(argv, fds) => (argv, fds, true),
+            Request::Exec(argv, fds) => (argv, fds, false, None),
+            Request::TypedExec(argv, fds) => (argv, fds, true, None),
+            Request::OptionsExec(argv, options, fds) => (argv, fds, true, Some(options)),
         };
         // A client that went away can't take the status; failing to send it
         // must not end PID 1 and with it the sandbox.
-        match run_exec(&argv, fds, &stream, listener, scope, &signals)? {
+        match run_exec(&argv, options.as_ref(), fds, &stream, listener, scope, &signals)? {
             Outcome::Completed(outcome) => report(&stream, &outcome, typed, &signals)?,
             Outcome::Fatal(outcome) => {
                 report(&stream, &outcome, typed, &signals)?;
@@ -292,14 +294,17 @@ fn wait_for_frame(stream: &UnixStream, signals: &SignalFd, deadline: Instant) ->
 /// cgroup can. Whatever ends the exec, every process it started is killed and
 /// gone before this returns, so the client's stdout and stderr reach EOF and
 /// the next exec starts from an empty cgroup.
-fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener: &UnixListener,
-    scope: &ExecCgroup, signals: &SignalFd) -> Result<Outcome> {
+fn run_exec(argv: &[CString], options: Option<&ExecOptions>, stdio: Vec<OwnedFd>, client: &UnixStream,
+    listener: &UnixListener, scope: &ExecCgroup, signals: &SignalFd) -> Result<Outcome> {
     // Request reception is deliberately still part of the idle state. Drain
     // once at the admission boundary so a shutdown signal received after
     // accept() cannot cross into and terminate this unrelated command.
     if let Some(code) = drain_idle_signals(signals)? {
         return Ok(Outcome::Stop(code));
     }
+    // Built before fork, so the child only calls chdir and swaps a pointer.
+    // PID 1 itself never takes the cwd or environment.
+    let options = options.map(LaunchOptions::new);
     #[cfg(test)]
     if let Some(errno) = injected("pipe") {
         return Ok(launch_failure(Stage::Prepare, Cleanup::NoChildStarted, errno, "injected pipe failure"));
@@ -331,7 +336,7 @@ fn run_exec(argv: &[CString], stdio: Vec<OwnedFd>, client: &UnixStream, listener
         Ok(ForkResult::Child) => {
             drop(joined_rx);
             drop(release_tx);
-            launch(argv, &stdio, scope, &joined_tx, &release_rx)
+            launch(argv, options.as_ref(), &stdio, scope, &joined_tx, &release_rx)
         }
         Ok(ForkResult::Parent { child }) => child,
     };
@@ -495,10 +500,16 @@ fn bootstrap_fail(fd: &OwnedFd, stage: Stage, errno: i32) -> ! {
     unsafe { libc::_exit(if stage == Stage::Exec { 127 } else { 126 }) }
 }
 
+unsafe extern "C" {
+    /// The C library's process environment, read by execvp(3).
+    static mut environ: *mut *mut libc::c_char;
+}
+
 /// The forked child: joins the exec cgroup, waits for PID 1 to release it,
 /// then becomes the command. Every instruction of the command, and of all it
 /// starts, runs inside the cgroup.
-fn launch(argv: &[CString], stdio: &[OwnedFd], scope: &ExecCgroup, joined: &OwnedFd, release: &OwnedFd) -> ! {
+fn launch(argv: &[CString], options: Option<&LaunchOptions>, stdio: &[OwnedFd], scope: &ExecCgroup,
+    joined: &OwnedFd, release: &OwnedFd) -> ! {
     #[cfg(test)]
     if let Some(errno) = injected("admission") { bootstrap_fail(joined, Stage::Admission, errno); }
     if let Err(e) = scope.join_self() { bootstrap_fail(joined, Stage::Admission, error_errno(&e)); }
@@ -532,6 +543,19 @@ fn launch(argv: &[CString], stdio: &[OwnedFd], scope: &ExecCgroup, joined: &Owne
     if let Err(e) = SigSet::empty().thread_set_mask() { bootstrap_fail(joined, Stage::Stdio, e as i32); }
     if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
         bootstrap_fail(joined, Stage::Stdio, Errno::last() as i32);
+    }
+    // Operation 5 only, and in this order: every descriptor except stdio and
+    // the bootstrap channel is already closed, so no inherited directory can
+    // become the cwd through /proc/self/fd/N. No fallback to /.
+    if let Some(options) = options {
+        if let Some(cwd) = &options.cwd
+            && unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
+            bootstrap_fail(joined, Stage::Chdir, Errno::last() as i32);
+        }
+        // execvp searches the PATH of, and passes, the process environment:
+        // make that exactly the effective envp. Only this child changes.
+        // SAFETY: the pointers stay valid until exec; nothing else runs here.
+        unsafe { *std::ptr::addr_of_mut!(environ) = options.environ().cast_mut().cast(); }
     }
     #[cfg(test)]
     if let Some(errno) = injected("exec") { bootstrap_fail(joined, Stage::Exec, errno); }
@@ -870,8 +894,8 @@ fn answer_busy_header(stream: &UnixStream, header: Header, signals: &SignalFd) -
         3 if header.len == 0 && header.fds.is_empty() => {
             respond(stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
         }
-        1 | 4 if header.fds.len() == 3 && header.len as usize <= crate::validation::MAX_EXEC_REQUEST_BYTES => {
-            let typed = header.op == 4;
+        1 | 4 | 5 if header.fds.len() == 3 && header.len as usize <= max_body(header.op) => {
+            let typed = header.op != 1;
             // A competing exec can be classified from its fixed header. Close
             // its descriptors before replying; never read or allocate its body.
             drop(header);
@@ -943,6 +967,7 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     use super::*;
+    use crate::exec_options;
 
     /// This is a protocol/bootstrap fixture, not a cgroup containment test.
     /// A separate process keeps signal masks, fork, and close_range away from
@@ -953,6 +978,10 @@ mod tests {
         let root = std::path::PathBuf::from(path);
         // Model PID 1 adoption without requiring a privileged PID namespace.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        // A directory descriptor PID 1 holds across fork: only descriptor
+        // closure keeps /proc/self/fd/N from naming it as a cwd.
+        let held = fs::File::open(&root).unwrap();
+        fs::write(root.join("held-dir-fd"), held.as_raw_fd().to_string()).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
         let scope = ExecCgroup::protocol_fixture(&root);
         let result = serve(&listener, &scope);
@@ -1003,10 +1032,21 @@ mod tests {
             fs::File::from(err).read_to_end(&mut stderr).unwrap();
             (o, stdout, stderr)
         }
-        fn start_exec(&self, args: &[&str]) -> (UnixStream, OwnedFd, OwnedFd) {
+        fn exec_options(&self, args: &[&str], options: &ExecOptions) -> (ExecOutcome, Vec<u8>, Vec<u8>) {
+            let (mut stream, out, err) = self.start_exec_with(args, Some(options));
+            let frame = protocol::read_reply(&mut stream, Some(Instant::now() + Duration::from_secs(5))).unwrap();
+            let Frame::Outcome(o) = frame else { panic!("not an outcome") };
+            let mut stdout = Vec::new(); let mut stderr = Vec::new();
+            fs::File::from(out).read_to_end(&mut stdout).unwrap();
+            fs::File::from(err).read_to_end(&mut stderr).unwrap();
+            (o, stdout, stderr)
+        }
+        fn start_exec(&self, args: &[&str]) -> (UnixStream, OwnedFd, OwnedFd) { self.start_exec_with(args, None) }
+        fn start_exec_with(&self, args: &[&str], options: Option<&ExecOptions>) -> (UnixStream, OwnedFd, OwnedFd) {
             let mut body = (args.len() as u32).to_le_bytes().to_vec();
             for arg in args { body.extend_from_slice(&(arg.len() as u32).to_le_bytes()); body.extend_from_slice(arg.as_bytes()); }
-            let (stream, out, err) = self.start_exec_header(4, body.len() as u32);
+            let op = match options { Some(options) => { body.extend_from_slice(&options.encode()); 5 } None => 4 };
+            let (stream, out, err) = self.start_exec_header(op, body.len() as u32);
             if let Err(e) = (&stream).write_all(&body) {
                 assert!(matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "{e}");
             }
@@ -1022,7 +1062,7 @@ mod tests {
             let (out_rx, out_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
             let (err_rx, err_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
             let mut header = vec![op, 0, 0, 0];
-            header.extend_from_slice(&if op == 4 { len.to_le_bytes() } else { len.to_ne_bytes() });
+            header.extend_from_slice(&if op == 1 { len.to_ne_bytes() } else { len.to_le_bytes() });
             let fds: [RawFd; 3] = [input.as_raw_fd(), out_tx.as_raw_fd(), err_tx.as_raw_fd()];
             let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(12) as usize }];
             let mut iov = libc::iovec { iov_base: header.as_mut_ptr().cast(), iov_len: sent };
@@ -1148,9 +1188,112 @@ mod tests {
         assert_eq!(out, b"retained"); assert!(err.is_empty());
     }
 
+    fn options(cwd: Option<&str>, env: &[(&str, &str)]) -> ExecOptions {
+        ExecOptions::new(cwd.map(Into::into), env.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()).unwrap()
+    }
+
+    #[test]
+    fn exec_options_set_cwd_and_exact_environment_for_the_command_only() {
+        let server = Server::start();
+        let root = server.root.to_str().unwrap().to_owned();
+        let show_env = ["/bin/cat", "/proc/self/environ"];
+        let (o, out, err) = server.exec_options(&show_env, &options(None, &[]));
+        assert_eq!((o, err), (ExecOutcome::command(CommandStatus::Exited(0)), Vec::new()));
+        assert_eq!(out, b"HOME=/root\0PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0TERM=xterm\0",
+            "operation 5 starts from the fixed base, not PID 1's environment");
+        let overrides = options(None, &[("TERM", "dumb"), ("A0", "x"), ("A", ""), ("_", "雪 =$x"), ("a", "l")]);
+        let (o, out, _) = server.exec_options(&show_env, &overrides);
+        assert_eq!(o.status, Some(CommandStatus::Exited(0)));
+        assert_eq!(out, "A=\0A0=x\0HOME=/root\0PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0TERM=dumb\0_=雪 =$x\0a=l\0".as_bytes());
+
+        // PATH is an override like any other, for lookup as well as for the
+        // command's environment; relative names resolve in the new cwd.
+        fs::create_dir(server.root.join("bin")).unwrap();
+        let tool = server.root.join("bin/kiln-options-tool");
+        fs::write(&tool, "#!/bin/sh\nprintf '%s|%s' \"$PWD\" \"$PATH\"\n").unwrap();
+        fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let bin = format!("{root}/bin");
+        let (o, out, _) = server.exec_options(&["kiln-options-tool"], &options(Some(&root), &[("PATH", &bin)]));
+        assert_eq!(o.status, Some(CommandStatus::Exited(0)));
+        assert_eq!(out, format!("{root}|{bin}").as_bytes());
+        let (o, out, _) = server.exec_options(&["./kiln-options-tool"], &options(Some(&bin), &[]));
+        assert_eq!((o.status, out), (Some(CommandStatus::Exited(0)), format!("{bin}|{}",
+            exec_options::BASE_ENV[1].1).into_bytes()));
+        let (o, _, _) = server.exec_options(&["kiln-options-tool"], &options(None, &[]));
+        assert_eq!((o.kind, o.stage, o.errno), (FailureKind::LaunchFailed, Stage::Exec, libc::ENOENT));
+        // `..` resolves inside the command's own root; no normalization.
+        let (o, out, _) = server.exec_options(&["/bin/pwd", "-P"], &options(Some(&format!("{bin}/..")), &[]));
+        assert_eq!((o.status, out), (Some(CommandStatus::Exited(0)), format!("{root}\n").into_bytes()));
+
+        // PID 1 never took the cwd or the overrides.
+        let (_, out, _) = server.exec(&["/bin/pwd"]);
+        assert_eq!(out, format!("{}\n", std::env::current_dir().unwrap().display()).as_bytes());
+        let (_, out, _) = server.exec(&["/bin/cat", "/proc/self/environ"]);
+        assert!(!out.windows(5).any(|w| w == b"A0=x\0") && out.windows(16).any(|w| w == b"KILN_PROTOCOL_FI"));
+    }
+
+    #[test]
+    fn chdir_failure_is_launch_failed_chdir_with_errno_after_drainage() {
+        let server = Server::start();
+        let root = server.root.to_str().unwrap().to_owned();
+        fs::write(server.root.join("file"), "").unwrap();
+        std::os::unix::fs::symlink(server.root.join("loop"), server.root.join("loop")).unwrap();
+        // Restore access on every exit so the fixture's directory can be removed.
+        struct Locked(std::path::PathBuf);
+        impl Drop for Locked {
+            fn drop(&mut self) { let _ = fs::set_permissions(&self.0, std::os::unix::fs::PermissionsExt::from_mode(0o700)); }
+        }
+        fs::create_dir(server.root.join("locked")).unwrap();
+        let _locked = Locked(server.root.join("locked"));
+        fs::set_permissions(server.root.join("locked"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let longest = format!("/{}", "a".repeat(exec_options::MAX_CWD - 1));
+        let mut cases = vec![
+            (format!("{root}/missing"), libc::ENOENT),
+            (format!("{root}/file"), libc::ENOTDIR),
+            (format!("{root}/file/below"), libc::ENOTDIR),
+            (format!("{root}/loop"), libc::ELOOP),
+            (longest, libc::ENAMETOOLONG),
+        ];
+        // Root bypasses directory permissions; the real sandbox suite covers
+        // EACCES there through /proc/1/cwd.
+        if unsafe { libc::geteuid() } != 0 { cases.push((format!("{root}/locked"), libc::EACCES)); }
+        for (cwd, errno) in cases {
+            fs::write(server.root.join("kill"), "").unwrap();
+            let (o, out, err) = server.exec_options(&["/bin/sh", "-c", "echo ran; echo ran >&2"], &options(Some(&cwd), &[]));
+            assert_eq!((o.kind, o.stage, o.errno, o.cleanup, o.status),
+                (FailureKind::LaunchFailed, Stage::Chdir, errno, Cleanup::Drained, None), "{}", &cwd[..cwd.len().min(80)]);
+            assert_eq!(o.projection(), 126);
+            assert!(out.is_empty() && err.is_empty(), "command ran or bootstrap leaked output");
+            assert_eq!(fs::read(server.root.join("kill")).unwrap(), b"1", "exec cgroup was not drained");
+            assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
+        }
+    }
+
+    #[test]
+    fn chdir_runs_after_descriptor_closure() {
+        let server = Server::start();
+        let held: i32 = fs::read_to_string(server.root.join("held-dir-fd")).unwrap().parse().unwrap();
+        let pid = server.child.id();
+        let open: Vec<i32> = fs::read_dir(format!("/proc/{pid}/fd")).unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().parse().unwrap()).collect();
+        // PID 1 really holds a directory a cwd could name before closure.
+        assert!(open.contains(&held) && fs::metadata(format!("/proc/{pid}/fd/{held}")).unwrap().is_dir());
+        let highest = open.iter().copied().max().unwrap() + 4;
+        for n in 0..=highest {
+            let (o, out, _) = server.exec_options(&["/bin/pwd"], &options(Some(&format!("/proc/self/fd/{n}")), &[]));
+            assert_eq!((o.kind, o.stage, o.status, out.as_slice()), (FailureKind::LaunchFailed, Stage::Chdir, None, &b""[..]),
+                "/proc/self/fd/{n} became a cwd");
+            assert!(matches!(o.errno, libc::ENOENT | libc::ENOTDIR), "fd {n}: errno {}", o.errno);
+        }
+        let (o, out, _) = server.exec_options(&["/bin/pwd"], &options(Some("/proc/1/cwd"), &[]));
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!((o.kind, o.stage, o.errno, out.as_slice()), (FailureKind::LaunchFailed, Stage::Chdir, libc::EACCES, &b""[..]));
+        }
+    }
+
     #[test]
     fn busy_exec_headers_close_fds_without_waiting_for_body_or_removal() {
-        for op in [1, 4] {
+        for op in [1, 4, 5] {
             let server = Server::start();
             let marker = server.root.join("busy-started");
             let command = format!("echo ready > {}; exec /bin/sleep 30", marker.display());
@@ -1162,7 +1305,7 @@ mod tests {
             // Removal is already queued while the refused body is incomplete.
             let mut remover = server.connect();
             remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-            if op == 4 {
+            if op != 1 {
                 let Frame::Outcome(o) = protocol::read_reply(&mut busy,
                     Some(start + Duration::from_millis(800))).unwrap() else { panic!("missing busy outcome") };
                 assert_eq!((o.kind, o.cleanup), (FailureKind::Busy, Cleanup::NoChildStarted));
