@@ -40,6 +40,16 @@ before 1.0, any minor release may change the CLI or on-disk layout.
     constants.
   - Operations 1 to 5 are byte-for-byte unchanged.
 
+- Close the checkpoint contract gaps found by adversarial review:
+  - **Exit status.** `kiln checkpoint-lease` exits 0 only for Released. A command outcome in place of a lease
+    frame is a protocol failure.
+  - **Cancellation.** Driver closure cancels a pending probe or grant.
+  - **Mount boundary.** The image walk refuses same-filesystem bind mounts by mount ID.
+  - **Hardlinks.** The tree manifest records hardlink topology for every non-directory type.
+  - **Snapshot.** Registration must observe one unchanged snapshot (two agreeing walks, stable directories).
+  - **Trusted registry.** A symlinked, foreign-owned or group- or world-writable registry root is refused
+    everywhere.
+
 - Let the capability probe before operation 5 (and 6) wait for its reply like
   an exec reply, keeping only the connect bounded, so a probe queued behind
   stalled root-only connections no longer fails where operation 4 waits and

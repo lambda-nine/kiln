@@ -40,6 +40,14 @@ bytes <regular-file bytes, one per hardlink group>
 
 Records are strict: keys in this order, canonical numbers, no extra lines.
 
+**Trusting the registry.** Every read and write first checks the registry
+root itself. It must be a real directory, not a symlink, owned by the
+running user (root on a real host), and not group or world writable. Entry
+files are opened with `O_NOFOLLOW`. A registry that fails these checks is
+refused by `register`, `verify`, `inspect` and `unregister`. When a create
+meets such a registry, the run still works, but its reference records no
+identity (`identity none image registry unusable: …`).
+
 - **Directory identity.** The `directory` line identifies the directory the
   name resolved to at registration: the filesystem ID from `fstatfs`, the
   inode, and the `statx` birth time. The birth time tells a reused inode
@@ -51,6 +59,11 @@ Records are strict: keys in this order, canonical numbers, no extra lines.
 - **Registering again.** Unchanged content in the same directory is a no-op.
   Anything else replaces the registration, and that is refused while the name
   is referenced (below).
+- **One real snapshot.** Registration walks the tree twice, and the two walks
+  must produce the same digest, entry count and byte count. Each directory's
+  own metadata must also be unchanged after its entries are walked. A tree
+  that changes during registration is refused rather than registered under a
+  digest of a state it never had.
 
 ## Serialization
 
@@ -122,9 +135,17 @@ little endian. Each record is:
 The trailer is u8 0 and then the u64 record count. Because of the markers and
 length prefixes, two different trees never produce the same stream.
 
-- **Hardlinks.** A regular file with more than one link is recorded in full at
-  its first name. Each later name in the tree is a hardlink record that points
-  to that ordinal, with the shared inode's metadata.
+- **Hardlinks.** Any non-directory entry with more than one link is recorded
+  in full at its first name: a regular file, a symlink, a device, a FIFO or a
+  socket. Each later name of that inode in the tree is a hardlink record that
+  points to that ordinal, with the shared inode's metadata. The target's type
+  is the first record's type. Two hardlinked symlinks and two independent
+  identical symlinks therefore have different digests.
+- **Mount boundary.** The walk records the image root's mount ID
+  (`statx(STATX_MNT_ID)`). It requires that ID, and the root's device, for
+  every entry looked up by name and for every directory or file it opens. A
+  bind mount from the same filesystem keeps the device number but changes the
+  mount ID, so it is refused. That includes a bind mount over a single file.
 - **Walking.** The walk is fd-relative and never follows a link. Directories
   open with `O_DIRECTORY|O_NOFOLLOW`. Regular files open with
   `O_NOFOLLOW|O_NOATIME`, and are compared with their `lstat` result before
@@ -132,7 +153,8 @@ length prefixes, two different trees never produce the same stream.
   never opened; their xattrs are read with `l*xattr` through the held
   directory.
 - **Refusals.** These are errors:
-  - a mount crossing;
+  - a mount crossing, including a same-filesystem bind mount;
+  - a directory whose metadata changed while its entries were walked;
   - a file whose size, mtime or ctime changed while it was read;
   - an entry replaced mid-walk;
   - more than 256 directory levels, 4,096-byte paths, 4,096-byte link
@@ -141,7 +163,16 @@ length prefixes, two different trees never produce the same stream.
 - **Excluded from the digest.** Inode numbers, link counts, atime, ctime and
   birth time.
 
-A golden stream of five records is pinned in `image.rs`:
+Two golden streams are pinned in `image.rs`. The second one is a hardlinked
+symlink:
+
+```text
+records: root dir 0755 0:0 mtime 0.0; "x" symlink "t" 0777 0:0 mtime 5.6;
+         "y" hardlink to ordinal 1; "z" FIFO 0600 0:0 mtime 5.6
+digest:  6dfe3feda0e00a245470b8372fd800a2d557a7d10ef3d4a4449b65ea372166be
+```
+
+The first one:
 
 ```text
 records: root dir 0755 2000000000:2000000000 mtime 1.2;

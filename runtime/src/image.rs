@@ -22,7 +22,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -208,7 +208,8 @@ fn lock(images: &Path, exclusive: bool) -> Result<Lock> {
 }
 
 fn read_small(path: &Path) -> Result<Option<String>> {
-    let file = match File::open(path) {
+    // A record is a regular file; a symlink in its place is refused.
+    let file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
@@ -221,6 +222,7 @@ fn read_small(path: &Path) -> Result<Option<String>> {
 
 pub fn read_entry(registry: &Path, name: &str) -> Result<Option<Entry>> {
     validate_image_name(name)?;
+    if !trusted_registry(registry)? { return Ok(None); }
     let path = registry.join(name);
     read_small(&path)?.map(|t| Entry::parse(&t).with_context(|| format!("parse {}", path.display()))).transpose()
 }
@@ -231,15 +233,27 @@ pub fn read_reference(run_dir: &Path) -> Result<Option<Reference>> {
     read_small(&path)?.map(|t| Reference::parse(&t).with_context(|| format!("parse {}", path.display()))).transpose()
 }
 
+/// Whether the registry root exists, after checking it may be trusted: a real
+/// directory (not a symlink), owned by this user (root on a real host) and
+/// not group or world writable. Every read and write goes through this.
+fn trusted_registry(registry: &Path) -> Result<bool> {
+    let meta = match fs::symlink_metadata(registry) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", registry.display())),
+    };
+    ensure!(meta.file_type().is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+        "image registry {} must be a directory owned by this user and not group/other writable", registry.display());
+    Ok(true)
+}
+
 fn ensure_registry(registry: &Path) -> Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(registry) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).with_context(|| format!("create {}", registry.display())),
     }
-    let meta = fs::symlink_metadata(registry)?;
-    ensure!(meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
-        "{} must be a directory owned by this user and not group/other writable", registry.display());
+    ensure!(trusted_registry(registry)?, "image registry {} disappeared", registry.display());
     Ok(())
 }
 
@@ -325,7 +339,13 @@ pub fn register(roots: &Roots, name: &str) -> Result<Entry> {
     let _lock = lock(&roots.images, true)?;
     let dir = open_image(roots, name)?;
     let before = dir_identity(&dir)?;
+    // Two complete walks must agree, so the registered digest is one state
+    // the tree really had, not a mix of states from before and after a
+    // change that raced the first walk.
     let tree = tree_digest(&dir)?;
+    let again = tree_digest(&dir)?;
+    ensure!((tree.sha256, tree.entries, tree.bytes) == (again.sha256, again.entries, again.bytes),
+        "image {name:?} changed while it was registered");
     ensure!(dir_identity(&dir)? == before && dir_identity(&open_image(roots, name)?)? == before,
         "image {name:?} was replaced while it was hashed");
     let sha256 = hex(&tree.sha256);
@@ -394,12 +414,17 @@ pub fn acquire_reference(roots: &Roots, name: &str, run_dir: &Path) -> Result<Re
     let _lock = lock(&roots.images, false)?;
     let dir = open_image(roots, name)?;
     let current = dir_identity(&dir)?;
-    let identity = match read_entry(&roots.registry, name)? {
+    // An untrustworthy or unreadable registry gives the run no identity; the
+    // create itself still works by name.
+    let identity = match read_entry(&roots.registry, name).map_err(|e| format!("image registry unusable: {e:#}")) {
+        Err(reason) => Err(reason),
+        Ok(entry) => match entry {
         Some(e) if e.state == State::Registered && e.directory == current =>
             Ok(Identity { generation: e.generation, sha256: e.sha256, directory: current }),
         Some(e) if e.state == State::Registered => Err("image directory differs from its registration".into()),
         Some(_) => Err("image registration is retired".into()),
         None => Err("image is not registered".into()),
+        },
     };
     let reference = Reference { name: name.to_owned(), identity: identity.map_err(|r: String| one_line(&r)) };
     // Visible before the lock is released. Losing it in a crash leaves a run
@@ -483,6 +508,9 @@ struct Walk {
     entries: u64,
     bytes: u64,
     dev: u64,
+    /// The image root's mount. A bind mount from the same filesystem keeps
+    /// `st_dev`, so only the mount ID proves an entry is in the image's tree.
+    mnt: u64,
     links: std::collections::HashMap<(u64, u64), u64>,
     buf: Vec<u8>,
 }
@@ -495,7 +523,8 @@ struct Walk {
 pub fn tree_digest(root: &File) -> Result<Tree> {
     let st = fstat(root.as_raw_fd())?;
     ensure!(st.st_mode & libc::S_IFMT == libc::S_IFDIR, "image root is not a directory");
-    let mut walk = Walk { hash: Sha256::new(), entries: 0, bytes: 0, dev: st.st_dev, links: Default::default(),
+    let mnt = mount_id(root.as_raw_fd(), None)?;
+    let mut walk = Walk { hash: Sha256::new(), entries: 0, bytes: 0, dev: st.st_dev, mnt, links: Default::default(),
         buf: Vec::new() };
     walk.hash.update(TREE_DOMAIN);
     let fd = dup(root.as_raw_fd())?;
@@ -534,6 +563,10 @@ impl Walk {
                 .with_context(|| format!("image entry {}", String::from_utf8_lossy(path)))?;
             path.truncate(at);
         }
+        // The entry set and the directory's own metadata were read at
+        // different times; refuse a directory that changed in between.
+        ensure!(unchanged(st, &fstat(dir.as_raw_fd())?), "directory {} changed while it was walked",
+            String::from_utf8_lossy(path));
         Ok(())
     }
 
@@ -543,26 +576,40 @@ impl Walk {
         // SAFETY: fstatat of a name relative to an open directory, no follow.
         Errno::result(unsafe { libc::fstatat(dir.as_raw_fd(), cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })
             .context("stat")?;
-        ensure!(st.st_dev == self.dev, "image crosses a mount");
+        ensure!(st.st_dev == self.dev && mount_id(dir.as_raw_fd(), Some(&cname))? == self.mnt,
+            "image crosses a mount");
+        let kind = st.st_mode & libc::S_IFMT;
+        // Hardlink topology for every non-directory type: a later name of an
+        // inode already recorded is a reference to that record's ordinal.
+        if kind != libc::S_IFDIR && st.st_nlink > 1 && let Some(&first) = self.links.get(&(st.st_dev, st.st_ino)) {
+            let xattrs = path_xattrs(dir, name)?;
+            return self.emit(&record(path, Kind::HardLink { first }, &st, &xattrs));
+        }
+        let ordinal = self.entries;
+        self.leaf(dir, &cname, name, &st, path, depth)?;
+        if kind != libc::S_IFDIR && st.st_nlink > 1 { self.links.insert((st.st_dev, st.st_ino), ordinal); }
+        Ok(())
+    }
+
+    fn leaf(&mut self, dir: &OwnedFd, cname: &CString, name: &[u8], st: &libc::stat, path: &mut Vec<u8>,
+        depth: usize) -> Result<()> {
+        let st = *st;
         match st.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
-                let fd = openat(dir, &cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+                let fd = openat(dir, cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
                 same_inode(&fstat(fd.as_raw_fd())?, &st)?;
+                ensure!(mount_id(fd.as_raw_fd(), None)? == self.mnt, "image crosses a mount");
                 self.directory(&fd, &st, path, depth + 1)
             }
             libc::S_IFREG => {
-                if st.st_nlink > 1 && let Some(&first) = self.links.get(&(st.st_dev, st.st_ino)) {
-                    let xattrs = path_xattrs(dir, name)?;
-                    return self.emit(&record(path, Kind::HardLink { first }, &st, &xattrs));
-                }
-                let fd = openat(dir, &cname, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_NONBLOCK)?;
+                let fd = openat(dir, cname, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_NONBLOCK)?;
                 let opened = fstat(fd.as_raw_fd())?;
                 same_inode(&opened, &st)?;
+                ensure!(mount_id(fd.as_raw_fd(), None)? == self.mnt, "image crosses a mount");
                 let (size, sha256) = hash_file(&fd)?;
                 let after = fstat(fd.as_raw_fd())?;
                 ensure!(size == st.st_size as u64 && unchanged(&opened, &after), "file changed while it was hashed");
                 let xattrs = fd_xattrs(fd.as_raw_fd())?;
-                if st.st_nlink > 1 { self.links.insert((st.st_dev, st.st_ino), self.entries); }
                 self.bytes = self.bytes.saturating_add(size);
                 self.emit(&record(path, Kind::Regular { size, sha256 }, &st, &xattrs))
             }
@@ -602,6 +649,21 @@ fn fstat(fd: RawFd) -> Result<libc::stat> {
     // SAFETY: fstat of an open descriptor.
     Errno::result(unsafe { libc::fstat(fd, &mut st) }).context("fstat")?;
     Ok(st)
+}
+
+/// The mount ID of `fd` itself, or of `name` relative to it without following
+/// a final symlink. Path lookup crosses into whatever is mounted on `name`, so
+/// a bind mount shows up here even when it keeps the same device number.
+fn mount_id(fd: RawFd, name: Option<&CString>) -> Result<u64> {
+    let mut st = unsafe { std::mem::zeroed::<libc::statx>() };
+    let (path, flags) = match name {
+        Some(name) => (name.as_ptr(), libc::AT_SYMLINK_NOFOLLOW),
+        None => (c"".as_ptr(), libc::AT_EMPTY_PATH),
+    };
+    // SAFETY: statx relative to an open descriptor into an owned buffer.
+    Errno::result(unsafe { libc::statx(fd, path, flags, libc::STATX_MNT_ID, &mut st) }).context("statx mount ID")?;
+    ensure!(st.stx_mask & libc::STATX_MNT_ID != 0, "kernel did not report a mount ID");
+    Ok(st.stx_mnt_id)
 }
 
 fn same_inode(a: &libc::stat, b: &libc::stat) -> Result<()> {
@@ -890,6 +952,165 @@ mod tests {
         for name in ["../x", ".hidden", ""] {
             assert!(register(&roots, name).is_err() && remove(&roots, name).is_err());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A later name of any non-directory inode is a hardlink record, whatever
+    /// the first record's type (here a symlink). Pinned against an
+    /// independent Python encoding.
+    #[test]
+    fn golden_hardlinked_symlink_stream() {
+        let mut out = Vec::new();
+        let meta = |path, kind, mode| Record { path, kind, mode, uid: 0, gid: 0, mtime_sec: 5, mtime_nsec: 6, xattrs: &[] };
+        encode_record(&mut out, &Record { mtime_sec: 0, mtime_nsec: 0, ..meta(b"", Kind::Directory, 0o755) });
+        encode_record(&mut out, &meta(b"x", Kind::Symlink(b"t"), 0o777));
+        encode_record(&mut out, &meta(b"y", Kind::HardLink { first: 1 }, 0o777));
+        encode_record(&mut out, &meta(b"z", Kind::Fifo, 0o600));
+        encode_trailer(&mut out, 4);
+        let mut stream = TREE_DOMAIN.to_vec(); stream.extend_from_slice(&out);
+        assert_eq!(hex(&Sha256::digest(&stream)), "6dfe3feda0e00a245470b8372fd800a2d557a7d10ef3d4a4449b65ea372166be");
+    }
+
+    /// Adversarial-review HIGH 3: hardlinked symlinks or FIFOs and independent
+    /// ones with identical names and metadata must not share a digest.
+    #[test]
+    fn non_regular_hardlink_topology_changes_the_digest() {
+        let (root, roots) = scratch("link-topology");
+        for (make_fifo, label) in [(false, "symlink"), (true, "fifo")] {
+            let linked = roots.images.join(format!("{label}-linked"));
+            let separate = roots.images.join(format!("{label}-separate"));
+            for d in [&linked, &separate] { fs::create_dir(d).unwrap(); }
+            let make = |p: &Path| if make_fifo {
+                nix::unistd::mkfifo(p, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap()
+            } else { symlink("target", p).unwrap() };
+            make(&linked.join("x"));
+            fs::hard_link(linked.join("x"), linked.join("y")).unwrap();
+            make(&separate.join("x"));
+            make(&separate.join("y"));
+            for d in [&linked, &separate] {
+                for n in ["x", "y"] { set_mtime(&d.join(n), 100, 5); }
+                set_mtime(d, 200, 6);
+            }
+            assert_eq!(fs::symlink_metadata(linked.join("x")).unwrap().ino(), fs::symlink_metadata(linked.join("y")).unwrap().ino());
+            let (a, b) = (digest(&linked), digest(&separate));
+            assert_eq!((a.entries, b.entries), (3, 3));
+            assert_ne!(a.sha256, b.sha256, "{label} hardlink topology collided");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Adversarial-review HIGH 3, in place: the same name, re-registered after
+    /// a symlink's hardlink was replaced by an independent symlink, is a
+    /// replacement with a new generation, not a no-op.
+    #[test]
+    fn topology_change_is_a_new_registration() {
+        let (root, roots) = scratch("topology-reregister");
+        let dir = image(&roots, "img");
+        let (x, y) = (dir.join("sx"), dir.join("sy"));
+        symlink("target", &x).unwrap();
+        fs::hard_link(&x, &y).unwrap();
+        set_mtime(&x, 100, 5);
+        set_mtime(&dir, 200, 6);
+        let first = register(&roots, "img").unwrap();
+        fs::remove_file(&y).unwrap();
+        symlink("target", &y).unwrap();
+        set_mtime(&y, 100, 5);
+        set_mtime(&dir, 200, 6);
+        assert!(verify(&roots, "img").is_err(), "verify accepted a changed topology");
+        let second = register(&roots, "img").unwrap();
+        assert_eq!(second.generation, first.generation + 1);
+        assert_ne!(second.sha256, first.sha256);
+        verify(&roots, "img").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Adversarial-review HIGH 2: a bind mount from the same filesystem keeps
+    /// st_dev; registration and verification must still refuse to cross it.
+    /// Needs root (CI runs unprivileged and skips; the VM runs it as root).
+    #[test]
+    fn same_filesystem_bind_mount_is_refused() {
+        if unsafe { libc::geteuid() } != 0 { eprintln!("skipped: needs root to bind mount"); return; }
+        use nix::mount::{MntFlags, MsFlags, mount, umount2};
+        let (root, roots) = scratch("bind-crossing");
+        let dir = image(&roots, "img");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "outside the image\n").unwrap();
+        fs::create_dir(dir.join("crossed")).unwrap();
+        let registered = register(&roots, "img").unwrap();
+        struct Unmount(PathBuf);
+        impl Drop for Unmount { fn drop(&mut self) { let _ = umount2(&self.0, MntFlags::MNT_DETACH); } }
+        mount(Some(&outside), &dir.join("crossed"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
+        let guard = Unmount(dir.join("crossed"));
+        assert_eq!(fs::metadata(dir.join("crossed")).unwrap().dev(), fs::metadata(&dir).unwrap().dev(),
+            "fixture must be a same-filesystem bind mount");
+        assert!(format!("{:#}", verify(&roots, "img").unwrap_err()).contains("crosses a mount"));
+        assert!(format!("{:#}", register(&roots, "img").unwrap_err()).contains("crosses a mount"));
+        // A bind mount over a single file is refused too.
+        drop(guard);
+        fs::write(dir.join("covered"), "image file\n").unwrap();
+        mount(Some(&outside.join("sentinel")), &dir.join("covered"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
+        let guard = Unmount(dir.join("covered"));
+        assert!(format!("{:#}", register(&roots, "img").unwrap_err()).contains("crosses a mount"));
+        drop(guard);
+        assert_eq!(read_entry(&roots.registry, "img").unwrap().unwrap(), registered, "a refusal changed the registry");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Hardening from the adversarial review: a change racing registration
+    /// either fails the registration or is wholly included; a registered
+    /// digest always verifies immediately afterwards.
+    #[test]
+    fn registration_publishes_only_a_real_snapshot() {
+        let (root, roots) = scratch("registration-race");
+        let dir = image(&roots, "img");
+        File::create(dir.join("a-big")).unwrap().set_len(64 * 1024 * 1024).unwrap();
+        fs::write(dir.join("z-victim"), b"before").unwrap();
+        let other = roots.clone();
+        let registering = std::thread::spawn(move || register(&other, "img"));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        fs::remove_file(dir.join("z-victim")).unwrap();
+        fs::write(dir.join("z-victim"), b"after").unwrap();
+        match registering.join().unwrap() {
+            Ok(_) => { verify(&roots, "img").unwrap(); }
+            Err(e) => assert!(format!("{e:#}").contains("changed while it was"), "{e:#}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Hardening from the adversarial review: a symlinked or writable registry
+    /// root is refused on every path, including reference acquisition.
+    #[test]
+    fn untrusted_registry_roots_are_refused_everywhere() {
+        let (root, mut roots) = scratch("registry-trust");
+        image(&roots, "img");
+        let opened = open_image(&roots, "img").unwrap();
+        let tree = tree_digest(&opened).unwrap();
+        let forged = Entry { name: "img".into(), generation: 77, state: State::Registered, sha256: hex(&tree.sha256),
+            directory: dir_identity(&opened).unwrap(), entries: tree.entries, bytes: tree.bytes };
+        let attacker = root.join("attacker-registry");
+        fs::create_dir(&attacker).unwrap();
+        fs::write(attacker.join("img"), forged.text()).unwrap();
+        let link = root.join("registry-link");
+        symlink(&attacker, &link).unwrap();
+        for (registry, mode) in [(link, 0o700), (attacker.clone(), 0o777), (attacker.clone(), 0o720)] {
+            fs::set_permissions(&attacker, fs::Permissions::from_mode(mode)).unwrap();
+            roots.registry = registry;
+            assert!(read_entry(&roots.registry, "img").is_err());
+            assert!(register(&roots, "img").is_err() && verify(&roots, "img").is_err());
+            let run = roots.runs.join("r-1");
+            fs::create_dir(&run).unwrap();
+            let reference = acquire_reference(&roots, "img", &run).unwrap();
+            assert!(reference.identity.unwrap_err().contains("image registry unusable"));
+            fs::remove_dir_all(&run).unwrap();
+        }
+        // A symlinked entry inside a trusted registry is refused as well.
+        fs::set_permissions(&attacker, fs::Permissions::from_mode(0o700)).unwrap();
+        roots.registry = root.join("registry");
+        fs::create_dir(&roots.registry).unwrap();
+        fs::set_permissions(&roots.registry, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(attacker.join("img"), roots.registry.join("img")).unwrap();
+        assert!(read_entry(&roots.registry, "img").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

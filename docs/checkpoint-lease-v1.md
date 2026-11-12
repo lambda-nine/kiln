@@ -128,8 +128,15 @@ command and never reads or copies sandbox files. The status socket is two-way:
    image identity or a verified layout record is refused (below).
 2. It probes PID 1 with operation 3 on its own connection. Without bit 6, or
    without protocol 1, it refuses and sends nothing else.
-3. It sends operation 6. A refusal outcome from PID 1 is forwarded as the final
-   frame.
+3. It sends operation 6. A *failure* outcome from PID 1 is forwarded as the
+   final frame. A command outcome (`FailureKind` None) where a lease frame
+   belongs, before Granted or after the acknowledgment, is a protocol
+   violation, Protocol / 15 Lease. It is never forwarded as success.
+
+   While the probe reply and the grant are pending, the CLI watches the status
+   socket too. The driver closing it, or writing anything before Granted,
+   abandons the wait at once. Otherwise the wait has no timer, so a request
+   queued behind PID 1's valid work still waits for it.
 4. On a grant it writes the Granted frame to the status socket. That frame is
    readiness: the source is quiescent and stays so.
 5. It waits, with no timer, for the driver's 16-byte acknowledgment on the
@@ -144,8 +151,9 @@ command and never reads or copies sandbox files. The status socket is two-way:
    lease connection. Each of these writes one final outcome frame.
 
 The status stream is therefore one frame (a refusal or failure) or two frames
-(Granted, then Released or a failure). Exit status is 0 only after Released
-was written, otherwise 125. The frames are the authority; the exit status is
+(Granted, then Released or a failure). Exit status is 0 only when the final
+frame is Released for the granted generation; every other final frame,
+including any outcome, is 125. The frames are the authority; the exit status is
 a consistency check.
 
 | Failure | Kind / stage | Cleanup |
@@ -158,7 +166,8 @@ a consistency check.
 | Lease busy | Busy / 15 Lease (from PID 1) | NoChildStarted |
 | Lease lost (driver or PID 1 gone) | Stopped / 15 Lease | NoChildStarted |
 | Bad acknowledgment from the driver | InvalidRequest / 15 Lease | NoChildStarted |
-| Malformed grant or release | Protocol / 15 Lease | NoChildStarted |
+| Malformed grant or release, or a command outcome in place of one | Protocol / 15 Lease | NoChildStarted |
+| Driver gone while the probe or grant was pending | Protocol / 13 Handshake or 15 Lease | NoChildStarted |
 
 The driver owns cancellation: it closes the status socket or kills the CLI.
 When the CLI dies, its lease connection closes and PID 1 ends the lease. A

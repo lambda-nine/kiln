@@ -17,6 +17,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 # Root runs this; never leave a root-owned __pycache__ in the checkout.
@@ -290,6 +291,140 @@ def run_old_pid1(capable):
         subprocess.run([OLD_KILN, "rm", old], check=True, timeout=15)
 
 
+def scripted_run(tag, shim):
+    """A fake run whose control socket is served by `shim(listener)`, with
+    metadata that passes the source gate, to drive the CLI against a peer
+    that breaks the protocol in a chosen way (adversarial-review cases)."""
+    identifier = f"{time.time_ns():x}-{os.getpid() + tag}"
+    run = os.path.join(RUNS, identifier)
+    os.mkdir(run, 0o700)
+    with open(os.path.join(run, "image"), "w") as f:
+        f.write("kiln-image-ref 1\nname alpine\ngeneration 1\nsha256 " + "0" * 64 +
+                "\ndirectory 0000000000000001:1:1.000000001\n")
+    with open(os.path.join(run, "layout"), "w") as f:
+        f.write("kiln-layout 1\npinned index=off,metacopy=off,redirect_dir=nofollow,nfs_export=off\n"
+                f"{PINNED_EFFECTIVE}\nverified yes\n")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.path.join(run, "control.sock"))
+    listener.listen(4)
+    thread = threading.Thread(target=shim, args=(listener,), daemon=True)
+    thread.start()
+    return identifier, run, listener, thread
+
+
+def scripted_frame(kind, payload):
+    return struct.pack("<8sHHI", b"KILNEXO\0", 1, kind, len(payload)) + payload
+
+
+SCRIPTED_CAPS = scripted_frame(2, struct.pack("<IHHHH4x", 0x7f, 1, 1, 3, 4) + b"fakeshim")
+COMMAND_SUCCESS = scripted_frame(1, struct.pack("<BBBBiHHiI4x", 1, 1, 2, 0, 0, 0, 0, 0, 0))
+
+
+def run_scripted_peers():
+    """Adversarial-review HIGH 1 and MEDIUM 1 against the real CLI."""
+    def exact(sock, n):
+        data = b""
+        while len(data) < n:
+            part = sock.recv(n - len(data))
+            assert part, "truncated"
+            data += part
+        return data
+
+    # HIGH 1: a command-success Outcome in place of a lease frame is never exit 0.
+    for granted in (False, True):
+        def shim(listener, granted=granted):
+            probe, _ = listener.accept()
+            assert exact(probe, 8) == b"\x03\0\0\0\0\0\0\0"
+            probe.sendall(SCRIPTED_CAPS)
+            probe.close()
+            op6, _ = listener.accept()
+            assert exact(op6, 8) == b"\x06\0\0\0\0\0\0\0"
+            if granted:
+                op6.sendall(scripted_frame(3, struct.pack("<B7xQ", 1, 7)))
+                exact(op6, 16)
+            op6.sendall(COMMAND_SUCCESS)
+            op6.close()
+        identifier, run, listener, thread = scripted_run(int(granted), shim)
+        try:
+            cli = LeaseCli(identifier)
+            if granted:
+                assert cli.granted() == 7
+                cli.ack(7)
+                kind, last = cli.last()
+            else:
+                kind, last = cli.first
+                assert read_frame(cli.status, timeout=5) is None
+            o, text = outcome_full(last)
+            assert kind == 1 and o[5:7] == (8, 15) and b"command outcome" in text, (o, text)
+            assert cli.finish()[0] == 125
+        finally:
+            listener.close()
+            shutil.rmtree(run)
+
+    # MEDIUM 1: the driver closing status ends a stalled probe or grant wait.
+    for stall in ("probe", "grant"):
+        release = threading.Event()
+        def shim(listener, stall=stall):
+            probe, _ = listener.accept()
+            exact(probe, 8)
+            if stall == "probe":
+                release.wait(30)
+                return
+            probe.sendall(SCRIPTED_CAPS)
+            probe.close()
+            op6, _ = listener.accept()
+            exact(op6, 8)
+            release.wait(30)
+        identifier, run, listener, thread = scripted_run(2 + (stall == "grant"), shim)
+        try:
+            status, theirs = socket.socketpair()
+            child = subprocess.Popen([KILN, "checkpoint-lease", "--protocol=1", f"--status-fd={theirs.fileno()}",
+                                      identifier], pass_fds=(theirs.fileno(),), stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            theirs.close()
+            time.sleep(2.5)  # past any framing window: the wait is still alive
+            assert child.poll() is None, f"stalled {stall}: CLI gave up on its own"
+            status.close()
+            child.communicate(timeout=3)
+            assert child.returncode == 125, (stall, child.returncode)
+        finally:
+            release.set()
+            listener.close()
+            shutil.rmtree(run)
+
+
+def run_bind_mount_refusal():
+    """Adversarial-review HIGH 2: a same-filesystem bind mount in an image."""
+    name = f"{IMAGE}-bind"
+    image, source = f"{IMAGES}/{name}", f"/tmp/c1-bind-source-{os.getpid()}"
+    subprocess.run(["cp", "-a", f"{IMAGES}/alpine", image], check=True, timeout=60)
+    os.makedirs(f"{image}/crossed")
+    os.makedirs(source)
+    with open(f"{source}/sentinel", "w") as f:
+        f.write("outside-image\n")
+    try:
+        entry = kiln("image", "register", name, timeout=120).stdout.decode()
+        assert os.stat(image).st_dev == os.stat(source).st_dev
+        subprocess.run(["mount", "--bind", source, f"{image}/crossed"], check=True)
+        try:
+            for action in ("verify", "register"):
+                p = kiln("image", action, name, check=False, timeout=120)
+                assert p.returncode != 0 and b"crosses a mount" in p.stderr, (action, p.stderr)
+            assert kiln("image", "inspect", name).stdout.decode() == entry
+        finally:
+            subprocess.run(["umount", f"{image}/crossed"], check=True)
+        kiln("image", "verify", name, timeout=120)
+        kiln("image", "rm", name)
+    finally:
+        if os.path.ismount(f"{image}/crossed"):
+            subprocess.run(["umount", "-l", f"{image}/crossed"])
+        shutil.rmtree(image, ignore_errors=True)
+        shutil.rmtree(source, ignore_errors=True)
+        for leftover in (f"{REGISTRY}/{name}", f"{REGISTRY}/.{name}.tmp"):
+            if os.path.lexists(leftover):
+                os.remove(leftover)
+
+
 def run_registry_and_sandboxes():
     # cp -a keeps the sandbox-range ownership the image check requires.
     subprocess.run(["cp", "-a", f"{IMAGES}/alpine", f"{IMAGES}/{IMAGE}"], check=True, timeout=60)
@@ -354,6 +489,8 @@ def main():
     assert os.listdir(RUNS) == [], "run with no other sandboxes: unknown runs block image removal"
     registry_existed = os.path.isdir(REGISTRY)
     try:
+        run_scripted_peers()
+        run_bind_mount_refusal()
         run_registry_and_sandboxes()
     finally:
         if os.path.isdir(f"{IMAGES}/{IMAGE}"):
@@ -363,8 +500,9 @@ def main():
                 os.remove(leftover)
         if not registry_existed and os.path.isdir(REGISTRY):
             os.rmdir(REGISTRY)
-    print("PASS: checkpoint lease, unsupported and old-PID-1 refusals, stalled probes, pinned layout, "
-          "protected paths, image identity and references")
+    print("PASS: checkpoint lease, unsupported and old-PID-1 refusals, stalled probes, scripted-peer success "
+          "and cancellation boundaries, bind-mount refusal, pinned layout, protected paths, image identity and "
+          "references")
 
 
 if __name__ == "__main__":

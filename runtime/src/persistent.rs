@@ -407,13 +407,44 @@ fn typed_request(cmd: &[String], options: Option<&[u8]>) -> Result<(u8, Vec<u8>)
 /// connections one at a time, each with its own deadline, so a probe queued
 /// behind stalled root-only connections must wait where operation 4 would.
 pub(crate) fn probe_features(path: &Path, stage: &mut Stage) -> Result<Capabilities> {
+    probe_features_cancellable(path, stage, None)
+}
+
+/// `probe_features`, abandoned as soon as `cancel` (a driver's status socket)
+/// closes or carries anything, while the reply is still being waited for.
+fn probe_features_cancellable(path: &Path, stage: &mut Stage, cancel: Option<&UnixStream>) -> Result<Capabilities> {
     let mut probe = connect_path_bounded(path, Instant::now() + protocol::FRAME_TIMEOUT)?;
     *stage = Stage::Handshake;
     probe.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
     send_header(&probe, 3, 0, &[])?;
+    wait_for_reply(&probe, cancel)?;
     match protocol::read_reply(&mut probe, None)? {
         Frame::Capabilities(capabilities) => Ok(capabilities),
         _ => bail!("expected sandbox capabilities"),
+    }
+}
+
+/// Waits, with no timer, until `control` is readable. With a driver status
+/// socket in `cancel`, the wait ends with an error as soon as that socket shows
+/// anything: EOF or a reset means the driver is gone, and a driver sends
+/// nothing before Granted. Its bytes are never consumed here. Valid queued
+/// work ahead of the request therefore keeps the wait alive; only the driver
+/// can end it.
+fn wait_for_reply(control: &UnixStream, cancel: Option<&UnixStream>) -> Result<()> {
+    let Some(cancel) = cancel else { return Ok(()) };
+    loop {
+        let mut fds = [libc::pollfd { fd: control.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: cancel.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        // SAFETY: two initialized pollfds.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted { continue; }
+            return Err(e).context("poll control reply");
+        }
+        if fds[1].revents != 0 {
+            bail!("driver closed or wrote to the status socket before the lease was granted; abandoned");
+        }
+        if fds[0].revents != 0 { return Ok(()); }
     }
 }
 
@@ -452,9 +483,38 @@ pub fn checkpoint_lease(id: &str, version: u16, status: RawFd) -> Result<i32> {
     restore_cloexec(status)?;
     let status = UnixStream::from(unsafe { OwnedFd::from_raw_fd(status) });
     let last = lease_session(id, version, &status);
-    let code = match &last { Frame::Lease(_) => 0, Frame::Outcome(o) => o.projection(), Frame::Capabilities(_) => EXEC_FAILED };
     protocol::write_bounded(status.as_raw_fd(), &last.encode()?, || Ok(()))?;
-    Ok(code)
+    Ok(lease_exit_code(&last))
+}
+
+/// Exit 0 means exactly one thing: the final frame is Released. The session
+/// returns Released only for the granted generation; every other frame,
+/// including a command outcome from a confused peer, is 125.
+fn lease_exit_code(last: &Frame) -> i32 {
+    match last {
+        Frame::Lease(protocol::Lease { state: protocol::LeaseState::Released, .. }) => 0,
+        _ => EXEC_FAILED,
+    }
+}
+
+/// A PID 1 reply to operation 6, or to the acknowledgment, may be an Outcome
+/// only if it reports a failure. A command outcome where a lease frame belongs
+/// is a protocol violation, never success.
+fn lease_failure(o: Outcome, phase: &str) -> Result<Frame> {
+    anyhow::ensure!(o.kind != FailureKind::None, "PID 1 answered the lease {phase} with a command outcome");
+    Ok(Frame::Outcome(o))
+}
+
+/// Reads PID 1's answer to operation 6: the granted generation, or a failure
+/// outcome to report as the final frame. Waits behind PID 1's other work, but
+/// gives up as soon as the driver closes its status socket.
+fn read_grant(lease: &mut UnixStream, status: &UnixStream) -> Result<std::result::Result<u64, Frame>> {
+    wait_for_reply(lease, Some(status))?;
+    match protocol::read_frame(lease, None)? {
+        Frame::Outcome(o) => lease_failure(o, "request").map(Err),
+        Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation }) => Ok(Ok(generation)),
+        _ => bail!("expected a checkpoint lease grant"),
+    }
 }
 
 /// Every path returns the final status frame. Granted, when reached, has
@@ -470,7 +530,7 @@ fn lease_session(id: &str, version: u16, status: &UnixStream) -> Frame {
         if let Err(reason) = checkpoint_source_support(&dir)? {
             return Ok(unsupported(&reason));
         }
-        let capabilities = probe_features(&dir.join("control.sock"), &mut stage)
+        let capabilities = probe_features_cancellable(&dir.join("control.sock"), &mut stage, Some(status))
             .with_context(|| format!("probe sandbox {id}"))?;
         if capabilities.require_v1().is_err() || capabilities.features & protocol::CHECKPOINT_LEASE_FEATURE == 0 {
             return Ok(unsupported(&format!("sandbox PID 1 does not grant checkpoint leases (features {:#010x})",
@@ -483,10 +543,9 @@ fn lease_session(id: &str, version: u16, status: &UnixStream) -> Frame {
         send_header(&lease, 6, 0, &[])?;
         stage = Stage::Lease;
         // Like an exec reply, the grant waits behind PID 1's other work.
-        let generation = match protocol::read_frame(&mut lease, None)? {
-            Frame::Outcome(o) => return Ok(Frame::Outcome(o)),
-            Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation }) => generation,
-            _ => bail!("expected a checkpoint lease grant"),
+        let generation = match read_grant(&mut lease, status)? {
+            Ok(generation) => generation,
+            Err(failure) => return Ok(failure),
         };
         let granted = Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation });
         protocol::write_bounded(status.as_raw_fd(), &granted.encode()?, || Ok(()))
@@ -566,7 +625,7 @@ fn hold_lease(lease: &mut UnixStream, status: &UnixStream, generation: u64) -> R
         return match protocol::read_reply(lease, Some(Instant::now() + protocol::FRAME_TIMEOUT))? {
             Frame::Lease(l) if l == (protocol::Lease { state: protocol::LeaseState::Released, generation }) =>
                 Ok(Frame::Lease(l)),
-            Frame::Outcome(o) => Ok(Frame::Outcome(o)),
+            Frame::Outcome(o) => lease_failure(o, "acknowledgment"),
             _ => bail!("expected release of checkpoint lease {generation}"),
         };
     }
@@ -1380,6 +1439,73 @@ mod tests {
             pid1.write_all(&released(9).encode().unwrap()).unwrap(); });
         assert!(hold_lease(&mut lease, &status, 7).is_err());
         t.join().unwrap();
+    }
+
+    /// Adversarial-review HIGH 1: a command outcome where a lease frame belongs
+    /// (before Granted, or after the acknowledgment) must never become exit 0.
+    #[test]
+    fn command_outcome_is_never_lease_success() {
+        use protocol::{CommandStatus, Lease, LeaseState};
+        let success = || Frame::Outcome(Outcome::command(CommandStatus::Exited(0)));
+        let busy = Frame::Outcome(Outcome::failure(FailureKind::Busy, Stage::Lease, Cleanup::NoChildStarted, 0, "busy"));
+        // Before Granted.
+        for (reply, expect) in [(success(), None), (busy.clone(), Some(Err(busy.clone()))),
+            (Frame::Lease(Lease { state: LeaseState::Granted, generation: 7 }), Some(Ok(7))),
+            (Frame::Lease(Lease { state: LeaseState::Released, generation: 7 }), None)] {
+            let (mut lease, mut pid1) = UnixStream::pair().unwrap();
+            let (status, _driver) = UnixStream::pair().unwrap();
+            pid1.write_all(&reply.encode().unwrap()).unwrap();
+            let got = read_grant(&mut lease, &status);
+            match expect {
+                None => assert!(got.unwrap_err().to_string().contains("lease"), "{reply:?}"),
+                Some(expected) => assert_eq!(got.unwrap(), expected),
+            }
+        }
+        // After Granted and the acknowledgment.
+        let (mut lease, mut pid1) = UnixStream::pair().unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        (&driver).write_all(&protocol::encode_ack(7)).unwrap();
+        let t = std::thread::spawn(move || { let mut a = [0u8; 16]; pid1.read_exact(&mut a).unwrap();
+            pid1.write_all(&Frame::Outcome(Outcome::command(CommandStatus::Exited(0))).encode().unwrap()).unwrap(); });
+        let error = hold_lease(&mut lease, &status, 7).unwrap_err().to_string();
+        assert!(error.contains("command outcome"), "{error}");
+        t.join().unwrap();
+        // Exit 0 belongs to Released alone.
+        assert_eq!(lease_exit_code(&Frame::Lease(Lease { state: LeaseState::Released, generation: 7 })), 0);
+        for other in [success(), busy, Frame::Lease(Lease { state: LeaseState::Granted, generation: 7 })] {
+            assert_eq!(lease_exit_code(&other), EXEC_FAILED, "{other:?}");
+        }
+    }
+
+    /// Adversarial-review MEDIUM 1: while the probe or grant is pending, the
+    /// driver closing its status socket ends the wait; otherwise it waits
+    /// with no timer behind PID 1's queued work.
+    #[test]
+    fn driver_closure_cancels_a_pending_probe_or_grant() {
+        // Driver closes while PID 1 is silent.
+        let (control, _pid1) = UnixStream::pair().unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        let closer = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(200)); drop(driver); });
+        let started = Instant::now();
+        assert!(wait_for_reply(&control, Some(&status)).unwrap_err().to_string().contains("abandoned"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        closer.join().unwrap();
+        // The same through read_grant, which is what the CLI calls.
+        let (mut lease, _pid1) = UnixStream::pair().unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        drop(driver);
+        assert!(read_grant(&mut lease, &status).is_err());
+        // A live driver keeps the wait alive past any framing window.
+        let (control, mut pid1) = UnixStream::pair().unwrap();
+        let (status, _driver) = UnixStream::pair().unwrap();
+        let late = std::thread::spawn(move || { std::thread::sleep(protocol::FRAME_TIMEOUT + Duration::from_millis(300));
+            pid1.write_all(b"x").unwrap(); pid1 });
+        let started = Instant::now();
+        wait_for_reply(&control, Some(&status)).unwrap();
+        assert!(started.elapsed() > protocol::FRAME_TIMEOUT);
+        drop(late.join().unwrap());
+        // Without a driver (exec options' probe), nothing changes.
+        wait_for_reply(&control, None).unwrap();
     }
 
     #[test]
