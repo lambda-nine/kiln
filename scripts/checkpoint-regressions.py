@@ -436,16 +436,19 @@ def run_registry_and_sandboxes():
         o, text = outcome_full(cli.first[1])
         assert o[5:7] == (4, 13) and b"sandbox_unsupported:workspace_checkpoint" in text and b"not registered" in text
         cli.finish()
-        entry = kiln("image", "register", IMAGE, timeout=120).stdout.decode()
-        assert f"name {IMAGE}\ngeneration 1\nstate registered\n" in entry, entry
-        assert kiln("image", "verify", IMAGE, timeout=120).stdout.decode() == entry
-        assert kiln("image", "register", IMAGE, timeout=120).stdout.decode() == entry, "no-op re-registration"
-        # A run referencing the name by name alone still blocks removal.
-        for action in (("unregister", IMAGE), ("rm", IMAGE)):
-            p = kiln("image", *action, check=False)
-            assert p.returncode != 0 and plain.encode() in p.stderr, p.stderr
+        # Registration installs a hashed private copy, which would replace the
+        # directory under this run's mounted lower: refused while referenced,
+        # even by name alone, as removal is.
+        for action in (("register", IMAGE), ("rm", IMAGE)):
+            p = kiln("image", *action, check=False, timeout=120)
+            assert p.returncode != 0 and plain.encode() in p.stderr and b"new image name" in p.stderr, p.stderr
     finally:
         kiln("rm", plain)
+    entry = kiln("image", "register", IMAGE, timeout=120).stdout.decode()
+    assert f"name {IMAGE}\ngeneration 1\nstate registered\n" in entry, entry
+    assert kiln("image", "verify", IMAGE, timeout=120).stdout.decode() == entry
+    assert kiln("image", "register", IMAGE, timeout=120).stdout.decode() == entry, "no-op re-registration"
+    assert not [n for n in os.listdir(IMAGES) if n.startswith(f".register-{IMAGE}-")], "registration left its stage"
 
     capable = create(IMAGE)
     try:

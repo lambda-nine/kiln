@@ -305,6 +305,11 @@ fn header(bytes: &[u8]) -> Result<(u16, usize)> {
     Ok((ty, len))
 }
 
+/// The total length of the frame this validated reply header starts.
+pub fn frame_len(bytes: &[u8; 16]) -> Result<usize> {
+    Ok(16 + header(bytes)?.1)
+}
+
 /// First exec byte may wait for the workload; after it arrives framing and EOF
 /// have an absolute deadline. Probes instead supply an overall deadline.
 pub fn read_reply(stream: &mut UnixStream, overall: Option<Instant>) -> Result<Frame> {
@@ -352,7 +357,9 @@ pub fn read_reply(stream: &mut UnixStream, overall: Option<Instant>) -> Result<F
 /// more than one (the lease connection and the lease status stream). Like
 /// `read_reply`, `overall` bounds the whole read; without it the first byte may
 /// wait indefinitely and the rest of the frame then has `FRAME_TIMEOUT`. A
-/// reset or EOF before the frame is complete is an error.
+/// reset or EOF before the frame is complete is an error. The lease CLI reads
+/// a grant with `persistent.rs`'s cancellable reader, which keeps these
+/// semantics; the capture worker, which has no driver socket, uses this one.
 pub fn read_frame(stream: &mut UnixStream, overall: Option<Instant>) -> Result<Frame> {
     let mut bytes = vec![0u8; 16];
     let mut at = 0;

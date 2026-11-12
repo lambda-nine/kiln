@@ -10,7 +10,7 @@ alive.
 ## Commands
 
 ```text
-kiln image register NAME     hash the installed tree and record its identity
+kiln image register NAME     install a hashed private copy of the tree and record its identity
 kiln image inspect NAME      print the registry entry
 kiln image verify NAME       rehash and compare with the registration
 kiln image unregister NAME   retire the registration (the image stays usable by name)
@@ -48,33 +48,49 @@ refused by `register`, `verify`, `inspect` and `unregister`. When a create
 meets such a registry, the run still works, but its reference records no
 identity (`identity none image registry unusable: …`).
 
-- **Directory identity.** The `directory` line identifies the directory the
-  name resolved to at registration: the filesystem ID from `fstatfs`, the
+- **Directory identity.** The `directory` line identifies the directory
+  registration installed under the name: the filesystem ID from `fstatfs`, the
   inode, and the `statx` birth time. The birth time tells a reused inode
   number apart. The identity is the cheap check a create makes. Capture and
   fork rehash the tree and compare the digest itself (`verify`).
 - **Generations.** A name's generation starts at 1 and increases with every
   replacement or re-registration. Unregistering or removing a name leaves its
   file with `state retired`, so a generation is never reused for one name.
-- **Registering again.** Unchanged content in the same directory is a no-op.
-  Anything else replaces the registration, and that is refused while the name
-  is referenced (below).
-- **Registration needs a quiescent image.** Registration walks the tree
-  twice, and the two walks must produce the same digest, entry count and byte
-  count. Each directory's own metadata must also be unchanged after its
-  entries are walked. These checks catch an unsynchronized change made while
-  the image is being registered. They are not an atomic snapshot: a writer
-  that coordinates with the walk, for example by watching it with inotify, can
-  show both walks the same mixed state, and no finite number of walks rules
-  that out. So registration requires an image nobody is changing:
-  - cooperating installers, such as `fetch-alpine.sh`, hold the exclusive
-    images flock while they change an image;
-  - host root is trusted not to change an image while it is being registered.
-- **The digest counts only when re-verified.** Capture and fork rehash the
-  tree and compare it with the registration (`verify`). A mismatch, including
-  one from a digest of a state the tree never had, fails closed with no
-  checkpoint. A future version may close the gap by hashing a staged or
-  immutable copy of the image instead of the live directory.
+- **Registering again.** Unchanged content in the registered directory is a
+  no-op. A no-op writes nothing, so it can't publish any state: it only
+  answers "unchanged", and the registry keeps certifying the snapshot the
+  earlier registration installed. Anything else replaces the directory and
+  the registration, and is refused while any run references the name (below).
+  That includes a first registration and re-registering a retired name,
+  because installing the copy swaps the directory under runs that use the
+  name.
+- **Registration installs what it hashed.** Under the exclusive image lock,
+  registration copies the tree into a private stage,
+  `/var/lib/kiln/images/.register-NAME-PID-N`, which is root-owned and mode
+  0700. The copy is made with the same safe walk as the digest, and is
+  faithful to everything the manifest covers: types, bytes, modes including
+  setuid, owners, xattrs, mtimes and hardlink topology. Registration then
+  hashes the copy, syncs it to disk, and exchanges it with `NAME` in one
+  `renameat2(RENAME_EXCHANGE)`. Only root can reach the copy between the hash
+  and the exchange, so the registered digest is the digest of the tree as
+  installed, whatever anyone does to the old directory meanwhile. Afterwards
+  `NAME` must resolve to the copy, and the old tree, now in the stage, is
+  deleted with it. The registered `directory` is therefore always a new
+  identity.
+  - A file or directory that changes while it is copied is still refused,
+    and so is a mount crossing.
+  - Registration needs free space for one more copy of the image on the
+    images filesystem. Runs of zero bytes are copied as holes.
+  - A crashed registration leaves a `.register-NAME-*` directory behind. The
+    next registration of that name deletes it.
+- **Verification is a live rehash.** `verify`, capture and fork rehash the
+  installed tree and compare it with the registration. They detect any
+  change that persists through the walk. A writer that can change the
+  installed image as its owner (host root, or the sandbox range's host UID)
+  can still defeat a live rehash.
+  Images are provisioned by root and are never visible to sandboxes by path.
+  Cooperating installers, such as `fetch-alpine.sh`, hold the exclusive images
+  flock while they change an image.
 
 ## Serialization
 
@@ -111,9 +127,9 @@ name alpine
 identity none image is not registered
 ```
 
-**A run directory is a durable reference.** Replacing, unregistering or
-removing a name is refused while any run directory under
-`/var/lib/kiln/runs` references it. It is also refused while any run's
+**A run directory is a durable reference.** Registering (other than a
+no-op), unregistering or removing a name is refused while any run directory
+under `/var/lib/kiln/runs` references it. It is also refused while any run's
 reference is missing or unreadable, because that run's image is unknown. Runs
 created by older kiln versions have no reference at all, so they block every
 image removal until they are gone. A crashed shim's run directory blocks until

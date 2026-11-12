@@ -18,6 +18,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 
 use crate::cgroup::{Cgroup, ExecCgroup, Limits};
+use crate::checkpoint;
 use crate::image;
 use crate::init;
 use crate::landlock;
@@ -45,6 +46,8 @@ pub struct Config {
     pub net: net::Plan,
     pub stats: bool,
     pub cmd: Vec<String>,
+    /// Set when the new sandbox's upper is restored from a checkpoint.
+    pub fork: Option<checkpoint::capture::ForkInfo>,
 }
 
 /// The overlayfs layers for one run. `lower` is the shared, read-only image;
@@ -108,7 +111,8 @@ pub fn run(cfg: &Config) -> Result<i32> {
 
 /// Runs the long-lived init for a persistent sandbox. This function is called
 /// by its detached host shim, which stays alive to own cleanup resources.
-pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<()> {
+pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Option<checkpoint::capture::Fork>)
+    -> Result<()> {
     validate_image(cfg)?;
     storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
     let run_dir = run_dir(id);
@@ -120,6 +124,15 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd) -> Result<(
     };
     create_run_dir(&run_dir)?;
     prepare(cfg, &run_dir, &layers)?;
+    if let Some(fork) = fork {
+        // The upper is rebuilt before anything mounts it; the artifact's
+        // shared lock is released when `fork` is consumed here. A failed
+        // restore removes the run: no sandbox starts on a partial upper.
+        if let Err(e) = checkpoint::capture::restore_into(fork, &run_dir, &generated(cfg)) {
+            let _ = fs::remove_dir_all(&run_dir);
+            return Err(e);
+        }
+    }
     let socket = run_dir.join("control.sock");
     let listener = bind_control_socket(&socket)?;
     let pid = std::process::id();
@@ -263,7 +276,16 @@ fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     // mounts the image, so image replacement or removal sees this run.
     image::acquire_reference(&image::Roots::system(), &cfg.image, run_dir)?;
     trace::mark("host: image reference");
+    // The root-write policy and writable set a checkpoint binds and a fork
+    // must match. Lost in a crash, the run is simply not a checkpoint source.
+    let policy = checkpoint::Policy::new(cfg.read_only, &cfg.writable)?;
+    publish_unsynced(&run_dir.join(checkpoint::POLICY_FILE), policy.text().as_bytes())?;
     Ok(())
+}
+
+/// The upper entries this run's runtime generates (protected.rs).
+pub fn generated(cfg: &Config) -> Vec<&'static str> {
+    cfg.net.resolv_conf().map(|_| protected::RESOLV_CONF).into_iter().collect()
 }
 
 fn spawn_and_wait(cfg: &Config, id: &str, layers: &Layers) -> Result<i32> {
@@ -480,12 +502,20 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     trace::mark("init: cgroup ns, hostname, overlay");
     // Read the effective features back while the host's /proc and /sys are
     // still visible, and record them with the entries this run generates.
-    let generated: Vec<&str> = cfg.net.resolv_conf().map(|_| protected::RESOLV_CONF).into_iter().collect();
+    let generated = generated(cfg);
     let read = overlay::read_back(&layers.merged, [&layers.lower, &layers.upper, &layers.work])
         .map_err(|e| format!("{e:#}"));
     let run_dir = layers.upper.parent().context("upper has no run directory")?;
     publish_unsynced(&run_dir.join(overlay::LAYOUT_FILE), overlay::layout_text(&read, &generated).as_bytes())?;
     trace::mark("init: overlay layout record");
+
+    // A restored upper is hostile input: before any privileged mount or DNS
+    // write follows a path into it, every mount target and the DNS file's
+    // parent must be a plain directory, checked without following.
+    if cfg.fork.is_some() {
+        checkpoint::restore::check_scaffolding(&layers.merged, &generated)?;
+        trace::mark("init: checkpoint scaffolding");
+    }
 
     // Device files must be bind-mounted from the host before we lose sight of it.
     setup_dev(&layers.merged.join(&protected::DEV[1..]))?;
@@ -530,7 +560,10 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // Written as real root, so it shows up inside as owned by "nobody":
     // readable, but sandbox root can't point DNS somewhere else.
     if let Some(conf) = cfg.net.resolv_conf() {
-        fs::write(protected::RESOLV_CONF, conf).context("write /etc/resolv.conf")?;
+        match &cfg.fork {
+            None => fs::write(protected::RESOLV_CONF, conf).context("write /etc/resolv.conf")?,
+            Some(info) => write_fork_resolv_conf(conf.as_bytes(), info)?,
+        }
     }
 
     // Last step as real root. Every namespace above was created first, so it
@@ -592,6 +625,30 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
         .collect::<Result<_, _>>()
         .context("argument contains a NUL byte")?;
     init::run(&argv)
+}
+
+/// The DNS write of a sandbox restored from a checkpoint: no component is
+/// followed, then the captured times of `/etc` and `/` (which the write may
+/// change by creating or copying up entries) are put back.
+fn write_fork_resolv_conf(conf: &[u8], info: &checkpoint::capture::ForkInfo) -> Result<()> {
+    let open = |dir: RawFd, name: &std::ffi::CStr, flags: i32| -> Result<OwnedFd> {
+        // SAFETY: openat relative to an open directory, not following.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644) };
+        Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(Errno::result(fd).context("open")?) })
+    };
+    let root = open(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let etc = open(root.as_raw_fd(), c"etc", libc::O_RDONLY | libc::O_DIRECTORY).context("open /etc without symlinks")?;
+    let file = open(etc.as_raw_fd(), c"resolv.conf", libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
+        .context("open /etc/resolv.conf without symlinks")?;
+    fs::File::from(file).write_all(conf).context("write /etc/resolv.conf")?;
+    let set = |fd: &OwnedFd, (sec, nsec): (i64, u32)| -> Result<()> {
+        let times = [libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }, libc::timespec { tv_sec: sec, tv_nsec: i64::from(nsec) }];
+        // SAFETY: futimens on an open descriptor.
+        Errno::result(unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) }).context("restore directory time")?;
+        Ok(())
+    };
+    if let Some(mtime) = info.etc_mtime { set(&etc, mtime)?; }
+    set(&root, info.root_mtime)
 }
 
 /// `struct clone_args` from <linux/sched.h> (version 2, 88 bytes: the

@@ -234,7 +234,9 @@ pub fn before_allocation<T>(result: Result<T>) -> Result<T> {
     result.context(CreatePreflightFailure)
 }
 
-pub fn create(cfg: &Config) -> Result<String> {
+/// `fork` is a checkpoint that passed the preflight; its upper is restored
+/// by the shim before the sandbox mounts it.
+pub fn create(cfg: &Config, from_checkpoint: Option<crate::checkpoint::capture::Fork>) -> Result<String> {
     before_allocation(container::validate_image(cfg))?;
     let id = container::new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
@@ -242,10 +244,16 @@ pub fn create(cfg: &Config) -> Result<String> {
     match unsafe { fork() }.context("fork shim")? {
         ForkResult::Parent { child } => {
             drop(ready_tx);
-            let mut byte = [0u8; 1];
-            if read(&ready_rx, &mut byte).context("wait for shim")? != 1 {
+            drop(from_checkpoint);
+            // "1" is readiness; a shim that fails during setup may write "E"
+            // and a one-line reason first (typed checkpoint reasons lead it).
+            let mut reply = [0u8; 1024];
+            let n = read(&ready_rx, &mut reply).context("wait for shim")?;
+            if n == 0 || reply[0] != b'1' {
                 let _ = nix::sys::wait::waitpid(child, None);
-                bail!("sandbox shim failed during setup");
+                let why = if n > 1 && reply[0] == b'E' { String::from_utf8_lossy(&reply[1..n]).into_owned() } else { String::new() };
+                if why.is_empty() { bail!("sandbox shim failed during setup"); }
+                bail!("sandbox shim failed during setup: {why}");
             }
             Ok(id)
         }
@@ -253,9 +261,15 @@ pub fn create(cfg: &Config) -> Result<String> {
             drop(ready_rx);
             let _ = setsid();
             redirect_stdio();
-            let code = match container::supervise_persistent(cfg, &id, &ready_tx) {
+            let code = match container::supervise_persistent(cfg, &id, &ready_tx, from_checkpoint) {
                 Ok(()) => 0,
-                Err(_) => 1,
+                Err(e) => {
+                    // Read only before readiness; afterwards the CLI is gone
+                    // and this write fails harmlessly.
+                    let why: String = format!("E{e:#}").chars().map(|c| if c.is_control() { ' ' } else { c }).take(1000).collect();
+                    let _ = nix::unistd::write(&ready_tx, why.as_bytes());
+                    1
+                }
             };
             std::process::exit(code);
         }
@@ -417,26 +431,45 @@ fn probe_features_cancellable(path: &Path, stage: &mut Stage, cancel: Option<&Un
     *stage = Stage::Handshake;
     probe.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
     send_header(&probe, 3, 0, &[])?;
-    wait_for_reply(&probe, cancel)?;
-    match protocol::read_reply(&mut probe, None)? {
+    let reply = match cancel {
+        Some(cancel) => read_frame_cancellable(&probe, cancel, true)?,
+        None => protocol::read_reply(&mut probe, None)?,
+    };
+    match reply {
         Frame::Capabilities(capabilities) => Ok(capabilities),
         _ => bail!("expected sandbox capabilities"),
     }
 }
 
-/// Waits, with no timer, until `control` is readable. With a driver status
-/// socket in `cancel`, the wait ends with an error as soon as that socket shows
-/// anything: EOF or a reset means the driver is gone, and a driver sends
-/// nothing before Granted. Its bytes are never consumed here. Valid queued
-/// work ahead of the request therefore keeps the wait alive; only the driver
-/// can end it.
-fn wait_for_reply(control: &UnixStream, cancel: Option<&UnixStream>) -> Result<()> {
-    let Some(cancel) = cancel else { return Ok(()) };
+/// Reads one reply frame from `control`, polling `cancel` (the driver's status
+/// socket) for the whole read. Before the first control byte there is no timer;
+/// after it the rest of the frame has `protocol::FRAME_TIMEOUT`. Status readiness
+/// (EOF, reset or any byte) wins over control readiness and abandons the read:
+/// a driver sends nothing before Granted, and its bytes are never consumed
+/// here. Valid queued work ahead of the request therefore keeps the wait
+/// alive; only the driver can end it.
+/// `until_eof`: probe semantics (the frame, then EOF; nothing after it), as
+/// `protocol::read_reply`, including its reset-after-a-complete-busy-reply rule.
+/// Otherwise lease-connection semantics: exactly one frame and no read past it,
+/// as `protocol::read_frame`.
+fn read_frame_cancellable(control: &UnixStream, cancel: &UnixStream, until_eof: bool) -> Result<Frame> {
+    let mut bytes = Vec::with_capacity(protocol::MAX_FRAME);
+    let mut chunk = [0u8; protocol::MAX_FRAME + 1];
+    // Without `until_eof`, never read past the header, then past the frame.
+    let mut want = 16;
+    let mut deadline: Option<Instant> = None;
     loop {
+        let timeout = match deadline {
+            None => -1,
+            Some(d) => {
+                let left = d.checked_duration_since(Instant::now()).context("incomplete reply framing deadline")?;
+                left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+            }
+        };
         let mut fds = [libc::pollfd { fd: control.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: cancel.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
         // SAFETY: two initialized pollfds.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == ErrorKind::Interrupted { continue; }
             return Err(e).context("poll control reply");
@@ -444,7 +477,44 @@ fn wait_for_reply(control: &UnixStream, cancel: Option<&UnixStream>) -> Result<(
         if fds[1].revents != 0 {
             bail!("driver closed or wrote to the status socket before the lease was granted; abandoned");
         }
-        if fds[0].revents != 0 { return Ok(()); }
+        if let Some(d) = deadline { anyhow::ensure!(Instant::now() < d, "incomplete reply framing deadline"); }
+        if fds[0].revents == 0 { continue; }
+        let limit = if until_eof { protocol::MAX_FRAME + 1 - bytes.len() } else { want - bytes.len() };
+        // SAFETY: recv into an owned buffer of at least `limit` bytes.
+        let n = unsafe { libc::recv(control.as_raw_fd(), chunk.as_mut_ptr().cast(), limit, libc::MSG_DONTWAIT) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                ErrorKind::Interrupted | ErrorKind::WouldBlock => continue,
+                ErrorKind::ConnectionReset if until_eof => {
+                    // As `read_reply`: a header-only busy refusal leaves request
+                    // bytes unread, and Linux may then reset the stream after
+                    // delivering the complete reply.
+                    let frame = Frame::decode(&bytes).context("reset before complete busy reply")?;
+                    anyhow::ensure!(matches!(&frame, Frame::Outcome(o) if o.kind == FailureKind::Busy
+                        && o.cleanup == Cleanup::NoChildStarted && o.status.is_none()),
+                        "reset without complete busy reply");
+                    return Ok(frame);
+                }
+                _ => return Err(e)
+                    .context(if until_eof { "incomplete control response" } else { "incomplete control frame" }),
+            }
+        }
+        if n == 0 {
+            if until_eof {
+                anyhow::ensure!(!bytes.is_empty(), "missing control response");
+                return Frame::decode(&bytes);
+            }
+            bail!(if bytes.is_empty() { "missing control frame" } else { "truncated control frame" });
+        }
+        deadline.get_or_insert_with(|| Instant::now() + protocol::FRAME_TIMEOUT);
+        bytes.extend_from_slice(&chunk[..n as usize]);
+        anyhow::ensure!(bytes.len() <= protocol::MAX_FRAME, "trailing or oversized reply");
+        if bytes.len() >= 16 {
+            want = protocol::frame_len(bytes[..16].try_into().unwrap())?;
+            anyhow::ensure!(bytes.len() <= want, "trailing or duplicate reply");
+            if !until_eof && bytes.len() == want { return Frame::decode(&bytes); }
+        }
     }
 }
 
@@ -509,8 +579,7 @@ fn lease_failure(o: Outcome, phase: &str) -> Result<Frame> {
 /// outcome to report as the final frame. Waits behind PID 1's other work, but
 /// gives up as soon as the driver closes its status socket.
 fn read_grant(lease: &mut UnixStream, status: &UnixStream) -> Result<std::result::Result<u64, Frame>> {
-    wait_for_reply(lease, Some(status))?;
-    match protocol::read_frame(lease, None)? {
+    match read_frame_cancellable(lease, status, false)? {
         Frame::Outcome(o) => lease_failure(o, "request").map(Err),
         Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation }) => Ok(Ok(generation)),
         _ => bail!("expected a checkpoint lease grant"),
@@ -647,6 +716,64 @@ pub fn checkpoint_source_support(dir: &Path) -> Result<std::result::Result<(), S
     match crate::overlay::read_layout(dir)? {
         None => Ok(Err("the run has no overlay layout record (created by an older kiln)".into())),
         Some(layout) => Ok(layout.verified.map_err(|reason| format!("overlay options not verified: {reason}"))),
+    }
+}
+
+/// An operation 6 lease held by the process that copies the source (the
+/// capture worker), with no driver socket in between: the worker's own
+/// lifetime bounds the lease. Dropping it without `release` closes the
+/// connection, which PID 1 treats as abandonment, never as success.
+pub struct HeldLease {
+    stream: UnixStream,
+    pub generation: u64,
+}
+
+/// Probes for bit 0x40, sends operation 6 and waits (behind PID 1's other
+/// work) for the grant. A refusal from PID 1 is returned as its outcome.
+pub fn acquire_lease(id: &str) -> Result<std::result::Result<HeldLease, Outcome>> {
+    validate_id(id)?;
+    let dir = container::run_dir(id);
+    let mut stage = Stage::Connect;
+    let capabilities = probe_features(&dir.join("control.sock"), &mut stage).with_context(|| format!("probe sandbox {id}"))?;
+    if capabilities.require_v1().is_err() || capabilities.features & protocol::CHECKPOINT_LEASE_FEATURE == 0 {
+        return Ok(Err(Outcome::failure(FailureKind::Incompatible, Stage::Handshake, Cleanup::NoChildStarted, 0,
+            &format!("{CHECKPOINT_UNSUPPORTED}: sandbox PID 1 does not grant checkpoint leases (features {:#010x})",
+                capabilities.features))));
+    }
+    let mut lease = connect_bounded(id, Instant::now() + protocol::FRAME_TIMEOUT)?;
+    lease.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
+    send_header(&lease, 6, 0, &[])?;
+    match protocol::read_frame(&mut lease, None)? {
+        Frame::Outcome(o) => match lease_failure(o, "request")? {
+            Frame::Outcome(o) => Ok(Err(o)),
+            _ => unreachable!(),
+        },
+        Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation }) =>
+            Ok(Ok(HeldLease { stream: lease, generation })),
+        _ => bail!("expected a checkpoint lease grant"),
+    }
+}
+
+impl HeldLease {
+    /// Whether PID 1 has ended the lease: it sends nothing before the
+    /// acknowledgment, so any readiness (EOF, reset, data) means it is gone.
+    pub fn lost(&self) -> bool {
+        let mut fd = libc::pollfd { fd: self.stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one initialized pollfd, no wait.
+        unsafe { libc::poll(&mut fd, 1, 0) != 0 }
+    }
+
+    /// Acknowledges the lease and requires PID 1's Released for the same
+    /// generation within the framing deadline.
+    pub fn release(mut self) -> Result<()> {
+        anyhow::ensure!(!self.lost(), "the sandbox ended checkpoint lease {} before release", self.generation);
+        (&self.stream).write_all(&protocol::encode_ack(self.generation)).context("send lease acknowledgment")?;
+        match protocol::read_reply(&mut self.stream, Some(Instant::now() + protocol::FRAME_TIMEOUT))? {
+            Frame::Lease(l) if l == (protocol::Lease { state: protocol::LeaseState::Released,
+                generation: self.generation }) => Ok(()),
+            Frame::Outcome(o) => bail!("checkpoint lease {} ended without release: {}", self.generation, o.diagnostic),
+            _ => bail!("expected release of checkpoint lease {}", self.generation),
+        }
     }
 }
 
@@ -880,11 +1007,15 @@ fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathB
     Ok(stale)
 }
 
+/// Run directories. The checkpoint namespace shares the runs filesystem for
+/// its quotas; it is never a sandbox (its name is not a valid sandbox ID),
+/// so inventory and GC skip it explicitly.
 fn registry_entries(root: &Path) -> Result<Vec<fs::DirEntry>> {
-    fs::read_dir(root)
+    let entries = fs::read_dir(root)
         .with_context(|| format!("read sandbox registry {}", root.display()))?
         .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("enumerate sandbox registry {}", root.display()))
+        .with_context(|| format!("enumerate sandbox registry {}", root.display()))?;
+    Ok(entries.into_iter().filter(|e| e.file_name() != crate::checkpoint::store::NAMESPACE).collect())
 }
 
 #[derive(Debug)]
@@ -1482,30 +1613,136 @@ mod tests {
     /// with no timer behind PID 1's queued work.
     #[test]
     fn driver_closure_cancels_a_pending_probe_or_grant() {
-        // Driver closes while PID 1 is silent.
-        let (control, _pid1) = UnixStream::pair().unwrap();
-        let (status, driver) = UnixStream::pair().unwrap();
-        let closer = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(200)); drop(driver); });
-        let started = Instant::now();
-        assert!(wait_for_reply(&control, Some(&status)).unwrap_err().to_string().contains("abandoned"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-        closer.join().unwrap();
+        // Driver closes while PID 1 is silent, for both framings.
+        for until_eof in [true, false] {
+            let (control, _pid1) = UnixStream::pair().unwrap();
+            let (status, driver) = UnixStream::pair().unwrap();
+            let closer = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(200)); drop(driver); });
+            let started = Instant::now();
+            assert!(read_frame_cancellable(&control, &status, until_eof).unwrap_err().to_string().contains("abandoned"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            closer.join().unwrap();
+        }
         // The same through read_grant, which is what the CLI calls.
         let (mut lease, _pid1) = UnixStream::pair().unwrap();
         let (status, driver) = UnixStream::pair().unwrap();
         drop(driver);
         assert!(read_grant(&mut lease, &status).is_err());
         // A live driver keeps the wait alive past any framing window.
+        let granted = Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation: 7 });
         let (control, mut pid1) = UnixStream::pair().unwrap();
         let (status, _driver) = UnixStream::pair().unwrap();
+        let frame = granted.encode().unwrap();
         let late = std::thread::spawn(move || { std::thread::sleep(protocol::FRAME_TIMEOUT + Duration::from_millis(300));
-            pid1.write_all(b"x").unwrap(); pid1 });
+            pid1.write_all(&frame).unwrap(); pid1 });
         let started = Instant::now();
-        wait_for_reply(&control, Some(&status)).unwrap();
+        assert_eq!(read_frame_cancellable(&control, &status, false).unwrap(), granted);
         assert!(started.elapsed() > protocol::FRAME_TIMEOUT);
         drop(late.join().unwrap());
-        // Without a driver (exec options' probe), nothing changes.
-        wait_for_reply(&control, None).unwrap();
+    }
+
+    /// Adversarial-review LOW (recheck): once PID 1 has sent one byte of the
+    /// grant, closing the driver's status socket still cancels at once rather
+    /// than at the partial-frame deadline.
+    #[test]
+    fn driver_closure_cancels_a_partial_grant_frame() {
+        let (mut control, mut pid1) = UnixStream::pair().unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            pid1.write_all(b"K").unwrap();
+            let _ = stopped.recv_timeout(protocol::FRAME_TIMEOUT + Duration::from_secs(1));
+        });
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(driver);
+        });
+        let started = Instant::now();
+        let error = read_grant(&mut control, &status).unwrap_err().to_string();
+        let elapsed = started.elapsed();
+        stop.send(()).unwrap();
+        closer.join().unwrap();
+        peer.join().unwrap();
+        assert!(error.contains("abandoned"), "{error}");
+        assert!(elapsed < Duration::from_secs(1), "driver close took {elapsed:?} to cancel");
+    }
+
+    /// The same for the capability probe: PID 1 sends one byte of its
+    /// capabilities and stalls; the driver's closure cancels the probe.
+    #[test]
+    fn driver_closure_cancels_a_partial_probe_frame() {
+        let path = std::env::temp_dir().join(format!("kiln-partial-probe-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 8];
+            stream.read_exact(&mut header).unwrap();
+            stream.write_all(&Frame::Capabilities(Capabilities::current()).encode().unwrap()[..1]).unwrap();
+            let _ = stopped.recv_timeout(protocol::FRAME_TIMEOUT + Duration::from_secs(1));
+            header
+        });
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(driver);
+        });
+        let mut stage = Stage::Connect;
+        let started = Instant::now();
+        let error = probe_features_cancellable(&path, &mut stage, Some(&status)).unwrap_err().to_string();
+        let elapsed = started.elapsed();
+        stop.send(()).unwrap();
+        closer.join().unwrap();
+        assert_eq!(server.join().unwrap(), [3, 0, 0, 0, 0, 0, 0, 0]);
+        fs::remove_file(&path).unwrap();
+        assert!(error.contains("abandoned"), "{error}");
+        assert!(elapsed < Duration::from_secs(1), "driver close took {elapsed:?} to cancel the probe");
+    }
+
+    /// With a live, silent driver, a complete Granted frame that arrives one
+    /// byte at a time inside the framing window is read, and nothing after it.
+    #[test]
+    fn split_grant_frame_is_read_with_a_live_driver() {
+        let granted = Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation: 9 });
+        let frame = granted.encode().unwrap();
+        let (mut control, mut pid1) = UnixStream::pair().unwrap();
+        let (status, _driver) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            for byte in &frame {
+                pid1.write_all(std::slice::from_ref(byte)).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            pid1.write_all(b"after").unwrap();
+            pid1
+        });
+        assert_eq!(read_grant(&mut control, &status).unwrap().unwrap(), 9);
+        drop(writer.join().unwrap());
+        // Lease-connection framing leaves the following bytes unread.
+        let mut rest = Vec::new();
+        control.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"after");
+    }
+
+    /// With a live driver, a partial frame still fails at the framing deadline.
+    #[test]
+    fn partial_frame_times_out_with_a_live_driver() {
+        for until_eof in [false, true] {
+            let (control, mut pid1) = UnixStream::pair().unwrap();
+            let (status, _driver) = UnixStream::pair().unwrap();
+            let (stop, stopped) = std::sync::mpsc::channel::<()>();
+            let peer = std::thread::spawn(move || {
+                pid1.write_all(b"K").unwrap();
+                let _ = stopped.recv_timeout(protocol::FRAME_TIMEOUT + Duration::from_secs(2));
+            });
+            let started = Instant::now();
+            let error = read_frame_cancellable(&control, &status, until_eof).unwrap_err().to_string();
+            let elapsed = started.elapsed();
+            stop.send(()).unwrap();
+            peer.join().unwrap();
+            assert!(error.contains("incomplete reply framing deadline"), "{error}");
+            assert!(elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_secs(3), "{elapsed:?}");
+        }
     }
 
     #[test]

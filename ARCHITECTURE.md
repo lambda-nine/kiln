@@ -308,7 +308,7 @@ layout, bounds and goldens are in
 ### Checkpoint source contract
 
 Workspace checkpoints copy a quiescent run's upper layer, so kiln provides
-four guarantees about the source; the copy itself comes later.
+four guarantees about the source, then the copy and restore themselves.
 
 - **Lease.** Operation 6 (bit `0x40`) gives the copier a lease. PID 1 grants
   it only from idle, after proving its exec cgroup empty and itself
@@ -328,9 +328,20 @@ four guarantees about the source; the copy itself comes later.
   targets, their ancestors and the generated entries a capture must not
   alter. The setup code uses the same constants.
 
+- **Capture and fork.** `kiln checkpoint capture` holds the lease itself
+  while it walks the raw upper (descriptor-relative, no-follow, one mount)
+  and copies it into a private artifact: a canonical JSON manifest and one
+  object per regular-file inode, under its own project quota, fsynced and
+  published by rename. Anything the format can't represent is a typed
+  refusal. `kiln create --from-checkpoint` checks everything before
+  allocating, rebuilds a fresh upper by exclusive creation, verifies every
+  byte and walks the result again before the sandbox mounts it. Nothing is
+  shared between source, artifact and forks.
+
 Byte layouts and the state machine are in
-[checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md) and
-[image-identity-v1.md](docs/image-identity-v1.md).
+[checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md),
+[image-identity-v1.md](docs/image-identity-v1.md) and
+[checkpoint-format-v1.md](docs/checkpoint-format-v1.md).
 
 ### Host service privileges
 

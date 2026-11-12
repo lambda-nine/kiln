@@ -58,6 +58,42 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   stalled root-only connections no longer fails where operation 4 waits and
   runs (adversarial-review LOW).
 
+- Add workspace checkpoints, format v1 (docs/checkpoint-format-v1.md):
+  - **Capture.** `kiln checkpoint capture` takes operation 6 itself, rehashes the image against the run's
+    recorded identity, and walks the raw upper with descriptor-relative, no-follow, `O_NOATIME` reads inside one
+    mount. Regular-file bytes go into flat numbered objects with SHA-256 (holes preserved); everything else goes
+    into a canonical JSON manifest with a reproducible `content_sha256`. Artifacts live under
+    `/var/lib/kiln/runs/.checkpoints/<instance>/<checkpoint>/`, built in a staging directory with its own XFS
+    project quota and published through the fsync order of the design. Source reads end before the lease is
+    released.
+  - **Refusals, never drops.** FIFOs, sockets, devices, ACLs, file capabilities, other security, trusted and
+    system xattrs, every overlay form except the opaque flag, `user.overlay.*`, unmapped owners, links leaving
+    the upper, protected-path violations, and over-limit sizes, xattrs, depths and link targets are typed
+    refusals. Only the kernel's `trusted.overlay.origin`, `impure` and `uuid` bookkeeping is excluded, and
+    its counts are recorded in the artifact.
+  - **Fork.** `kiln create --from-checkpoint INSTANCE/CHECKPOINT` validates the artifact, image (by
+    rehashed content), root-write policy, writable paths, generated entries and disk before allocating
+    anything, rebuilds a fresh upper by exclusive descriptor-relative creation with every object verified,
+    then walks it again and requires the manifest exactly. It shares no inode with the source or the artifact.
+    A fork's init checks the merged scaffolding without following before mounting or writing DNS, writes DNS
+    without following, and restores `/etc` and `/` times.
+  - **Inventory and removal.** `kiln checkpoint inspect [--verify]`, `rm` and `ls`. `kiln ls` and `kiln gc`
+    skip the namespace; artifact headers are image references, so `kiln image rm` is refused while one names
+    the image or can't be read.
+  - Every run records `<run>/policy` (root-write policy and writable paths); runs without it are not sources.
+
+- Fix image registration publishing a digest of a state that was never installed. Two matching walks of the live
+  directory are not a snapshot: a writer coordinating with the walk could show both the same mixed state.
+  `kiln image register` now copies the tree into a root-only stage under the exclusive image lock, hashes the copy,
+  and installs exactly that copy with `renameat2(RENAME_EXCHANGE)`, so the registered digest is the installed
+  tree's. The registered directory is always the new copy; registration needs space for one extra copy, and the next
+  registration of a name deletes a crashed one's `.register-NAME-*` stage. Registration other than a no-op, including
+  a first registration, is now refused while any run references the name (adversarial-review HIGH).
+
+- Fix driver closure waiting for the two-second framing deadline once part of a probe reply or lease grant had
+  arrived. `kiln checkpoint-lease` now reads both frames incrementally and watches the driver's status socket until
+  the last byte, so closure cancels at once (adversarial-review LOW).
+
 - Add exec options: typed operation 5 (operation 4's argv block plus a
   strict, versioned cwd/environment frame), `kiln exec --exec-options-fd=N`
   for a memfd sealed with exactly write/shrink/grow/seal, capability bit

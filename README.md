@@ -347,8 +347,17 @@ sandbox must have a registered image (`kiln image register NAME`) and
 verified pinned overlay options; older sandboxes and PID 1 instances without
 capability bit `0x40` are refused before any lease byte. See
 [checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md) and
-[image-identity-v1.md](docs/image-identity-v1.md). Capture itself (walking and
-copying) is not implemented yet.
+[image-identity-v1.md](docs/image-identity-v1.md).
+
+`kiln checkpoint capture --instance I --checkpoint C --generation G
+--max-bytes R ID` copies that upper layer into a private artifact under
+`/var/lib/kiln/runs/.checkpoints/`, and `kiln create --from-checkpoint I/C`
+starts a new, independent sandbox from it (same image, root-write policy and
+writable paths). Unsupported metadata (ACLs, capabilities, special files,
+unknown overlay forms) is refused with a typed reason rather than dropped. The
+daemon owns who may do this and for how long an artifact lives; the format,
+refusals and order of operations are in
+[checkpoint-format-v1.md](docs/checkpoint-format-v1.md).
 
 ## Notes
 

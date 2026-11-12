@@ -1,23 +1,25 @@
 //! Image content identity.
 //!
 //! An image is still selected by name (`/var/lib/kiln/images/NAME`), but a
-//! name says nothing about content. `kiln image register NAME` hashes the
-//! image's canonical full-tree manifest (types, metadata, hardlink topology,
-//! xattrs and file bytes; never device contents) and records the digest with
-//! the directory's identity in a root-owned registry, one file per name under
-//! `/var/lib/kiln/image-registry`. Every new run writes a durable reference,
-//! `<run>/image`, naming its image and, when the directory still is the
-//! registered one, that identity. A run without an identity works as before
-//! but is not a checkpoint source.
+//! name says nothing about content. `kiln image register NAME` copies the
+//! image into a private stage, hashes the copy's canonical full-tree manifest
+//! (types, metadata, hardlink topology, xattrs and file bytes; never device
+//! contents), installs exactly that copy under the name, and records the
+//! digest with the installed directory's identity in a root-owned registry,
+//! one file per name under `/var/lib/kiln/image-registry`. Every new run
+//! writes a durable reference, `<run>/image`, naming its image and, when the
+//! directory still is the registered one, that identity. A run without an
+//! identity works as before but is not a checkpoint source.
 //!
 //! Registration, replacement, retirement and removal take an exclusive flock
 //! on the images directory; reference acquisition takes it shared. A name
 //! referenced by any run, or any run whose reference can't be read (older
-//! runs have none), blocks replacement and removal: changed content must be
-//! installed under a new name. Retired names keep their generation counter,
-//! so a re-registered name never repeats a generation.
+//! runs have none), blocks registration (other than a no-op), replacement and
+//! removal: changed content must be installed under a new name. Retired
+//! names keep their generation counter, so a re-registered name never repeats
+//! a generation.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -313,6 +315,23 @@ pub fn blocking_references(roots: &Roots, name: &str) -> Result<Vec<String>> {
     for entry in entries {
         let entry = entry.with_context(|| format!("enumerate {}", roots.runs.display()))?;
         let id = entry.file_name().to_string_lossy().into_owned();
+        // Checkpoint artifacts are durable image references too: each one's
+        // header names its image, and one that can't be read (an interrupted
+        // capture, anything unknown) blocks every image.
+        if entry.file_name() == crate::checkpoint::store::NAMESPACE {
+            let store = crate::checkpoint::store::Store::under(&roots.runs, false);
+            match store.image_references() {
+                Ok(references) => for (label, image) in references {
+                    match image {
+                        Some(image) if image != name => {}
+                        Some(_) => blocking.push(label),
+                        None => blocking.push(format!("{label} (unreadable checkpoint header)")),
+                    }
+                },
+                Err(e) => blocking.push(format!("checkpoints (unreadable: {e:#})")),
+            }
+            continue;
+        }
         match read_reference(&entry.path()) {
             Ok(Some(r)) if r.name != name => {}
             Ok(Some(_)) => blocking.push(id),
@@ -331,40 +350,141 @@ fn refuse_if_referenced(roots: &Roots, name: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-/// Registers (or re-registers) `name` with the digest of its current tree.
-/// Unchanged content and directory is a no-op. Anything else replaces the
-/// registration and is refused while the name is referenced.
+/// Registers (or re-registers) `name`. Unchanged content in the registered
+/// directory is a no-op. Anything else copies the tree into a private,
+/// root-only stage, hashes the copy, and installs exactly that copy in place
+/// of the directory with an atomic exchange, all under the exclusive image
+/// lock: the registered digest is the digest of the tree as installed, and no
+/// writer of the old directory can change it. Because the directory is
+/// replaced, this is refused while any run references the name.
 pub fn register(roots: &Roots, name: &str) -> Result<Entry> {
     validate_image_name(name)?;
-    let _lock = lock(&roots.images, true)?;
-    let dir = open_image(roots, name)?;
-    let before = dir_identity(&dir)?;
-    // Two complete walks must agree. This catches an unsynchronized change
-    // racing registration; it is not an atomic snapshot (a writer that
-    // coordinates with the walk can show both walks the same mixed state).
-    // Registration therefore requires a quiescent image, and the digest is
-    // authoritative only where capture and fork rehash and compare it,
-    // failing closed on a mismatch.
-    let tree = tree_digest(&dir)?;
-    let again = tree_digest(&dir)?;
-    ensure!((tree.sha256, tree.entries, tree.bytes) == (again.sha256, again.entries, again.bytes),
-        "image {name:?} changed while it was registered");
-    ensure!(dir_identity(&dir)? == before && dir_identity(&open_image(roots, name)?)? == before,
-        "image {name:?} was replaced while it was hashed");
-    let sha256 = hex(&tree.sha256);
-    let generation = match read_entry(&roots.registry, name)? {
-        Some(e) if e.state == State::Registered && e.sha256 == sha256 && e.directory == before => return Ok(e),
-        Some(e) if e.state == State::Registered => {
-            refuse_if_referenced(roots, name, "replace the registration of")?;
-            e.generation.checked_add(1).context("generation overflow")?
+    let held = lock(&roots.images, true)?;
+    let src = open_image(roots, name)?;
+    let before = dir_identity(&src)?;
+    remove_stale_stages(&roots.images, name)?;
+    let previous = read_entry(&roots.registry, name)?;
+    if let Some(e) = previous.as_ref().filter(|e| e.state == State::Registered && e.directory == before) {
+        // A no-op only answers "unchanged": it writes nothing, so it cannot
+        // publish any state. The registry keeps certifying the snapshot an
+        // earlier registration hashed and installed.
+        let tree = tree_digest(&src)?;
+        if hex(&tree.sha256) == e.sha256 && tree.entries == e.entries && tree.bytes == e.bytes {
+            ensure!(dir_identity(&open_image(roots, name)?)? == before, "image {name:?} was replaced while it was hashed");
+            return Ok(e.clone());
         }
-        Some(e) => e.generation.checked_add(1).context("generation overflow")?,
+    }
+    // Installing a copy swaps the directory under any run that uses it by
+    // name, so a first registration is refused while referenced too.
+    refuse_if_referenced(roots, name, "register")?;
+    let generation = match &previous {
         None => 1,
+        Some(e) => e.generation.checked_add(1).context("generation overflow")?,
     };
-    let entry = Entry { name: name.to_owned(), generation, state: State::Registered, sha256, directory: before,
-        entries: tree.entries, bytes: tree.bytes };
+
+    let images = held.0.as_raw_fd();
+    static STAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stage_name = format!(".register-{name}-{}-{}", std::process::id(),
+        STAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let stage_cname = CString::new(stage_name.as_str())?;
+    // SAFETY: mkdirat relative to the held images directory.
+    Errno::result(unsafe { libc::mkdirat(images, stage_cname.as_ptr(), 0o700) })
+        .with_context(|| format!("create {stage_name}"))?;
+    let stage = StageDir(roots.images.join(&stage_name));
+    let stage_fd = openat_raw(images, &stage_cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+    private_stage(&stage_fd)?;
+    copy_tree(&src, &stage_fd, c"tree").with_context(|| format!("copy image {name:?}"))?;
+    let copy = File::from(openat(&stage_fd, c"tree", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?);
+    let staged = dir_identity(&copy)?;
+    let tree = tree_digest(&copy)?;
+    // The copy is on disk before it replaces the image (the old tree is
+    // deleted below, so a crash must not leave a torn copy installed).
+    // SAFETY: syncfs on an open descriptor.
+    Errno::result(unsafe { libc::syncfs(copy.as_raw_fd()) }).context("sync the staged image")?;
+    let cname = CString::new(name)?;
+    // SAFETY: renameat2 of names relative to two held directories.
+    Errno::result(unsafe { libc::renameat2(stage_fd.as_raw_fd(), c"tree".as_ptr(), images, cname.as_ptr(),
+        libc::RENAME_EXCHANGE) }).with_context(|| format!("install the staged copy of image {name:?}"))?;
+    held.0.sync_all().context("sync image directory")?;
+    ensure!(dir_identity(&open_image(roots, name)?)? == staged && dir_identity(&copy)? == staged,
+        "image {name:?} was replaced while it was installed");
+    let entry = Entry { name: name.to_owned(), generation, state: State::Registered, sha256: hex(&tree.sha256),
+        directory: staged, entries: tree.entries, bytes: tree.bytes };
     write_entry(&roots.registry, &entry)?;
+    // The replaced tree now sits in the stage. Deleting it is best effort: a
+    // leftover is deleted by the next registration of this name.
+    drop(stage);
+    let _ = held.0.sync_all();
     Ok(entry)
+}
+
+/// A registration's stage directory. Dropping it deletes it with whatever it
+/// holds: the partial copy after a failure, the replaced tree after success.
+struct StageDir(PathBuf);
+
+impl Drop for StageDir {
+    fn drop(&mut self) { let _ = remove_tree(&self.0); }
+}
+
+/// Makes a new stage reachable by its owner (root) alone: no umask or
+/// inherited default ACL may widen it, and nothing created in it inherits an
+/// ACL the source doesn't have.
+fn private_stage(stage: &OwnedFd) -> Result<()> {
+    // SAFETY: fchmod and fremovexattr on an open descriptor.
+    Errno::result(unsafe { libc::fchmod(stage.as_raw_fd(), 0o700) }).context("chmod stage")?;
+    for acl in [c"system.posix_acl_default", c"system.posix_acl_access"] {
+        if unsafe { libc::fremovexattr(stage.as_raw_fd(), acl.as_ptr()) } < 0
+            && !matches!(Errno::last(), Errno::ENODATA | Errno::EOPNOTSUPP) {
+            return Err(Errno::last()).context("remove stage ACL");
+        }
+    }
+    Ok(())
+}
+
+/// Whether `entry` in the images directory is a stage of `name`'s
+/// registration: `.register-NAME-PID-N`. The two numeric fields keep one
+/// name's stages apart from those of a name that extends it (`img-2`).
+fn is_stage_of(entry: &[u8], name: &str) -> bool {
+    let Some(rest) = entry.strip_prefix(format!(".register-{name}-").as_bytes()) else { return false };
+    let digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
+    rest.iter().position(|b| *b == b'-').is_some_and(|i| digits(&rest[..i]) && digits(&rest[i + 1..]))
+}
+
+/// Deletes stages that crashed registrations of `name` left behind. Called
+/// under the exclusive lock, so none of them is in use.
+fn remove_stale_stages(images: &Path, name: &str) -> Result<()> {
+    for entry in fs::read_dir(images).with_context(|| format!("read {}", images.display()))? {
+        let entry = entry.with_context(|| format!("enumerate {}", images.display()))?;
+        if is_stage_of(entry.file_name().as_bytes(), name) {
+            remove_tree(&entry.path()).with_context(|| format!("delete leftover {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes a directory tree, or a single non-directory, without following
+/// symlinks. Copied directories keep their image modes, which may deny their
+/// owner write access (never root, but an unprivileged test user), so a
+/// failed removal opens the directories up and tries again.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_dir() { return fs::remove_file(path); }
+    if fs::remove_dir_all(path).is_ok() { return Ok(()); }
+    fn open_up(dir: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() { open_up(&entry.path())?; }
+        }
+        Ok(())
+    }
+    open_up(path)?;
+    fs::remove_dir_all(path)
 }
 
 /// Retires the registration; the image directory stays usable by name.
@@ -642,6 +762,256 @@ impl Walk {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Private copy for registration
+
+struct Copy {
+    /// The stage directory and the copy root's name in it. Later names of a
+    /// hardlinked inode are linked to its first copy by a path relative to
+    /// the stage. The stage is root-only (0700), so no one else can change
+    /// what that path resolves to, and each link is checked against the
+    /// first copy's inode.
+    stage: RawFd,
+    root: Vec<u8>,
+    entries: u64,
+    dev: u64,
+    mnt: u64,
+    /// Source (device, inode) of a multiply linked non-directory → its first
+    /// copy's image-relative path and destination inode.
+    links: std::collections::HashMap<(u64, u64), (Vec<u8>, u64)>,
+    buf: Vec<u8>,
+}
+
+/// Copies the tree at `src` into a new directory `name` in `stage`: every
+/// entry type, byte, mode (`st_mode & 07777`), owner, xattr, mtime and atime,
+/// and the hardlink topology, which is everything the tree manifest covers.
+/// The source is walked like `tree_digest` walks it (fd-relative, never
+/// following a link, refusing mount crossings, entries replaced mid-walk and
+/// files or directories that change while read, with the same bounds).
+/// Destination entries are created exclusively, relative to held directory
+/// descriptors. Devices, FIFOs and sockets are recreated, never opened.
+/// Holes need not survive: runs of zero bytes become holes. On error the
+/// partial copy is left for the caller to delete.
+fn copy_tree(src: &File, stage: &OwnedFd, name: &CStr) -> Result<()> {
+    let st = fstat(src.as_raw_fd())?;
+    ensure!(st.st_mode & libc::S_IFMT == libc::S_IFDIR, "image root is not a directory");
+    let mnt = mount_id(src.as_raw_fd(), None)?;
+    let mut copy = Copy { stage: stage.as_raw_fd(), root: name.to_bytes().to_vec(), entries: 0, dev: st.st_dev, mnt,
+        links: Default::default(), buf: vec![0u8; 64 * 1024] };
+    let fd = dup(src.as_raw_fd())?;
+    copy.directory(&fd, &st, stage, name, &mut Vec::new(), 0)
+}
+
+impl Copy {
+    fn count(&mut self) -> Result<()> {
+        ensure!(self.entries < MAX_ENTRIES, "image has more than {MAX_ENTRIES} entries");
+        self.entries += 1;
+        Ok(())
+    }
+
+    /// Creates `name` in `parent` as a copy of the open source directory
+    /// `src`. Its own metadata is applied after its entries, which change
+    /// its mtime.
+    fn directory(&mut self, src: &OwnedFd, st: &libc::stat, parent: &OwnedFd, name: &CStr, path: &mut Vec<u8>,
+        depth: usize) -> Result<()> {
+        ensure!(depth <= MAX_DEPTH, "image is deeper than {MAX_DEPTH} directories");
+        self.count()?;
+        // SAFETY: mkdirat relative to a held directory.
+        Errno::result(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) }).context("create directory")?;
+        let dst = openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+        for child in sorted_names(src)? {
+            let at = path.len();
+            if !path.is_empty() { path.push(b'/'); }
+            path.extend_from_slice(&child);
+            ensure!(path.len() <= MAX_PATH, "image path longer than {MAX_PATH} bytes");
+            self.child(src, &dst, &child, path, depth)
+                .with_context(|| format!("image entry {}", String::from_utf8_lossy(path)))?;
+            path.truncate(at);
+        }
+        let xattrs = fd_xattrs(src.as_raw_fd())?;
+        ensure!(unchanged(st, &fstat(src.as_raw_fd())?), "directory {} changed while it was copied",
+            String::from_utf8_lossy(path));
+        apply_fd(&dst, st, &xattrs)
+    }
+
+    fn child(&mut self, src: &OwnedFd, dst: &OwnedFd, name: &[u8], path: &mut Vec<u8>, depth: usize) -> Result<()> {
+        let cname = CString::new(name)?;
+        let st = fstatat(src, &cname)?;
+        ensure!(st.st_dev == self.dev && mount_id(src.as_raw_fd(), Some(&cname))? == self.mnt,
+            "image crosses a mount");
+        let linked = st.st_mode & libc::S_IFMT != libc::S_IFDIR && st.st_nlink > 1;
+        if linked && let Some((first, ino)) = self.links.get(&(st.st_dev, st.st_ino)).cloned() {
+            self.count()?;
+            let mut old = self.root.clone();
+            old.push(b'/');
+            old.extend_from_slice(&first);
+            let old = CString::new(old)?;
+            // SAFETY: linkat between names relative to held directories;
+            // flags 0 links a symlink itself, never its target.
+            Errno::result(unsafe { libc::linkat(self.stage, old.as_ptr(), dst.as_raw_fd(), cname.as_ptr(), 0) })
+                .context("link")?;
+            ensure!(fstatat(dst, &cname)?.st_ino == ino, "hardlink did not reach its first copy");
+            return Ok(());
+        }
+        self.leaf(src, dst, &cname, &st, path, depth)?;
+        if linked { self.links.insert((st.st_dev, st.st_ino), (path.clone(), fstatat(dst, &cname)?.st_ino)); }
+        Ok(())
+    }
+
+    fn leaf(&mut self, src: &OwnedFd, dst: &OwnedFd, cname: &CString, st: &libc::stat, path: &mut Vec<u8>,
+        depth: usize) -> Result<()> {
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                let fd = openat(src, cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+                same_inode(&fstat(fd.as_raw_fd())?, st)?;
+                ensure!(mount_id(fd.as_raw_fd(), None)? == self.mnt, "image crosses a mount");
+                self.directory(&fd, st, dst, cname, path, depth + 1)
+            }
+            libc::S_IFREG => {
+                let fd = openat(src, cname, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_NONBLOCK)?;
+                let opened = fstat(fd.as_raw_fd())?;
+                same_inode(&opened, st)?;
+                ensure!(mount_id(fd.as_raw_fd(), None)? == self.mnt, "image crosses a mount");
+                self.count()?;
+                // SAFETY: exclusive create relative to a held directory.
+                let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                let out = unsafe { libc::openat(dst.as_raw_fd(), cname.as_ptr(), flags, 0o600 as libc::c_uint) };
+                let out = unsafe { OwnedFd::from_raw_fd(Errno::result(out).context("create file")?) };
+                let size = copy_bytes(&fd, &out, &mut self.buf)?;
+                let xattrs = fd_xattrs(fd.as_raw_fd())?;
+                let after = fstat(fd.as_raw_fd())?;
+                ensure!(size == st.st_size as u64 && unchanged(&opened, &after), "file changed while it was copied");
+                apply_fd(&out, &opened, &xattrs)
+            }
+            libc::S_IFLNK => {
+                let mut target = vec![0u8; MAX_LINK + 1];
+                // SAFETY: readlinkat into a buffer of the given length.
+                let n = unsafe { libc::readlinkat(src.as_raw_fd(), cname.as_ptr(), target.as_mut_ptr().cast(), target.len()) };
+                let n = Errno::result(n).context("readlink")? as usize;
+                ensure!(n <= MAX_LINK, "symlink target longer than {MAX_LINK} bytes");
+                target.truncate(n);
+                let target = CString::new(target).context("symlink target contains NUL")?;
+                let xattrs = path_xattrs(src, cname.as_bytes())?;
+                self.count()?;
+                // SAFETY: symlinkat relative to a held directory.
+                Errno::result(unsafe { libc::symlinkat(target.as_ptr(), dst.as_raw_fd(), cname.as_ptr()) })
+                    .context("create symlink")?;
+                apply_at(dst, cname, st, &xattrs, true)
+            }
+            kind => {
+                ensure!(matches!(kind, libc::S_IFCHR | libc::S_IFBLK | libc::S_IFIFO | libc::S_IFSOCK), "unknown file type");
+                let rdev = if matches!(kind, libc::S_IFCHR | libc::S_IFBLK) { st.st_rdev } else { 0 };
+                let xattrs = path_xattrs(src, cname.as_bytes())?;
+                self.count()?;
+                // SAFETY: mknodat relative to a held directory; never opened.
+                Errno::result(unsafe { libc::mknodat(dst.as_raw_fd(), cname.as_ptr(), kind | 0o600, rdev) })
+                    .context("create special file")?;
+                apply_at(dst, cname, st, &xattrs, false)
+            }
+        }
+    }
+}
+
+/// Copies a file's bytes; a 64 KiB run of zeros becomes a hole.
+fn copy_bytes(src: &OwnedFd, dst: &OwnedFd, buf: &mut [u8]) -> Result<u64> {
+    let mut size = 0u64;
+    loop {
+        // SAFETY: read into an owned buffer.
+        let n = unsafe { libc::read(src.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            if Errno::last() == Errno::EINTR { continue; }
+            return Err(Errno::last()).context("read");
+        }
+        if n == 0 { break; }
+        let chunk = &buf[..n as usize];
+        if chunk.iter().all(|b| *b == 0) {
+            // SAFETY: lseek on an open descriptor.
+            Errno::result(unsafe { libc::lseek(dst.as_raw_fd(), n as libc::off_t, libc::SEEK_CUR) }).context("seek")?;
+        } else {
+            let mut at = 0;
+            while at < chunk.len() {
+                // SAFETY: write from an owned buffer.
+                let w = unsafe { libc::write(dst.as_raw_fd(), chunk[at..].as_ptr().cast(), chunk.len() - at) };
+                if w < 0 {
+                    if Errno::last() == Errno::EINTR { continue; }
+                    return Err(Errno::last()).context("write");
+                }
+                at += w as usize;
+            }
+        }
+        size += n as u64;
+    }
+    // SAFETY: ftruncate on an open descriptor; sets the length a trailing hole leaves short.
+    Errno::result(unsafe { libc::ftruncate(dst.as_raw_fd(), size as libc::off_t) }).context("truncate")?;
+    Ok(size)
+}
+
+fn times(st: &libc::stat) -> [libc::timespec; 2] {
+    [libc::timespec { tv_sec: st.st_atime, tv_nsec: st.st_atime_nsec },
+        libc::timespec { tv_sec: st.st_mtime, tv_nsec: st.st_mtime_nsec }]
+}
+
+/// Owner, then xattrs, then mode, then times, on an open copy. The order
+/// matters: chown clears setuid, setgid and `security.capability`.
+fn apply_fd(fd: &OwnedFd, st: &libc::stat, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: metadata calls on an open descriptor with owned buffers.
+    Errno::result(unsafe { libc::fchown(fd, st.st_uid, st.st_gid) }).context("chown")?;
+    for (name, value) in xattrs {
+        let name = CString::new(name.as_slice())?;
+        Errno::result(unsafe { libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) })
+            .with_context(|| format!("set xattr {}", name.to_string_lossy()))?;
+    }
+    Errno::result(unsafe { libc::fchmod(fd, st.st_mode & 0o7777) }).context("chmod")?;
+    let times = times(st);
+    Errno::result(unsafe { libc::futimens(fd, times.as_ptr()) }).context("set times")?;
+    Ok(())
+}
+
+/// The same for an entry that isn't opened (a symlink or special file),
+/// without following it; a symlink has no mode of its own.
+fn apply_at(dir: &OwnedFd, name: &CString, st: &libc::stat, xattrs: &[(Vec<u8>, Vec<u8>)], symlink: bool)
+    -> Result<()> {
+    let at = dir.as_raw_fd();
+    // SAFETY: metadata calls on names relative to a held directory.
+    Errno::result(unsafe { libc::fchownat(at, name.as_ptr(), st.st_uid, st.st_gid, libc::AT_SYMLINK_NOFOLLOW) })
+        .context("chown")?;
+    let mut path = format!("/proc/self/fd/{at}/").into_bytes();
+    path.extend_from_slice(name.as_bytes());
+    let path = CString::new(path)?;
+    for (xname, value) in xattrs {
+        let xname = CString::new(xname.as_slice())?;
+        Errno::result(unsafe { libc::lsetxattr(path.as_ptr(), xname.as_ptr(), value.as_ptr().cast(), value.len(), 0) })
+            .with_context(|| format!("set xattr {}", xname.to_string_lossy()))?;
+    }
+    // A device, FIFO or socket is not a symlink, so this cannot follow one.
+    if !symlink {
+        Errno::result(unsafe { libc::fchmodat(at, name.as_ptr(), st.st_mode & 0o7777, 0) }).context("chmod")?;
+    }
+    let times = times(st);
+    Errno::result(unsafe { libc::utimensat(at, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) })
+        .context("set times")?;
+    Ok(())
+}
+
+fn fstatat(dir: &OwnedFd, name: &CString) -> Result<libc::stat> {
+    let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: fstatat of a name relative to an open directory, no follow.
+    Errno::result(unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })
+        .context("stat")?;
+    Ok(st)
+}
+
+/// A directory's entry names, sorted by bytes.
+fn sorted_names(dir: &OwnedFd) -> Result<Vec<Vec<u8>>> {
+    let mut names: Vec<Vec<u8>> = fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+        .context("read image directory")?
+        .map(|e| e.map(|e| e.file_name().as_bytes().to_vec()))
+        .collect::<std::io::Result<_>>().context("read image directory")?;
+    names.sort();
+    Ok(names)
+}
+
 fn record<'a>(path: &'a [u8], kind: Kind<'a>, st: &libc::stat, xattrs: &'a [(Vec<u8>, Vec<u8>)]) -> Record<'a> {
     Record { path, kind, mode: st.st_mode & 0o7777, uid: st.st_uid, gid: st.st_gid, mtime_sec: st.st_mtime,
         mtime_nsec: st.st_mtime_nsec as u32, xattrs }
@@ -685,9 +1055,13 @@ fn dup(fd: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(n) })
 }
 
-fn openat(dir: &OwnedFd, name: &CString, flags: i32) -> Result<OwnedFd> {
+fn openat(dir: &OwnedFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
+    openat_raw(dir.as_raw_fd(), name, flags)
+}
+
+fn openat_raw(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
     // SAFETY: openat relative to an open directory.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
     Ok(unsafe { OwnedFd::from_raw_fd(Errno::result(fd).context("open")?) })
 }
 
@@ -892,6 +1266,15 @@ mod tests {
     fn registry_lifecycle_references_and_replacement() {
         let (root, roots) = scratch("registry");
         let dir = image(&roots, "img");
+        // Registration installs a copy in place of the directory, so even a
+        // first registration is refused while a run uses the name.
+        let run = roots.runs.join("r-0");
+        fs::create_dir(&run).unwrap();
+        assert_eq!(acquire_reference(&roots, "img", &run).unwrap().identity, Err("image is not registered".into()));
+        let refused = register(&roots, "img").unwrap_err().to_string();
+        assert!(refused.contains("referenced by r-0") && refused.contains("new image name"), "{refused}");
+        assert!(read_entry(&roots.registry, "img").unwrap().is_none());
+        fs::remove_dir_all(&run).unwrap();
         let first = register(&roots, "img").unwrap();
         assert_eq!((first.generation, first.state), (1, State::Registered));
         assert_eq!(register(&roots, "img").unwrap(), first, "unchanged content is a no-op");
@@ -1061,9 +1444,8 @@ mod tests {
     }
 
     /// Hardening from the adversarial review: an unsynchronized change racing
-    /// registration either fails the registration or is wholly included, so
-    /// the digest verifies afterwards. (A writer that coordinates with the
-    /// walk is outside this check; registration requires a quiescent image.)
+    /// registration either fails it or lands in the copy or only in the
+    /// replaced tree; a registered digest always verifies afterwards.
     #[test]
     fn registration_publishes_only_a_real_snapshot() {
         let (root, roots) = scratch("registration-race");
@@ -1073,12 +1455,190 @@ mod tests {
         let other = roots.clone();
         let registering = std::thread::spawn(move || register(&other, "img"));
         std::thread::sleep(std::time::Duration::from_millis(150));
+        // The change must race the registration, not follow it (a change to
+        // the installed image afterwards is a different, detected case).
+        assert!(!registering.is_finished(), "registration finished before the race");
         fs::remove_file(dir.join("z-victim")).unwrap();
         fs::write(dir.join("z-victim"), b"after").unwrap();
         match registering.join().unwrap() {
-            Ok(_) => { verify(&roots, "img").unwrap(); }
+            Ok(entry) => {
+                assert_eq!(verify(&roots, "img").unwrap(), entry);
+            }
             Err(e) => assert!(format!("{e:#}").contains("changed while it was"), "{e:#}"),
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Adversarial-review HIGH (recheck): a writer that watches the walk with
+    /// inotify can show two full walks the same mixed state, a=old with
+    /// z=new, that it never installs. Registration must register the state
+    /// it installs: the digest of the installed tree, which then verifies.
+    #[test]
+    fn coordinated_writer_cannot_register_a_mixed_snapshot() {
+        let (root, roots) = scratch("mixed-snapshot");
+        let dir = roots.images.join("img");
+        fs::create_dir(&dir).unwrap();
+        let a = dir.join("a");
+        let z = dir.join("z");
+        fs::write(&a, b"old\n").unwrap();
+        fs::write(&z, b"old\n").unwrap();
+        let delay_1 = dir.join("m-delay");
+        let delay_2 = dir.join("zz-delay");
+        File::create(&delay_1).unwrap().set_len(512 * 1024 * 1024).unwrap();
+        File::create(&delay_2).unwrap().set_len(512 * 1024 * 1024).unwrap();
+        for path in [&a, &z, &delay_1, &delay_2, &dir] { set_mtime(path, 100, 5); }
+
+        // Watch closes from the walker. The two sparse delay files leave
+        // ample time to move from old/old -> new/new after A was read, and
+        // back from new/new -> old/old after Z was read. The mixed old/new
+        // state a walk sees is never installed by the writer.
+        let notify = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(notify >= 0, "inotify_init1: {}", std::io::Error::last_os_error());
+        let watched = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert!(unsafe { libc::inotify_add_watch(notify, watched.as_ptr(), libc::IN_CLOSE_NOWRITE) } >= 0,
+            "inotify_add_watch: {}", std::io::Error::last_os_error());
+
+        let other = roots.clone();
+        let registering = std::thread::spawn(move || register(&other, "img"));
+        let mut a_closes = 0;
+        let mut z_closes = 0;
+        let mut events = [0u8; 4096];
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        // Run until the registration has finished and no event is pending.
+        loop {
+            let mut ready = libc::pollfd { fd: notify, events: libc::POLLIN, revents: 0 };
+            let n = unsafe { libc::poll(&mut ready, 1, 100) };
+            if n < 0 {
+                assert_eq!(Errno::last(), Errno::EINTR, "poll inotify");
+                continue;
+            }
+            if n == 0 {
+                if registering.is_finished() { break; }
+                assert!(std::time::Instant::now() < give_up, "registration did not finish");
+                continue;
+            }
+            let count = unsafe { libc::read(notify, events.as_mut_ptr().cast(), events.len()) };
+            assert!(count > 0, "read inotify: {}", std::io::Error::last_os_error());
+            let mut at = 0usize;
+            while at < count as usize {
+                let event = unsafe { &*(events.as_ptr().add(at).cast::<libc::inotify_event>()) };
+                let base = std::mem::size_of::<libc::inotify_event>();
+                let raw = unsafe { std::slice::from_raw_parts(events.as_ptr().add(at + base), event.len as usize) };
+                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+                let name = &raw[..end];
+                if name == b"a" {
+                    a_closes += 1;
+                    // Forward transition: never pass through old/new.
+                    fs::write(&a, b"new\n").unwrap();
+                    set_mtime(&a, 100, 5);
+                    fs::write(&z, b"new\n").unwrap();
+                    set_mtime(&z, 100, 5);
+                } else if name == b"z" {
+                    z_closes += 1;
+                    if z_closes == 1 {
+                        // Reset transition: never pass through old/new.
+                        fs::write(&z, b"old\n").unwrap();
+                        set_mtime(&z, 100, 5);
+                        fs::write(&a, b"old\n").unwrap();
+                        set_mtime(&a, 100, 5);
+                    }
+                }
+                at += base + event.len as usize;
+            }
+        }
+        unsafe { libc::close(notify); }
+        assert!(a_closes >= 1 && z_closes >= 1, "the writer never acted ({a_closes}, {z_closes})");
+        let registered = registering.join().unwrap().unwrap();
+        let installed = tree_digest(&open_image(&roots, "img").unwrap()).unwrap();
+        assert_eq!(registered.sha256, hex(&installed.sha256), "registered a state that is not installed");
+        verify(&roots, "img").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Registration hashes a private copy and installs exactly that copy:
+    /// a new directory whose tree has the source's digest, with no stage
+    /// left behind; registering again is a no-op.
+    #[test]
+    fn registration_installs_a_private_copy_atomically() {
+        use nix::sys::stat::{Mode, SFlag, mknod};
+        let (root, roots) = scratch("private-copy");
+        let dir = roots.images.join("img");
+        fs::create_dir_all(dir.join("nested/deeper")).unwrap();
+        fs::write(dir.join("regular"), b"bytes\n").unwrap();
+        fs::write(dir.join("setuid"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(dir.join("setuid"), fs::Permissions::from_mode(0o4755)).unwrap();
+        let regular = CString::new(dir.join("regular").as_os_str().as_bytes()).unwrap();
+        let xattr = unsafe { libc::setxattr(regular.as_ptr(), c"user.kiln".as_ptr(), b"v".as_ptr().cast(), 1, 0) } == 0;
+        if !xattr { eprintln!("note: no user xattrs here; that part is skipped"); }
+        File::create(dir.join("sparse")).unwrap().set_len(1024 * 1024).unwrap();
+        symlink("regular", dir.join("link")).unwrap();
+        nix::unistd::mkfifo(&dir.join("fifo"), Mode::from_bits_truncate(0o640)).unwrap();
+        let socket = mknod(&dir.join("socket"), SFlag::S_IFSOCK, Mode::from_bits_truncate(0o600), 0).is_ok();
+        fs::write(dir.join("nested/deeper/file"), b"deep\n").unwrap();
+        // An internal hardlink pair across directories, and a hardlinked symlink pair.
+        fs::hard_link(dir.join("regular"), dir.join("nested/regular-link")).unwrap();
+        symlink("target", dir.join("sym-a")).unwrap();
+        fs::hard_link(dir.join("sym-a"), dir.join("nested/sym-b")).unwrap();
+        let mut leaves = vec!["regular", "setuid", "sparse", "link", "fifo", "nested/deeper/file", "sym-a"];
+        if socket { leaves.push("socket"); }
+        for p in leaves { set_mtime(&dir.join(p), 1_700_000_000, 123_456_789); }
+        for d in ["nested/deeper", "nested"] {
+            fs::set_permissions(dir.join(d), fs::Permissions::from_mode(0o555)).unwrap();
+            set_mtime(&dir.join(d), 1_600_000_000, 987_654_321);
+        }
+        set_mtime(&dir, 1_500_000_000, 1);
+
+        let opened = open_image(&roots, "img").unwrap();
+        let source_id = dir_identity(&opened).unwrap();
+        let source = tree_digest(&opened).unwrap();
+        drop(opened);
+        let entry = register(&roots, "img").unwrap();
+        assert_ne!(entry.directory, source_id, "the registered directory must be the installed copy");
+        let installed = open_image(&roots, "img").unwrap();
+        assert_eq!(dir_identity(&installed).unwrap(), entry.directory);
+        let tree = tree_digest(&installed).unwrap();
+        assert_eq!((hex(&tree.sha256), tree.entries, tree.bytes), (hex(&source.sha256), source.entries, source.bytes),
+            "the copy is not faithful");
+        assert_eq!(entry.sha256, hex(&source.sha256));
+        // Spot checks of what the digest covers.
+        assert_eq!(fs::metadata(dir.join("setuid")).unwrap().mode() & 0o7777, 0o4755);
+        assert_eq!(fs::metadata(dir.join("nested")).unwrap().mode() & 0o7777, 0o555);
+        assert_eq!(fs::metadata(dir.join("regular")).unwrap().ino(),
+            fs::metadata(dir.join("nested/regular-link")).unwrap().ino());
+        assert_eq!(fs::symlink_metadata(dir.join("sym-a")).unwrap().ino(),
+            fs::symlink_metadata(dir.join("nested/sym-b")).unwrap().ino());
+        assert_eq!(fs::read(dir.join("sparse")).unwrap().len(), 1024 * 1024);
+        if xattr {
+            let mut value = [0u8; 8];
+            let n = unsafe { libc::getxattr(regular.as_ptr(), c"user.kiln".as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            assert_eq!(&value[..n as usize], b"v");
+        }
+        let left: Vec<_> = fs::read_dir(&roots.images).unwrap().map(|e| e.unwrap().file_name())
+            .filter(|n| n.as_bytes().starts_with(b".register-")).collect();
+        assert!(left.is_empty(), "stages left behind: {left:?}");
+        assert_eq!(register(&roots, "img").unwrap(), entry, "unchanged content is a no-op");
+        assert_eq!(dir_identity(&open_image(&roots, "img").unwrap()).unwrap(), entry.directory);
+        verify(&roots, "img").unwrap();
+        remove_tree(&root).unwrap();
+    }
+
+    /// A crashed registration's stage is deleted by the next registration of
+    /// that name; another name's stage is left alone.
+    #[test]
+    fn registration_deletes_leftover_stages() {
+        let (root, roots) = scratch("leftover-stage");
+        image(&roots, "img");
+        let leftover = roots.images.join(".register-img-1-0");
+        let other = roots.images.join(".register-img-2-1-0");
+        for stage in [&leftover, &other] {
+            fs::create_dir_all(stage.join("tree")).unwrap();
+            fs::write(stage.join("tree/file"), b"partial").unwrap();
+        }
+        assert!(is_stage_of(b".register-img-1-0", "img") && !is_stage_of(b".register-img-2-1-0", "img"));
+        assert!(is_stage_of(b".register-img-2-1-0", "img-2") && !is_stage_of(b".register-img-", "img"));
+        register(&roots, "img").unwrap();
+        assert!(!leftover.exists(), "leftover stage survived");
+        assert!(other.join("tree/file").exists(), "another name's stage was deleted");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1115,6 +1675,38 @@ mod tests {
         fs::set_permissions(&roots.registry, fs::Permissions::from_mode(0o700)).unwrap();
         symlink(attacker.join("img"), roots.registry.join("img")).unwrap();
         assert!(read_entry(&roots.registry, "img").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Checkpoint headers reference their image; an unreadable one (or an
+    /// unknown entry in the namespace) blocks every image, an empty namespace
+    /// none.
+    #[test]
+    fn checkpoint_artifacts_are_image_references() {
+        use std::io::Write;
+        let (root, roots) = scratch("checkpoint-refs");
+        image(&roots, "img");
+        let ns = roots.runs.join(crate::checkpoint::store::NAMESPACE);
+        let private = |p: &Path| fs::DirBuilder::new().mode(0o700).create(p).unwrap();
+        private(&ns);
+        assert_eq!(blocking_references(&roots, "img").unwrap(), Vec::<String>::new());
+        let instance = ns.join("0123456789abcdef0123456789abcdef");
+        private(&instance);
+        let artifact = instance.join(format!("cp-{}", "1".repeat(32)));
+        private(&artifact);
+        let blocked = blocking_references(&roots, "img").unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert!(blocked[0].contains("unreadable checkpoint header"), "{blocked:?}");
+        let header = crate::checkpoint::store::Header { instance: "0123456789abcdef0123456789abcdef".into(),
+            checkpoint: format!("cp-{}", "1".repeat(32)), generation: 1, source: "18e0-42".into(), source_lease: 1,
+            image: "img".into(), image_generation: 1, image_sha256: "ab".repeat(32),
+            image_directory: "0000000000000001:2:3.000000004".into(), layout: "index=off".into(), limit_bytes: 1 << 20 };
+        let path = artifact.join("header");
+        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).unwrap()
+            .write_all(header.text().as_bytes()).unwrap();
+        assert!(blocking_references(&roots, "img").unwrap()[0].starts_with("checkpoint 0123456789abcdef0123456789abcdef/cp-"));
+        assert!(register(&roots, "img").is_err() && remove(&roots, "img").is_err());
+        assert_eq!(blocking_references(&roots, "other").unwrap(), Vec::<String>::new());
         fs::remove_dir_all(root).unwrap();
     }
 

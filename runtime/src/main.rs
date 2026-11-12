@@ -1,4 +1,6 @@
 mod cgroup;
+mod checkpoint;
+mod cjson;
 mod container;
 mod dns;
 mod exec_options;
@@ -93,6 +95,12 @@ enum Command {
         #[arg(long)]
         dns: bool,
     },
+    /// Capture, inspect, list or remove workspace checkpoints
+    /// (docs/checkpoint-format-v1.md). Output is one strict text record; a
+    /// failure prints `kiln-checkpoint-failure 1` with a typed reason and
+    /// exits 125.
+    #[command(subcommand)]
+    Checkpoint(CheckpointCommand),
     /// Register, inspect, verify, unregister or remove image content identities.
     #[command(subcommand)]
     Image(ImageCommand),
@@ -124,6 +132,46 @@ enum Command {
     },
     /// Show running sandboxes' resource use, sampled over one second.
     Stats,
+}
+
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// Copy a quiescent persistent sandbox's upper layer into a new artifact
+    /// under its operation 6 lease.
+    Capture {
+        /// The owning daemon instance: 32 lowercase hex digits.
+        #[arg(long)]
+        instance: String,
+        /// `cp-` and 32 lowercase hex digits.
+        #[arg(long)]
+        checkpoint: String,
+        /// The capture generation the artifact is bound to (nonzero).
+        #[arg(long)]
+        generation: u64,
+        /// The reservation: quota and the largest allowed charge, in bytes.
+        #[arg(long)]
+        max_bytes: u64,
+        id: String,
+    },
+    /// Validate an artifact and print its record (with --verify, rehash
+    /// every object).
+    Inspect {
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Remove an artifact and any staging of it.
+    Rm {
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        checkpoint: String,
+    },
+    /// List every artifact, staging and unknown entry, removing nothing.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -212,6 +260,10 @@ struct CreateArgs {
     net: String,
     #[arg(long, value_name = "DEST")]
     allow: Vec<String>,
+    /// Restore the new sandbox's upper from a checkpoint. The image, root-write
+    /// policy and writable paths must match it, and --disk must cover it.
+    #[arg(long, value_name = "INSTANCE/CHECKPOINT")]
+    from_checkpoint: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -252,11 +304,13 @@ fn run() -> Result<()> {
                 writable: args.writable,
                 stats: args.stats,
                 cmd: args.cmd,
+                fork: None,
             };
             std::process::exit(container::run(&cfg)?);
         }
         Command::Create(args) => {
-            let cfg = persistent::before_allocation((|| -> Result<container::Config> {
+            let from_checkpoint = args.from_checkpoint.clone();
+            let mut cfg = persistent::before_allocation((|| -> Result<container::Config> {
                 if let Some(version) = args.require_exec_protocol {
                     anyhow::ensure!(version == exec_protocol::VERSION, "unsupported persistent-exec protocol {version}");
                 }
@@ -276,9 +330,18 @@ fn run() -> Result<()> {
                     writable: args.writable,
                     stats: false,
                     cmd: Vec::new(),
+                    fork: None,
                 })
             })())?;
-            println!("{}", persistent::create(&cfg)?);
+            // Every checkpoint refusal is before allocation, with its typed
+            // reason leading the message.
+            let fork = from_checkpoint.map(|source| persistent::before_allocation((|| {
+                let policy = checkpoint::Policy::new(cfg.read_only, &cfg.writable)?;
+                checkpoint::capture::preflight(&checkpoint::store::Store::system(), &image::Roots::system(), &source,
+                    &cfg.image, &policy, &container::generated(&cfg), cfg.disk)
+            })())).transpose()?;
+            cfg.fork = fork.as_ref().map(|f| f.info.clone());
+            println!("{}", persistent::create(&cfg, fork)?);
             Ok(())
         }
         Command::Exec { id, cmd, protocol, status_fd, stdin_fd, stdout_fd, stderr_fd, exec_options_fd } => {
@@ -306,6 +369,31 @@ fn run() -> Result<()> {
                     std::process::exit(persistent::EXEC_FAILED);
                 }
             }
+        }
+        Command::Checkpoint(command) => {
+            let store = checkpoint::store::Store::system();
+            let result = match command {
+                CheckpointCommand::Capture { instance, checkpoint, generation, max_bytes, id } =>
+                    checkpoint::capture::capture(&store, &image::Roots::system(), &checkpoint::capture::Request {
+                        instance, checkpoint, generation, limit_bytes: max_bytes, source: id }),
+                CheckpointCommand::Inspect { instance, checkpoint, verify } => (|| {
+                    let artifact = store.open(&instance, &checkpoint, false)?;
+                    if verify { artifact.verify_objects()?; }
+                    Ok(artifact.record(&artifact.charge(store.require_quota)?))
+                })(),
+                CheckpointCommand::Rm { instance, checkpoint } => store.remove(&instance, &checkpoint)
+                    .map(|existed| format!("kiln-checkpoint-removed 1\nexisted {}\n", if existed { "yes" } else { "no" })),
+                CheckpointCommand::Ls => store.inventory_text(),
+            };
+            match result {
+                Ok(text) => print!("{text}"),
+                Err(e) => {
+                    print!("{}", checkpoint::failure_text(&e));
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    std::process::exit(persistent::EXEC_FAILED);
+                }
+            }
+            Ok(())
         }
         Command::CheckpointContract { dns } => {
             let generated: &[&str] = if dns { &[protected::RESOLV_CONF] } else { &[] };
@@ -451,9 +539,9 @@ mod create_certainty_tests {
             disk: Some(16 * 1024 * 1024),
             net: net::Plan::new("none", &[]).unwrap(),
             hostname: "kiln".into(), image: "round2-missing-image-unit-fixture".into(),
-            keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(),
+            keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,
         };
-        let error = persistent::create(&cfg).unwrap_err();
+        let error = persistent::create(&cfg, None).unwrap_err();
         assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
         assert!(format!("{error:#}").contains("image"));
     }

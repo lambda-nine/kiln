@@ -134,9 +134,11 @@ command and never reads or copies sandbox files. The status socket is two-way:
    violation, Protocol / 15 Lease. It is never forwarded as success.
 
    While the probe reply and the grant are pending, the CLI watches the status
-   socket too. The driver closing it, or writing anything before Granted,
-   abandons the wait at once. Otherwise the wait has no timer, so a request
-   queued behind PID 1's valid work still waits for it.
+   socket too, through the last byte of each frame. The driver closing it, or
+   writing anything before Granted, abandons the wait at once, even after part
+   of a frame has arrived. Otherwise the wait has no timer until the frame's
+   first byte, so a request queued behind PID 1's valid work still waits for
+   it; the rest of the frame must then arrive within two seconds.
 4. On a grant it writes the Granted frame to the status socket. That frame is
    readiness: the source is quiescent and stays so.
 5. It waits, with no timer, for the driver's 16-byte acknowledgment on the
