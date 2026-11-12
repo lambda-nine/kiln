@@ -12,7 +12,8 @@ Each root-only Unix control connection carries one request and one reply.
 The request header is eight bytes: operation u8, three zero reserved bytes,
 body length u32. Operations 1 (legacy exec) and 2 (remove) retain their
 native-endian lengths, argv and i32 replies. Operations 3 (capabilities),
-4 (typed exec) and 5 (typed exec with options) use little endian throughout.
+4 (typed exec), 5 (typed exec with options) and 6 (checkpoint lease, in
+[checkpoint-lease-v1.md](checkpoint-lease-v1.md)) use little endian throughout.
 No machine client falls back to operation 1 or interprets an i32 legacy reply.
 
 Operation 3 has zero body length and no descriptors. Operation 4 requires
@@ -44,21 +45,25 @@ Capability probes remain available while an exec runs.
 
 ## Reply framing
 
-All operation 3/4 replies and CLI machine status use this 16-byte header:
+All operation 3 to 6 replies and CLI machine status use this 16-byte header:
 
 | Offset | Bytes | Meaning |
 |---|---|---|
 | 0 | 8 | `4b 49 4c 4e 45 58 4f 00` (`KILNEXO\0`) |
 | 8 | 2 | LE u16 version, exactly 1 |
-| 10 | 2 | LE u16 type: 1 outcome, 2 capabilities |
+| 10 | 2 | LE u16 type: 1 outcome, 2 capabilities, 3 lease (operation 6 only) |
 | 12 | 4 | LE u32 payload length, at most 2072 |
 
-The largest frame is 2088 bytes. A connection ends after exactly one frame.
+The largest frame is 2088 bytes. A connection ends after exactly one frame,
+except operation 6's lease connection and the `kiln checkpoint-lease` status
+stream, which carry two in sequence.
 Require EOF; reject missing, truncated, malformed, unsupported-version,
 duplicate or trailing responses. Reject oversized lengths before allocation.
 An exec may run arbitrarily long before the first reply byte. Once framing
-begins, the entire frame and EOF have one two-second deadline. Capability
-probes instead have an absolute two-second exchange deadline. Response writes
+begins, the entire frame and EOF have one two-second deadline. `kiln
+capabilities ID` instead has an absolute two-second exchange deadline. The
+CLI's own probe before operation 5 or 6 bounds only its connect; its reply
+waits like an exec reply (see CLI transport). Response writes
 handle partial writes, EINTR and EAGAIN, use nonblocking send with SIGPIPE
 suppressed, and stop within two seconds or when signals need servicing.
 A disconnected or non-reading peer is a request-local failure. A lost reply
@@ -87,9 +92,10 @@ Failure kinds: 0 None, 1 InvalidRequest, 2 Unavailable, 3 NotFound,
 
 Stages: 0 None, 1 Validate, 2 Connect, 3 Request, 4 Prepare, 5 Fork,
 6 Admission, 7 Stdio, 8 Exec, 9 Wait, 10 Cleanup, 11 Report, 12 Capture,
-13 Handshake, 14 Chdir. Release failures use Admission; signal preparation
-uses Stdio. Chdir occurs only for operation 5, so decoders that predate it
-never receive it from requests they send.
+13 Handshake, 14 Chdir, 15 Lease. Release failures use Admission; signal
+preparation uses Stdio. Chdir occurs only for operation 5 and Lease only for
+operation 6 and `kiln checkpoint-lease`, so decoders that predate them never
+receive them from requests they send.
 
 A command requires observed termination, drained cleanup and all diagnostic
 fields zero/empty. Exit codes are 0–255 and Linux signals 1–64. Core dumped
@@ -151,8 +157,13 @@ contract applies only to persistent `create`, not `run` or `exec`.
 Bit 5 (`0x00000020`) advertises **exec options**: PID 1 accepts operation 5
 and the CLI accepts `--exec-options-fd`. It is additive like bit 4: PID 1
 instances without it still serve operation 4, and the CLI refuses options
-against them before sending any exec byte (below). This build advertises
-`0x3f`.
+against them before sending any exec byte (below).
+
+Bit 6 (`0x00000040`) advertises **checkpoint leases**: PID 1 grants operation
+6 and the CLI accepts `kiln checkpoint-lease`
+([checkpoint-lease-v1.md](checkpoint-lease-v1.md)). It is additive in the
+same way; the CLI refuses a PID 1 without it before sending any lease byte.
+This build advertises `0x7f`.
 
 Golden capabilities for package `0.1.0` and provenance `git test`:
 
@@ -261,7 +272,12 @@ command line. A bad descriptor or frame is InvalidRequest/Validate with no
 child started. Before sending any exec byte the CLI probes the sandbox's PID 1
 (operation 3, on its own connection): without bit 5 it reports
 Incompatible/Handshake with no child started and sends nothing else; a probe
-that fails after connecting is Protocol/Handshake.
+that fails after connecting is Protocol/Handshake. The probe's connect has
+the two-second bound, which protects against a full listener backlog. Its
+reply then waits under the exec-reply policy: no limit before the first byte,
+two seconds for the rest. PID 1 frames idle connections one at a time, each
+with its own two-second window, so a probe queued behind stalled root-only
+connections waits exactly where operation 4 would, rather than failing.
 
 Capabilities writes one binary frame to stdout: installed CLI provenance
 without ID, that sandbox PID 1's capabilities with ID. An unsupported create

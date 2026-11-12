@@ -3,14 +3,18 @@ mod container;
 mod dns;
 mod exec_options;
 mod exec_protocol;
+mod image;
 mod init;
 mod landlock;
 mod metrics;
 mod net;
 mod netlink;
+mod overlay;
 mod persistent;
+mod protected;
 mod quota;
 mod seccomp;
+mod sha256;
 mod storage;
 mod trace;
 mod userns;
@@ -72,6 +76,26 @@ enum Command {
         protocol: u16,
         id: Option<String>,
     },
+    /// Hold a checkpoint lease on a persistent sandbox for a driver on the
+    /// private status socket (see docs/checkpoint-lease-v1.md). Runs no
+    /// sandbox command and copies nothing.
+    CheckpointLease {
+        #[arg(long, required = true)]
+        protocol: u16,
+        #[arg(long, required = true)]
+        status_fd: i32,
+        id: String,
+    },
+    /// Print the protected-path contract a checkpoint must respect.
+    #[command(hide = true)]
+    CheckpointContract {
+        /// Include /etc/resolv.conf, as for a run whose network has DNS.
+        #[arg(long)]
+        dns: bool,
+    },
+    /// Register, inspect, verify, unregister or remove image content identities.
+    #[command(subcommand)]
+    Image(ImageCommand),
     /// List persistent sandboxes.
     Ls,
     /// Remove a persistent sandbox.
@@ -100,6 +124,20 @@ enum Command {
     },
     /// Show running sandboxes' resource use, sampled over one second.
     Stats,
+}
+
+#[derive(Subcommand)]
+enum ImageCommand {
+    /// Hash an installed image and record its content identity.
+    Register { name: String },
+    /// Print an image's registry entry.
+    Inspect { name: String },
+    /// Rehash a registered image and compare it with its registration.
+    Verify { name: String },
+    /// Retire a registration (the image stays usable by name).
+    Unregister { name: String },
+    /// Delete an image directory and retire its registration.
+    Rm { name: String },
 }
 
 #[derive(clap::Args)]
@@ -260,6 +298,32 @@ fn run() -> Result<()> {
             }
         }
         Command::Capabilities { protocol, id } => persistent::capabilities(id.as_deref(), protocol),
+        Command::CheckpointLease { protocol, status_fd, id } => {
+            match persistent::checkpoint_lease(&id, protocol, status_fd) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(persistent::EXEC_FAILED);
+                }
+            }
+        }
+        Command::CheckpointContract { dns } => {
+            let generated: &[&str] = if dns { &[protected::RESOLV_CONF] } else { &[] };
+            print!("{}", protected::describe(generated));
+            Ok(())
+        }
+        Command::Image(command) => {
+            let roots = image::Roots::system();
+            match command {
+                ImageCommand::Register { name } => print!("{}", image::register(&roots, &name)?.text()),
+                ImageCommand::Inspect { name } => print!("{}", image::read_entry(&roots.registry, &name)?
+                    .with_context(|| format!("image {name:?} has no registry entry"))?.text()),
+                ImageCommand::Verify { name } => print!("{}", image::verify(&roots, &name)?.text()),
+                ImageCommand::Unregister { name } => print!("{}", image::unregister(&roots, &name)?.text()),
+                ImageCommand::Rm { name } => image::remove(&roots, &name)?,
+            }
+            Ok(())
+        }
         Command::Ls => persistent::list(),
         Command::Rm { id } => persistent::remove(&id),
         Command::Gc { ids } => persistent::gc(&ids),

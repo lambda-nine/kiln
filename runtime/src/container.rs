@@ -18,9 +18,12 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, chdir, pipe2, pivot_root, read, sethostname, write};
 
 use crate::cgroup::{Cgroup, ExecCgroup, Limits};
+use crate::image;
 use crate::init;
 use crate::landlock;
 use crate::net;
+use crate::overlay;
+use crate::protected;
 use crate::seccomp;
 use crate::storage;
 use crate::quota;
@@ -30,7 +33,6 @@ use crate::validation;
 
 const KILN_ROOT: &str = "/var/lib/kiln";
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
 
 pub struct Config {
     pub hostname: String,
@@ -190,6 +192,27 @@ where
     )
 }
 
+/// Writes `path` through a synced temporary file and a rename, then syncs
+/// the directory.
+pub(crate) fn atomic_publish(path: &Path, contents: &[u8]) -> Result<()> {
+    atomic_publish_with(path, contents, || {})
+}
+
+/// Run metadata that only ever fails closed if it is lost: a rename makes the
+/// complete file appear at once, without the cost of syncing on the create
+/// path. After a crash a missing or damaged record makes the run unknown
+/// (which blocks image removal) or not a checkpoint source, never the reverse.
+pub(crate) fn publish_unsynced(path: &Path, contents: &[u8]) -> Result<()> {
+    let name = path.file_name().context("metadata path has no file name")?;
+    let temporary = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    let result = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)
+        .and_then(|mut file| file.write_all(contents))
+        .and_then(|()| fs::rename(&temporary, path))
+        .with_context(|| format!("publish {}", path.display()));
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
 fn atomic_publish_with<F>(path: &Path, contents: &[u8], before_publish: F) -> Result<()>
 where
     F: FnOnce(),
@@ -235,6 +258,11 @@ fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
     let id = Some(userns::ID_BASE);
     chown(&layers.upper, id, id).context("chown upper")?;
     trace::mark("host: overlay dirs");
+    // The run's reference to its image, with the registered content identity
+    // when the directory is the registered one. It exists before anything
+    // mounts the image, so image replacement or removal sees this run.
+    image::acquire_reference(&image::Roots::system(), &cfg.image, run_dir)?;
+    trace::mark("host: image reference");
     Ok(())
 }
 
@@ -445,18 +473,22 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     mount(None::<&str>, "/", None::<&str>, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None::<&str>)
         .context("make / private")?;
 
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        layers.lower.display(),
-        layers.upper.display(),
-        layers.work.display()
-    );
+    // Pinned features (overlay.rs): no index, metacopy or redirects in the upper.
+    let opts = overlay::mount_data(&layers.lower, &layers.upper, &layers.work);
     mount(Some("overlay"), &layers.merged, Some("overlay"), MsFlags::empty(), Some(opts.as_str()))
         .context("mount overlay")?;
     trace::mark("init: cgroup ns, hostname, overlay");
+    // Read the effective features back while the host's /proc and /sys are
+    // still visible, and record them with the entries this run generates.
+    let generated: Vec<&str> = cfg.net.resolv_conf().map(|_| protected::RESOLV_CONF).into_iter().collect();
+    let read = overlay::read_back(&layers.merged, [&layers.lower, &layers.upper, &layers.work])
+        .map_err(|e| format!("{e:#}"));
+    let run_dir = layers.upper.parent().context("upper has no run directory")?;
+    publish_unsynced(&run_dir.join(overlay::LAYOUT_FILE), overlay::layout_text(&read, &generated).as_bytes())?;
+    trace::mark("init: overlay layout record");
 
     // Device files must be bind-mounted from the host before we lose sight of it.
-    setup_dev(&layers.merged.join("dev"))?;
+    setup_dev(&layers.merged.join(&protected::DEV[1..]))?;
     trace::mark("init: /dev");
 
     // Swap roots. pivot_root(".", ".") stacks the old root on top of the new
@@ -472,7 +504,7 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // one so `ps` inside the sandbox only sees the sandbox's processes.
     mount(
         Some("proc"),
-        "/proc",
+        protected::PROC,
         Some("proc"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
@@ -488,7 +520,7 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // Read-only, so the sandbox can read its limits and usage but not raise them.
     mount(
         Some("cgroup2"),
-        "/sys/fs/cgroup",
+        protected::CGROUP,
         Some("cgroup2"),
         MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
@@ -498,7 +530,7 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // Written as real root, so it shows up inside as owned by "nobody":
     // readable, but sandbox root can't point DNS somewhere else.
     if let Some(conf) = cfg.net.resolv_conf() {
-        fs::write("/etc/resolv.conf", conf).context("write /etc/resolv.conf")?;
+        fs::write(protected::RESOLV_CONF, conf).context("write /etc/resolv.conf")?;
     }
 
     // Last step as real root. Every namespace above was created first, so it
@@ -627,7 +659,7 @@ fn setup_dev(dev: &Path) -> Result<()> {
     )
     .context("mount /dev tmpfs")?;
 
-    for name in DEVICES {
+    for name in protected::DEVICES {
         let target = dev.join(name);
         fs::File::create(&target).with_context(|| format!("create {}", target.display()))?;
         let source = Path::new("/dev").join(name);
@@ -635,18 +667,13 @@ fn setup_dev(dev: &Path) -> Result<()> {
             .with_context(|| format!("bind {}", source.display()))?;
     }
 
-    for (link, target) in [
-        ("fd", "/proc/self/fd"),
-        ("stdin", "/proc/self/fd/0"),
-        ("stdout", "/proc/self/fd/1"),
-        ("stderr", "/proc/self/fd/2"),
-    ] {
+    for (link, target) in protected::DEV_LINKS {
         symlink(target, dev.join(link)).with_context(|| format!("symlink /dev/{link}"))?;
     }
 
     // POSIX shared memory (Python multiprocessing, Chromium, Postgres). Its
     // pages are charged to the sandbox's cgroup, so it stays inside memory.max.
-    let shm = dev.join("shm");
+    let shm = dev.join(protected::DEV_SHM.strip_prefix("/dev/").context("/dev/shm")?);
     fs::create_dir(&shm).context("create /dev/shm")?;
     mount(
         Some("tmpfs"),

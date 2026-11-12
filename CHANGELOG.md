@@ -18,6 +18,33 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ### Runtime
 
+- Add the checkpoint source contract (docs/checkpoint-lease-v1.md,
+  docs/image-identity-v1.md):
+  - **Leases.** Typed operation 6 `CheckpointLease`, capability bit `0x40`,
+    reply type 3 and stage 15 Lease. PID 1 grants a lease only when idle and
+    provably quiescent (empty exec cgroup, no child processes). While a lease is
+    held, PID 1 refuses every exec and lease as busy and still answers probes. A
+    lease lasts as long as its connection, with no timer, and ends successfully
+    only with a valid acknowledgment. `kiln checkpoint-lease` holds one for a
+    driver on a private status socket. It refuses old runs and PID 1 instances
+    without `0x40` before sending any lease byte.
+  - **Overlay options.** Every run pins `index=off,metacopy=off,redirect_dir=nofollow,nfs_export=off`,
+    reads the effective options back from mountinfo and the module defaults,
+    and records them in `<run>/layout`.
+  - **Image identity.** `kiln image register|inspect|verify|unregister|rm`
+    keeps a root-owned registry of canonical full-tree SHA-256 digests. Every
+    run writes `<run>/image`, a reference that blocks replacing or removing its
+    image. `fetch-alpine.sh` refuses to replace a registered name.
+  - **Protected paths.** `runtime/src/protected.rs` is the contract for
+    runtime mount targets and generated entries; kiln's setup uses its
+    constants.
+  - Operations 1 to 5 are byte-for-byte unchanged.
+
+- Let the capability probe before operation 5 (and 6) wait for its reply like
+  an exec reply, keeping only the connect bounded, so a probe queued behind
+  stalled root-only connections no longer fails where operation 4 waits and
+  runs (adversarial-review LOW).
+
 - Add exec options: typed operation 5 (operation 4's argv block plus a
   strict, versioned cwd/environment frame), `kiln exec --exec-options-fd=N`
   for a memfd sealed with exactly write/shrink/grow/seal, capability bit

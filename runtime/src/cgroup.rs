@@ -195,7 +195,8 @@ impl ExecCgroup {
         }
     }
 
-    fn populated(&self) -> Result<bool> {
+    /// Whether any process is in the exec cgroup, read fresh from cgroup.events.
+    pub fn populated(&self) -> Result<bool> {
         let mut buf = [0u8; 256];
         let mut len = 0;
         while len < buf.len() {

@@ -34,6 +34,8 @@ pub enum Request {
     /// Operation 5: operation 4's argv block followed by an exec options frame.
     OptionsExec(Vec<CString>, ExecOptions, Vec<OwnedFd>),
     Capabilities,
+    /// Operation 6: hold a checkpoint lease on this connection.
+    CheckpointLease,
     Remove,
 }
 
@@ -152,6 +154,11 @@ impl RequestReader {
                     self.complete = true;
                     return Ok(ReadState::Complete(Request::Capabilities));
                 }
+                6 if header.len == 0 && header.fds.is_empty() => {
+                    self.complete = true;
+                    return Ok(ReadState::Complete(Request::CheckpointLease));
+                }
+                6 => bail!("checkpoint lease request must have an empty body and no descriptors"),
                 op => bail!("unknown request operation {op}"),
             }
         }
@@ -190,8 +197,8 @@ impl RequestReader {
     }
 }
 
-/// Operations 3, 4 and 5 use little-endian lengths; 1 and 2 keep native order.
-fn is_typed(op: u8) -> bool { matches!(op, 3..=5) }
+/// Operations 3 to 6 use little-endian lengths; 1 and 2 keep native order.
+fn is_typed(op: u8) -> bool { matches!(op, 3..=6) }
 
 /// The largest body an operation may announce. Operation 5 adds at most one
 /// exec options frame to operation 4's argv block.
@@ -392,25 +399,196 @@ fn typed_request(cmd: &[String], options: Option<&[u8]>) -> Result<(u8, Vec<u8>)
     })
 }
 
-/// Asks the sandbox's PID 1 for its capabilities on a separate connection
-/// before any exec byte is sent. Returns the refusal outcome when PID 1 does
-/// not advertise exec options; nothing reaches it except operation 3.
-fn require_exec_options(path: &Path, stage: &mut Stage) -> Result<Option<Outcome>> {
-    let deadline = Instant::now() + protocol::FRAME_TIMEOUT;
-    let mut probe = connect_path_bounded(path, deadline)?;
+/// Asks the sandbox's PID 1 for its capabilities on a separate connection,
+/// before any byte of the request it gates. The connect keeps its bounded
+/// deadline, which protects against a full listener backlog. The reply then
+/// waits under the same policy as an exec reply (no limit before its first
+/// byte, `FRAME_TIMEOUT` for the rest of the frame): PID 1 frames idle
+/// connections one at a time, each with its own deadline, so a probe queued
+/// behind stalled root-only connections must wait where operation 4 would.
+pub(crate) fn probe_features(path: &Path, stage: &mut Stage) -> Result<Capabilities> {
+    let mut probe = connect_path_bounded(path, Instant::now() + protocol::FRAME_TIMEOUT)?;
     *stage = Stage::Handshake;
-    probe.set_write_timeout(Some(deadline.checked_duration_since(Instant::now())
-        .context("capability exchange deadline")?))?;
+    probe.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
     send_header(&probe, 3, 0, &[])?;
-    let Frame::Capabilities(capabilities) = protocol::read_reply(&mut probe, Some(deadline))? else {
-        bail!("expected sandbox capabilities");
-    };
+    match protocol::read_reply(&mut probe, None)? {
+        Frame::Capabilities(capabilities) => Ok(capabilities),
+        _ => bail!("expected sandbox capabilities"),
+    }
+}
+
+/// Returns the refusal outcome when PID 1 does not advertise exec options;
+/// nothing reaches it except operation 3.
+pub(crate) fn require_exec_options(path: &Path, stage: &mut Stage) -> Result<Option<Outcome>> {
+    let capabilities = probe_features(path, stage)?;
     if capabilities.require_v1().is_err() || capabilities.features & protocol::EXEC_OPTIONS_FEATURE == 0 {
         return Ok(Some(Outcome::failure(FailureKind::Incompatible, Stage::Handshake, Cleanup::NoChildStarted, 0,
             &format!("sandbox PID 1 does not support exec options (features {:#010x}); recreate the sandbox",
                 capabilities.features))));
     }
     Ok(None)
+}
+
+/// The refusal for a sandbox that cannot be checkpointed. The token prefix is
+/// what a manager maps to `sandbox_unsupported:workspace_checkpoint`.
+pub const CHECKPOINT_UNSUPPORTED: &str = "sandbox_unsupported:workspace_checkpoint";
+
+fn unsupported(reason: &str) -> Frame {
+    Frame::Outcome(Outcome::failure(FailureKind::Incompatible, Stage::Handshake, Cleanup::NoChildStarted, 0,
+        &format!("{CHECKPOINT_UNSUPPORTED}: {reason}; recreate the sandbox with this kiln")))
+}
+
+/// `kiln checkpoint-lease --protocol=1 --status-fd=N ID`.
+///
+/// Takes operation 6 for a driver that owns the private status socket. The
+/// status socket carries, in order: one Granted lease frame (readiness: the
+/// source is quiescent and stays so), then, after the driver writes the
+/// 16-byte acknowledgment echoing that generation, one Released frame. Any
+/// failure or refusal is one Outcome frame instead, and ends the stream. The
+/// command never runs a sandbox command and never reads or copies sandbox
+/// files. Exit 0 only after Released was written.
+pub fn checkpoint_lease(id: &str, version: u16, status: RawFd) -> Result<i32> {
+    validate_status_fd(status)?;
+    restore_cloexec(status)?;
+    let status = UnixStream::from(unsafe { OwnedFd::from_raw_fd(status) });
+    let last = lease_session(id, version, &status);
+    let code = match &last { Frame::Lease(_) => 0, Frame::Outcome(o) => o.projection(), Frame::Capabilities(_) => EXEC_FAILED };
+    protocol::write_bounded(status.as_raw_fd(), &last.encode()?, || Ok(()))?;
+    Ok(code)
+}
+
+/// Every path returns the final status frame. Granted, when reached, has
+/// already been written to `status`.
+fn lease_session(id: &str, version: u16, status: &UnixStream) -> Frame {
+    let mut stage = Stage::Validate;
+    let run = (|| -> Result<Frame> {
+        anyhow::ensure!(version == protocol::VERSION, "unsupported persistent-exec protocol {version}");
+        validate_id(id)?;
+        let dir = container::run_dir(id);
+        stage = Stage::Connect;
+        // Run metadata first: an old or unidentified run gets no byte at all.
+        if let Err(reason) = checkpoint_source_support(&dir)? {
+            return Ok(unsupported(&reason));
+        }
+        let capabilities = probe_features(&dir.join("control.sock"), &mut stage)
+            .with_context(|| format!("probe sandbox {id}"))?;
+        if capabilities.require_v1().is_err() || capabilities.features & protocol::CHECKPOINT_LEASE_FEATURE == 0 {
+            return Ok(unsupported(&format!("sandbox PID 1 does not grant checkpoint leases (features {:#010x})",
+                capabilities.features)));
+        }
+        stage = Stage::Connect;
+        let mut lease = connect_bounded(id, Instant::now() + protocol::FRAME_TIMEOUT)?;
+        stage = Stage::Request;
+        lease.set_write_timeout(Some(protocol::FRAME_TIMEOUT))?;
+        send_header(&lease, 6, 0, &[])?;
+        stage = Stage::Lease;
+        // Like an exec reply, the grant waits behind PID 1's other work.
+        let generation = match protocol::read_frame(&mut lease, None)? {
+            Frame::Outcome(o) => return Ok(Frame::Outcome(o)),
+            Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation }) => generation,
+            _ => bail!("expected a checkpoint lease grant"),
+        };
+        let granted = Frame::Lease(protocol::Lease { state: protocol::LeaseState::Granted, generation });
+        protocol::write_bounded(status.as_raw_fd(), &granted.encode()?, || Ok(()))
+            .context("deliver lease readiness")?;
+        hold_lease(&mut lease, status, generation)
+    })();
+    match run {
+        Ok(frame) => frame,
+        Err(e) => {
+            let errno = e.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()
+                .and_then(|e| e.raw_os_error())).unwrap_or(0);
+            let kind = match stage {
+                Stage::Validate if version != protocol::VERSION => FailureKind::Incompatible,
+                Stage::Validate => FailureKind::InvalidRequest,
+                Stage::Connect if errno == libc::ENOENT => FailureKind::NotFound,
+                Stage::Connect => FailureKind::Unavailable,
+                Stage::Request => FailureKind::Io,
+                _ => FailureKind::Protocol,
+            };
+            Frame::Outcome(Outcome::failure(kind, stage, Cleanup::NoChildStarted, errno, &format!("{e:#}")))
+        }
+    }
+}
+
+/// Holds the lease connection until the driver acknowledges, the driver goes
+/// away, or PID 1 ends the lease. There is deliberately no timer: the driver
+/// (and whoever supervises it) owns the deadline, and ends the lease by
+/// closing its status socket or by killing this process.
+fn hold_lease(lease: &mut UnixStream, status: &UnixStream, generation: u64) -> Result<Frame> {
+    let lost = |why: &str| Frame::Outcome(Outcome::failure(FailureKind::Stopped, Stage::Lease,
+        Cleanup::NoChildStarted, 0, &format!("checkpoint lease {generation} ended without release: {why}")));
+    let mut ack = [0u8; protocol::ACK_LEN + 1];
+    let mut at = 0;
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let mut fds = [libc::pollfd { fd: status.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: lease.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let timeout = deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_millis()
+            .min(i32::MAX as u128) as i32);
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted { continue; }
+            return Err(std::io::Error::last_os_error()).context("poll checkpoint lease");
+        }
+        // PID 1 sends nothing before the acknowledgment: any readiness on the
+        // lease connection (EOF, reset or data) means the lease is gone.
+        if fds[1].revents != 0 {
+            return Ok(lost("sandbox ended the lease (stopped, removed or protocol failure)"));
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(Frame::Outcome(Outcome::failure(FailureKind::InvalidRequest, Stage::Lease,
+                Cleanup::NoChildStarted, 0, "incomplete lease acknowledgment; lease abandoned")));
+        }
+        if fds[0].revents == 0 { continue; }
+        let n = unsafe { libc::recv(status.as_raw_fd(), ack[at..].as_mut_ptr().cast(), ack.len() - at,
+            libc::MSG_DONTWAIT) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) { continue; }
+            return Ok(lost(&format!("status socket failed: {e}")));
+        }
+        if n == 0 { return Ok(lost("driver closed the status socket before acknowledging")); }
+        deadline.get_or_insert_with(|| Instant::now() + protocol::FRAME_TIMEOUT);
+        at += n as usize;
+        if at < protocol::ACK_LEN { continue; }
+        let acknowledged = match protocol::decode_ack(&ack[..at]) {
+            Ok(g) => g,
+            Err(e) => return Ok(Frame::Outcome(Outcome::failure(FailureKind::InvalidRequest, Stage::Lease,
+                Cleanup::NoChildStarted, 0, &format!("{e:#}; lease abandoned")))),
+        };
+        if acknowledged != generation {
+            return Ok(Frame::Outcome(Outcome::failure(FailureKind::InvalidRequest, Stage::Lease,
+                Cleanup::NoChildStarted, 0, &format!("acknowledgment names lease {acknowledged}, \
+                    not {generation}; lease abandoned"))));
+        }
+        (&*lease).write_all(&protocol::encode_ack(generation)).context("send lease acknowledgment")?;
+        return match protocol::read_reply(lease, Some(Instant::now() + protocol::FRAME_TIMEOUT))? {
+            Frame::Lease(l) if l == (protocol::Lease { state: protocol::LeaseState::Released, generation }) =>
+                Ok(Frame::Lease(l)),
+            Frame::Outcome(o) => Ok(Frame::Outcome(o)),
+            _ => bail!("expected release of checkpoint lease {generation}"),
+        };
+    }
+}
+
+/// Whether the run's metadata proves the checkpoint source contract: a
+/// registered image identity and verified pinned overlay options. Old runs
+/// have neither file and remain usable for everything except checkpointing.
+/// The outer error is an I/O failure (including a missing run); the inner one
+/// is the unsupported reason.
+pub fn checkpoint_source_support(dir: &Path) -> Result<std::result::Result<(), String>> {
+    fs::symlink_metadata(dir).with_context(|| format!("inspect sandbox {}", dir.display()))?;
+    let Some(reference) = crate::image::read_reference(dir)? else {
+        return Ok(Err("the run has no image reference (created by an older kiln)".into()));
+    };
+    if let Err(why) = &reference.identity {
+        return Ok(Err(format!("image {:?} had no content identity at create ({why})", reference.name)));
+    }
+    match crate::overlay::read_layout(dir)? {
+        None => Ok(Err("the run has no overlay layout record (created by an older kiln)".into())),
+        Some(layout) => Ok(layout.verified.map_err(|reason| format!("overlay options not verified: {reason}"))),
+    }
 }
 
 /// Reads the exec options frame from the caller's sealed memfd: exactly
@@ -1088,6 +1266,120 @@ mod tests {
                 _ => false,
             });
         }
+    }
+
+    #[test]
+    fn checkpoint_lease_request_is_an_empty_typed_header() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        send_header(&client, 6, 0, &[]).unwrap();
+        let mut bytes = [0u8; 8];
+        server.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [6, 0, 0, 0, 0, 0, 0, 0], "operation 6 golden");
+        (&client).write_all(&bytes).unwrap();
+        assert!(matches!(RequestReader::new().read(&server).unwrap(), ReadState::Complete(Request::CheckpointLease)));
+        for (len, fds) in [(1, vec![]), (0, vec![open("/dev/null")])] {
+            let (client, server) = UnixStream::pair().unwrap();
+            send_header(&client, 6, len, &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>()).unwrap();
+            assert!(RequestReader::new().read(&server).is_err());
+        }
+        // Operations 4 and 5 keep their exact bytes.
+        let (op, body) = typed_request(&["true".into()], None).unwrap();
+        assert_eq!((op, body.as_slice()), (4, &[1, 0, 0, 0, 4, 0, 0, 0, b't', b'r', b'u', b'e'][..]));
+    }
+
+    #[test]
+    fn checkpoint_lease_host_failures_use_only_private_status() {
+        for (id, version, kind, stage) in [("invalid/id", 1, FailureKind::InvalidRequest, Stage::Validate),
+            ("18de453339a8cc89-3762", 2, FailureKind::Incompatible, Stage::Validate),
+            ("18de453339a8cc89-1", 1, FailureKind::NotFound, Stage::Connect)] {
+            let (status, mut receiver) = UnixStream::pair().unwrap();
+            assert_eq!(checkpoint_lease(id, version, status.into_raw_fd()).unwrap(), 125);
+            let Frame::Outcome(o) = protocol::read_reply(&mut receiver, Some(Instant::now() + protocol::FRAME_TIMEOUT)).unwrap()
+                else { panic!("not an outcome") };
+            assert_eq!((o.kind, o.stage, o.cleanup), (kind, stage, Cleanup::NoChildStarted), "{id}");
+        }
+        assert!(checkpoint_lease("18de453339a8cc89-1", 1, 1).is_err(), "stdout is not a private status socket");
+    }
+
+    #[test]
+    fn checkpoint_source_needs_an_identity_and_a_verified_layout() {
+        let dir = std::env::temp_dir().join(format!("kiln-source-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let reason = |d: &Path| checkpoint_source_support(d).unwrap().unwrap_err();
+        assert!(reason(&dir).contains("no image reference"));
+        let identity = crate::image::Reference { name: "alpine".into(), identity: Ok(crate::image::Identity {
+            generation: 1, sha256: "0".repeat(64),
+            directory: crate::image::DirIdentity { fsid: 1, ino: 2, btime_sec: 3, btime_nsec: 4 } }) };
+        let none = crate::image::Reference { name: "alpine".into(), identity: Err("image is not registered".into()) };
+        fs::write(dir.join("image"), none.text()).unwrap();
+        assert!(reason(&dir).contains("not registered"));
+        fs::write(dir.join("image"), identity.text()).unwrap();
+        assert!(reason(&dir).contains("no overlay layout"));
+        fs::write(dir.join("layout"), crate::overlay::layout_text(&Err("no readback".into()), &[])).unwrap();
+        assert!(reason(&dir).contains("not verified: no readback"));
+        let options = "rw,lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=nofollow";
+        let defaults = crate::overlay::Defaults { index: false, metacopy: false, nfs_export: false,
+            redirect_dir: false, redirect_always_follow: true };
+        let effective = crate::overlay::effective(options, &defaults,
+            [Path::new("/l"), Path::new("/u"), Path::new("/w")]).unwrap();
+        fs::write(dir.join("layout"), crate::overlay::layout_text(&Ok(crate::overlay::ReadBack {
+            defaults, options: options.into(), effective }), &[])).unwrap();
+        checkpoint_source_support(&dir).unwrap().unwrap();
+        fs::write(dir.join("image"), "garbage").unwrap();
+        assert!(checkpoint_source_support(&dir).is_err(), "a damaged record is an error, not a source");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(checkpoint_source_support(&dir).is_err(), "a missing run is an error");
+    }
+
+    /// The CLI's hold loop against a scripted PID 1 and driver.
+    #[test]
+    fn checkpoint_lease_holder_forwards_only_a_matching_acknowledgment() {
+        use protocol::{Lease, LeaseState};
+        let released = |g| Frame::Lease(Lease { state: LeaseState::Released, generation: g });
+        let run = |driver: &dyn Fn(&UnixStream), pid1: &(dyn Fn(UnixStream) + Sync)| -> Frame {
+            let (mut lease, pid1_end) = UnixStream::pair().unwrap();
+            let (status, driver_end) = UnixStream::pair().unwrap();
+            std::thread::scope(move |scope| {
+                scope.spawn(move || pid1(pid1_end));
+                driver(&driver_end);
+                let frame = hold_lease(&mut lease, &status, 7).unwrap();
+                // The scripted PID 1 may still be reading; end its connection.
+                drop((lease, driver_end));
+                frame
+            })
+        };
+        let honest = |mut s: UnixStream| {
+            let mut ack = [0u8; 16];
+            if s.read_exact(&mut ack).is_ok() && protocol::decode_ack(&ack).ok() == Some(7) {
+                s.write_all(&released(7).encode().unwrap()).unwrap();
+            }
+        };
+        // A matching acknowledgment reaches PID 1 and returns its release.
+        assert_eq!(run(&|d| (&*d).write_all(&protocol::encode_ack(7)).unwrap(), &honest), released(7));
+        // Driver gone, wrong generation, malformed and stalled acknowledgments.
+        let lost = run(&|d| d.shutdown(std::net::Shutdown::Write).unwrap(), &honest);
+        assert!(matches!(&lost, Frame::Outcome(o) if o.kind == FailureKind::Stopped && o.stage == Stage::Lease), "{lost:?}");
+        for (bytes, expect) in [(protocol::encode_ack(8).to_vec(), "names lease 8"),
+            (b"KILNACK\0\x07\0\0\0\0\0\0\0\0".to_vec(), "exactly 16"), (b"XILNACK\0\x07\0\0\0\0\0\0\0".to_vec(), "magic")] {
+            let frame = run(&|d| (&*d).write_all(&bytes).unwrap(), &honest);
+            assert!(matches!(&frame, Frame::Outcome(o) if o.kind == FailureKind::InvalidRequest
+                && o.diagnostic.contains(expect)), "{frame:?}");
+        }
+        let started = Instant::now();
+        let frame = run(&|d| (&*d).write_all(&protocol::encode_ack(7)[..5]).unwrap(), &honest);
+        assert!(matches!(&frame, Frame::Outcome(o) if o.diagnostic.contains("incomplete")), "{frame:?}");
+        assert!(started.elapsed() >= protocol::FRAME_TIMEOUT);
+        // PID 1 ending the lease first is reported without forwarding anything.
+        let frame = run(&|_| {}, &|s: UnixStream| drop(s));
+        assert!(matches!(&frame, Frame::Outcome(o) if o.kind == FailureKind::Stopped), "{frame:?}");
+        // A release for another generation is a protocol failure, not success.
+        let (mut lease, mut pid1) = UnixStream::pair().unwrap();
+        let (status, driver) = UnixStream::pair().unwrap();
+        (&driver).write_all(&protocol::encode_ack(7)).unwrap();
+        let t = std::thread::spawn(move || { let mut a = [0u8; 16]; pid1.read_exact(&mut a).unwrap();
+            pid1.write_all(&released(9).encode().unwrap()).unwrap(); });
+        assert!(hold_lease(&mut lease, &status, 7).is_err());
+        t.join().unwrap();
     }
 
     #[test]

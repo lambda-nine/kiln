@@ -305,6 +305,33 @@ fallback to `/`. PID 1 itself never changes its cwd or environment. The byte
 layout, bounds and goldens are in
 [the protocol specification](docs/exec-protocol-v1.md#exec-options-operation-5).
 
+### Checkpoint source contract
+
+Workspace checkpoints copy a quiescent run's upper layer, so kiln provides
+four guarantees about the source; the copy itself comes later.
+
+- **Lease.** Operation 6 (bit `0x40`) gives the copier a lease. PID 1 grants
+  it only from idle, after proving its exec cgroup empty and itself
+  childless, and then refuses every exec and lease as busy. A lease lives
+  exactly as long as its connection: no timer releases it while the holder
+  may still be reading. Only the holder's acknowledgment, echoing the lease
+  generation, earns a Released frame. Death, half-close, a bad acknowledgment,
+  removal or a stop signal all end it without one.
+- **Overlay options.** Every overlay mount pins `index=off,metacopy=off,
+  redirect_dir=nofollow,nfs_export=off`, so the upper can't hold index,
+  metacopy or redirect metadata. PID 1's setup reads the effective options
+  back (mountinfo plus module defaults) and records them in `<run>/layout`.
+- **Image identity.** An image is identified by the SHA-256 of its canonical
+  tree manifest, recorded by `kiln image register`. Each run writes a
+  reference, which blocks replacing or removing that image.
+- **Protected paths.** `runtime/src/protected.rs` lists the runtime mount
+  targets, their ancestors and the generated entries a capture must not
+  alter. The setup code uses the same constants.
+
+Byte layouts and the state machine are in
+[checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md) and
+[image-identity-v1.md](docs/image-identity-v1.md).
+
 ### Host service privileges
 
 Installed listeners use separate system users: `kiln-dns` has only

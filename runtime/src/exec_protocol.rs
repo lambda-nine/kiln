@@ -20,6 +20,15 @@ pub const CREATE_PREFLIGHT_FEATURE: u32 = 0x10;
 /// the CLI accepts `--exec-options-fd`. Additive: older PID 1 instances
 /// without it still serve operation 4.
 pub const EXEC_OPTIONS_FEATURE: u32 = 0x20;
+/// PID 1 grants operation 6 (checkpoint lease) and the CLI accepts
+/// `kiln checkpoint-lease`. Additive like bits 4 and 5: PID 1 instances
+/// without it are refused by the CLI before any lease byte is sent.
+pub const CHECKPOINT_LEASE_FEATURE: u32 = 0x40;
+/// Reply type 3: a checkpoint lease state frame.
+pub const LEASE_PAYLOAD: usize = 16;
+/// The holder's lease acknowledgment, sent only after its last source read.
+pub const ACK_MAGIC: &[u8; 8] = b"KILNACK\0";
+pub const ACK_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandStatus {
@@ -55,7 +64,7 @@ wire_enum!(FailureKind {
 wire_enum!(Stage {
     None = 0, Validate = 1, Connect = 2, Request = 3, Prepare = 4, Fork = 5,
     Admission = 6, Stdio = 7, Exec = 8, Wait = 9, Cleanup = 10,
-    Report = 11, Capture = 12, Handshake = 13, Chdir = 14,
+    Report = 11, Capture = 12, Handshake = 13, Chdir = 14, Lease = 15,
 });
 wire_enum!(Cleanup { Unconfirmed = 0, NoChildStarted = 1, Drained = 2 });
 
@@ -127,7 +136,8 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn current() -> Self {
-        Self { features: REQUIRED_FEATURES | CREATE_PREFLIGHT_FEATURE | EXEC_OPTIONS_FEATURE,
+        Self { features: REQUIRED_FEATURES | CREATE_PREFLIGHT_FEATURE | EXEC_OPTIONS_FEATURE
+                | CHECKPOINT_LEASE_FEATURE,
             control_version: VERSION, status_fd_version: VERSION,
             package: env!("CARGO_PKG_VERSION").into(), provenance: env!("KILN_GIT").into() }
     }
@@ -140,8 +150,39 @@ impl Capabilities {
     }
 }
 
+/// The state a lease frame reports. Granted starts the lease on this
+/// connection; Released confirms a valid acknowledgment of that same lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseState { Granted = 1, Released = 2 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub state: LeaseState,
+    /// Nonzero, increasing for each lease one PID 1 grants. It names the lease
+    /// an acknowledgment refers to; it is not a secret or a boot identity.
+    pub generation: u64,
+}
+
+/// The holder's 16-byte acknowledgment: `KILNACK\0`, then the generation it
+/// was granted, LE u64. It is the only byte sequence a lease holder sends.
+pub fn encode_ack(generation: u64) -> [u8; ACK_LEN] {
+    let mut ack = [0u8; ACK_LEN];
+    ack[..8].copy_from_slice(ACK_MAGIC);
+    ack[8..].copy_from_slice(&generation.to_le_bytes());
+    ack
+}
+
+/// Returns the acknowledged generation of exactly one valid record.
+pub fn decode_ack(bytes: &[u8]) -> Result<u64> {
+    ensure!(bytes.len() == ACK_LEN, "lease acknowledgment must be exactly {ACK_LEN} bytes");
+    ensure!(&bytes[..8] == ACK_MAGIC, "malformed lease acknowledgment magic");
+    let generation = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    ensure!(generation != 0, "lease acknowledgment for generation 0");
+    Ok(generation)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Frame { Outcome(Outcome), Capabilities(Capabilities) }
+pub enum Frame { Outcome(Outcome), Capabilities(Capabilities), Lease(Lease) }
 
 impl Frame {
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -178,6 +219,13 @@ impl Frame {
                 p.extend_from_slice(c.package.as_bytes());
                 p.extend_from_slice(c.provenance.as_bytes());
                 (2, p)
+            }
+            Self::Lease(l) => {
+                ensure!(l.generation != 0, "lease generation 0");
+                let mut p = vec![0u8; LEASE_PAYLOAD];
+                p[0] = l.state as u8;
+                p[8..].copy_from_slice(&l.generation.to_le_bytes());
+                (3, p)
             }
         };
         let mut frame = Vec::with_capacity(16 + payload.len());
@@ -233,6 +281,15 @@ impl Frame {
                     provenance: std::str::from_utf8(&p[16+a..])?.into(),
                 }))
             }
+            3 => {
+                ensure!(p.len() == LEASE_PAYLOAD, "invalid lease payload length");
+                ensure!(p[1..8] == [0; 7], "lease reserved bytes");
+                let state = match p[0] { 1 => LeaseState::Granted, 2 => LeaseState::Released,
+                    _ => bail!("unknown lease state") };
+                let generation = u64::from_le_bytes(p[8..].try_into().unwrap());
+                ensure!(generation != 0, "lease generation 0");
+                Ok(Self::Lease(Lease { state, generation }))
+            }
             _ => unreachable!(),
         }
     }
@@ -242,7 +299,7 @@ fn header(bytes: &[u8]) -> Result<(u16, usize)> {
     ensure!(&bytes[..8] == MAGIC, "malformed reply magic");
     ensure!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()) == VERSION, "unsupported reply version");
     let ty = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
-    ensure!(matches!(ty, 1 | 2), "unknown reply type");
+    ensure!(matches!(ty, 1..=3), "unknown reply type");
     let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     ensure!(len <= MAX_PAYLOAD, "reply payload too large");
     Ok((ty, len))
@@ -289,6 +346,41 @@ pub fn read_reply(stream: &mut UnixStream, overall: Option<Instant>) -> Result<F
             Err(e) => return Err(e).context("incomplete control response"),
         }
     }
+}
+
+/// Reads exactly one frame and nothing after it, for a connection that carries
+/// more than one (the lease connection and the lease status stream). Like
+/// `read_reply`, `overall` bounds the whole read; without it the first byte may
+/// wait indefinitely and the rest of the frame then has `FRAME_TIMEOUT`. A
+/// reset or EOF before the frame is complete is an error.
+pub fn read_frame(stream: &mut UnixStream, overall: Option<Instant>) -> Result<Frame> {
+    let mut bytes = vec![0u8; 16];
+    let mut at = 0;
+    let mut deadline = overall;
+    let mut want = 16;
+    while at < want {
+        stream.set_read_timeout(match deadline {
+            Some(d) => Some(d.checked_duration_since(Instant::now()).context("incomplete frame deadline")?),
+            None => None,
+        })?;
+        let read = stream.read(&mut bytes[at..want]);
+        if let Some(d) = deadline { ensure!(Instant::now() < d, "incomplete frame deadline"); }
+        match read {
+            Ok(0) => bail!(if at == 0 { "missing control frame" } else { "truncated control frame" }),
+            Ok(n) => {
+                if deadline.is_none() { deadline = Some(Instant::now() + FRAME_TIMEOUT); }
+                at += n;
+                if at == 16 && want == 16 {
+                    let (_, len) = header(&bytes[..16])?;
+                    want = 16 + len;
+                    bytes.resize(want, 0);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("incomplete control frame"),
+        }
+    }
+    Frame::decode(&bytes)
 }
 
 /// MSG_DONTWAIT avoids changing the peer-shared open-file flags. Service the
@@ -340,10 +432,83 @@ mod tests {
         let caps = Capabilities::current();
         caps.require_v1().unwrap();
         assert_eq!(caps.features & CREATE_PREFLIGHT_FEATURE, CREATE_PREFLIGHT_FEATURE);
-        assert_eq!(caps.features, 0x3f);
+        assert_eq!(caps.features, 0x7f);
+        assert_eq!(caps.features & CHECKPOINT_LEASE_FEATURE, 0x40);
         let mut execution_only = caps;
         execution_only.features = REQUIRED_FEATURES;
         execution_only.require_v1().unwrap();
+    }
+
+    #[test]
+    fn golden_lease_frames_and_acknowledgment() {
+        let granted = Frame::Lease(Lease { state: LeaseState::Granted, generation: 1 });
+        let bytes = granted.encode().unwrap();
+        assert_eq!(bytes, b"KILNEXO\0\x01\0\x03\0\x10\0\0\0\x01\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0");
+        assert_eq!(Frame::decode(&bytes).unwrap(), granted);
+        let released = Frame::Lease(Lease { state: LeaseState::Released, generation: 0x0102030405060708 });
+        assert_eq!(&released.encode().unwrap()[16..],
+            b"\x02\0\0\0\0\0\0\0\x08\x07\x06\x05\x04\x03\x02\x01");
+        // Unknown state, reserved bytes, generation 0, short/long payloads.
+        for (at, value) in [(16, 0), (16, 3), (17, 1), (23, 1)] {
+            let mut bad = bytes.clone(); bad[at] = value;
+            assert!(Frame::decode(&bad).is_err(), "offset {at}");
+        }
+        let mut zero = bytes.clone(); zero[24] = 0;
+        assert!(Frame::decode(&zero).is_err());
+        let mut long = bytes.clone(); long[12] = 17; long.push(0);
+        assert!(Frame::decode(&long).is_err());
+        let mut short = bytes[..31].to_vec(); short[12] = 15;
+        assert!(Frame::decode(&short).is_err());
+        assert!(Frame::Lease(Lease { state: LeaseState::Granted, generation: 0 }).encode().is_err());
+
+        assert_eq!(&encode_ack(1), b"KILNACK\0\x01\0\0\0\0\0\0\0");
+        assert_eq!(decode_ack(&encode_ack(u64::MAX)).unwrap(), u64::MAX);
+        assert!(decode_ack(&encode_ack(0)).is_err());
+        assert!(decode_ack(&encode_ack(1)[..15]).is_err());
+        let mut trailing = encode_ack(1).to_vec(); trailing.push(0);
+        assert!(decode_ack(&trailing).is_err());
+        let mut magic = encode_ack(1); magic[0] = b'X';
+        assert!(decode_ack(&magic).is_err());
+    }
+
+    #[test]
+    fn read_frame_takes_exactly_one_frame_at_every_split() {
+        let first = Frame::Lease(Lease { state: LeaseState::Granted, generation: 7 }).encode().unwrap();
+        let second = Frame::Lease(Lease { state: LeaseState::Released, generation: 7 }).encode().unwrap();
+        let mut both = first.clone(); both.extend_from_slice(&second);
+        for split in 0..=both.len() {
+            let (mut tx, mut rx) = UnixStream::pair().unwrap();
+            let b = both.clone();
+            let t = std::thread::spawn(move || { tx.write_all(&b[..split]).unwrap();
+                std::thread::yield_now(); tx.write_all(&b[split..]).unwrap(); });
+            assert_eq!(read_frame(&mut rx, Some(Instant::now() + FRAME_TIMEOUT)).unwrap(),
+                Frame::decode(&first).unwrap());
+            assert_eq!(read_frame(&mut rx, Some(Instant::now() + FRAME_TIMEOUT)).unwrap(),
+                Frame::decode(&second).unwrap());
+            t.join().unwrap();
+            assert!(read_frame(&mut rx, Some(Instant::now() + FRAME_TIMEOUT)).is_err(), "EOF is not a frame");
+        }
+        for end in 1..first.len() {
+            let (mut tx, mut rx) = UnixStream::pair().unwrap();
+            tx.write_all(&first[..end]).unwrap(); drop(tx);
+            assert!(read_frame(&mut rx, None).is_err(), "truncated at {end}");
+        }
+        // A valid Outcome type 1 frame still decodes; exec replies are unchanged.
+        let exit = Frame::Outcome(Outcome::command(CommandStatus::Exited(125))).encode().unwrap();
+        let (mut tx, mut rx) = UnixStream::pair().unwrap();
+        tx.write_all(&exit).unwrap();
+        assert!(matches!(read_frame(&mut rx, None).unwrap(), Frame::Outcome(_)));
+    }
+
+    #[test]
+    fn lease_stage_is_15_and_projects_125() {
+        let o = Outcome::failure(FailureKind::Stopped, Stage::Lease, Cleanup::NoChildStarted, 0, "lost");
+        let bytes = Frame::Outcome(o.clone()).encode().unwrap();
+        assert_eq!(&bytes[26..28], b"\x0f\0");
+        assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Outcome(o.clone()));
+        assert_eq!(o.projection(), 125);
+        let mut unknown = bytes.clone(); unknown[26] = 16;
+        assert!(Frame::decode(&unknown).is_err());
     }
 
     #[test]
@@ -353,7 +518,7 @@ mod tests {
         assert_eq!(&bytes[16..32], b"\x02\x00\x02\x00\x00\x00\x00\x00\x06\x00\x0e\x00\x02\x00\x00\x00");
         assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Outcome(o.clone()));
         assert_eq!(o.projection(), 126);
-        let mut unknown = bytes.clone(); unknown[26] = 15;
+        let mut unknown = bytes.clone(); unknown[26] = 16;
         assert!(Frame::decode(&unknown).is_err());
     }
 

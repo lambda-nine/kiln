@@ -260,6 +260,9 @@ sh scripts/shim-identity-regressions.sh
 echo "13b. Persistent typed exec outcomes"
 sudo python3 -I scripts/typed-exec-regressions.py "$KILN"
 
+echo "13c. Checkpoint lease, source metadata and image identity"
+sudo python3 -I scripts/checkpoint-regressions.py "$KILN"
+
 echo "14. Bridge ports isolated"
 sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sleep 5 &
 first=$!

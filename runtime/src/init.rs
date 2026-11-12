@@ -23,7 +23,7 @@ use crate::cgroup::ExecCgroup;
 use crate::exec_options::{ExecOptions, LaunchOptions};
 use crate::persistent::{EXEC_FAILED, Header, HeaderReader, ReadState, Request, RequestReader, max_body};
 use crate::exec_protocol::{self as protocol, Capabilities, Cleanup, CommandStatus, FailureKind,
-    Frame, Outcome as ExecOutcome, Stage};
+    Frame, Lease, LeaseState, Outcome as ExecOutcome, Stage};
 
 /// Signals passed on to the command. SIGINT, SIGQUIT and SIGWINCH are left
 /// out on purpose: the terminal sends those to the whole foreground process
@@ -52,6 +52,15 @@ const MAX_BUSY_FINALIZE_BATCHES: usize = (CONTROL_BACKLOG as usize + 1).div_ceil
 /// The exec loop's fixed pollfds, ahead of the pending busy headers: signals,
 /// client, listener and bootstrap channel.
 const EXEC_WATCH: usize = 4;
+
+/// The lease loop's fixed pollfds, ahead of the pending busy headers: signals,
+/// holder and listener.
+const LEASE_WATCH: usize = 3;
+
+/// Busy diagnostics. Both are FailureKind::Busy with no child started; the
+/// text only says which kind of activity holds PID 1.
+const EXEC_BUSY: &str = "another exec is active";
+const LEASE_BUSY: &str = "a checkpoint lease is held";
 
 /// Starts `argv` as a child and supervises it until it exits. Returns its
 /// shell-style exit code (128 + signal number if it was killed).
@@ -104,6 +113,8 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
     // the client hanging up and new requests.
     let signals = SignalFd::with_flags(&all, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
         .context("signalfd")?;
+    // Generations name the leases this PID 1 grants: nonzero and increasing.
+    let mut leases = 0u64;
     loop {
         let mut stream = match wait_for_request(listener, &signals)? {
             IdleEvent::Request(stream) => stream,
@@ -122,6 +133,16 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
             Request::Capabilities => {
                 respond(&stream, &Frame::Capabilities(Capabilities::current()).encode()?, &signals, true);
                 continue;
+            }
+            Request::CheckpointLease => {
+                match hold_lease(&stream, listener, scope, &signals, &mut leases)? {
+                    LeaseEnd::Released | LeaseEnd::Ended => continue,
+                    LeaseEnd::Stop(code) => return Ok(code),
+                    LeaseEnd::Removed(remover) => {
+                        respond(&remover, &0i32.to_ne_bytes(), &signals, true);
+                        return Ok(0);
+                    }
+                }
             }
             Request::Exec(argv, fds) => (argv, fds, false, None),
             Request::TypedExec(argv, fds) => (argv, fds, true, None),
@@ -183,7 +204,12 @@ fn report(stream: &UnixStream, outcome: &ExecOutcome, typed: bool, signals: &Sig
 /// Request-local write failure never unwinds PID 1. Leave signals queued for
 /// the lifetime or exec loop so this writer cannot steal leader/stop ownership.
 fn respond(stream: &UnixStream, bytes: &[u8], signals: &SignalFd, idle: bool) {
-    let result = protocol::write_bounded(stream.as_raw_fd(), bytes, || {
+    if let Err(e) = send_response(stream, bytes, signals, idle) { eprintln!("kiln: report status: {e:#}"); }
+}
+
+/// `respond`, for a caller that must know whether the whole frame was sent.
+fn send_response(stream: &UnixStream, bytes: &[u8], signals: &SignalFd, idle: bool) -> Result<()> {
+    protocol::write_bounded(stream.as_raw_fd(), bytes, || {
         #[cfg(test)]
         if let Some(root) = std::env::var_os("KILN_PROTOCOL_FIXTURE") {
             let root = std::path::PathBuf::from(root);
@@ -199,8 +225,7 @@ fn respond(stream: &UnixStream, bytes: &[u8], signals: &SignalFd, idle: bool) {
         poll(&mut p, 0)?;
         anyhow::ensure!(p[0].revents == 0, "signal pending during {} response", if idle { "idle" } else { "busy" });
         Ok(())
-    });
-    if let Err(e) = result { eprintln!("kiln: report status: {e:#}"); }
+    })
 }
 
 /// What wakes PID 1 while no exec request is active.
@@ -423,7 +448,7 @@ fn run_exec(argv: &[CString], options: Option<&ExecOptions>, stdio: Vec<OwnedFd>
             kill(Pid::this(), Signal::SIGTERM).context("fixture finalization signal")?;
         }
         if matches!(outcome, Outcome::Completed(_) | Outcome::Disconnected) {
-            Ok(busy.finish_backlog(listener, signals)?.unwrap_or(outcome))
+            Ok(busy.finish_backlog(listener, signals, EXEC_BUSY)?.map(Outcome::Removed).unwrap_or(outcome))
         } else { Ok(outcome) }
     });
     let outcome = match outcome {
@@ -757,20 +782,24 @@ fn interrupted(wait: &[libc::pollfd; 3], ready: &[libc::pollfd], busy: &mut Busy
     poll_error(wait[0].revents, "signalfd")?;
     poll_error(wait[2].revents, "control listener")?;
     let mut completed = busy.advance(ready, wait[2].revents & libc::POLLIN != 0, listener)?;
-    if let Some(outcome) = answer_busy_headers(&mut completed, signals)? { return Ok(Some(outcome)); }
+    if let Some(remover) = answer_busy_headers(&mut completed, signals, EXEC_BUSY)? {
+        return Ok(Some(Outcome::Removed(remover)));
+    }
     // Ready headers, including removal, win over a simultaneous disconnect.
     let disconnected = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
     Ok((wait[1].revents & disconnected != 0).then_some(Outcome::Disconnected))
 }
 
-fn answer_busy_headers(completed: &mut Vec<(UnixStream, Header)>, signals: &SignalFd) -> Result<Option<Outcome>> {
+/// Answers every complete busy header and returns a removal's connection.
+fn answer_busy_headers(completed: &mut Vec<(UnixStream, Header)>, signals: &SignalFd, busy: &str)
+    -> Result<Option<UnixStream>> {
     // Removal wins this pass before anything else is answered.
     let remover = completed.iter().position(|(_, header)| is_remove(header))
         .map(|at| completed.swap_remove(at).0);
     for (stream, header) in completed.drain(..) {
-        answer_busy_header(&stream, header, signals)?;
+        answer_busy_header(&stream, header, signals, busy)?;
     }
-    Ok(remover.map(Outcome::Removed))
+    Ok(remover)
 }
 
 /// One connection whose fixed header hasn't fully arrived while an exec runs.
@@ -793,13 +822,14 @@ impl BusyHeaders {
     /// even beyond one accept burst. Bound total work as well as each batch;
     /// leave shutdown signals queued for idle so a completed command retains
     /// its real outcome. New connections during cleanup are left for idle.
-    fn finish_backlog(&mut self, listener: &UnixListener, signals: &SignalFd) -> Result<Option<Outcome>> {
+    fn finish_backlog(&mut self, listener: &UnixListener, signals: &SignalFd, busy: &str)
+        -> Result<Option<UnixStream>> {
         for _ in 0..MAX_BUSY_FINALIZE_BATCHES {
             let ready = [libc::pollfd { fd: -1, events: 0, revents: libc::POLLIN }; MAX_BUSY_PENDING];
             let mut completed = self.advance(&ready, true, listener)?;
             // Incomplete requests cannot become an exec in the next idle turn.
             self.pending.clear();
-            if let Some(outcome) = answer_busy_headers(&mut completed, signals)? { return Ok(Some(outcome)); }
+            if let Some(remover) = answer_busy_headers(&mut completed, signals, busy)? { return Ok(Some(remover)); }
             let mut wait = [libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
             poll(&mut wait, 0)?;
             poll_error(wait[0].revents, "control listener")?;
@@ -886,11 +916,13 @@ fn is_remove(header: &Header) -> bool {
     header.op == 2 && header.len == 0 && header.fds.is_empty()
 }
 
-/// Answers a complete header that arrived while an exec runs. Execs run one at
-/// a time, so another exec request fails with EXEC_FAILED instead of queueing.
-fn answer_busy_header(stream: &UnixStream, header: Header, signals: &SignalFd) -> Result<()> {
+/// Answers a complete header that arrived while an exec runs or a checkpoint
+/// lease is held. One activity runs at a time, so another exec or lease
+/// request is refused as busy instead of queueing; capability probes are
+/// answered.
+fn answer_busy_header(stream: &UnixStream, header: Header, signals: &SignalFd, busy: &str) -> Result<()> {
     match header.op {
-        2 if is_remove(&header) => eprintln!("kiln: dropped a second removal during exec"),
+        2 if is_remove(&header) => eprintln!("kiln: dropped a second removal while busy"),
         3 if header.len == 0 && header.fds.is_empty() => {
             respond(stream, &Frame::Capabilities(Capabilities::current()).encode()?, signals, false);
         }
@@ -899,16 +931,173 @@ fn answer_busy_header(stream: &UnixStream, header: Header, signals: &SignalFd) -
             // A competing exec can be classified from its fixed header. Close
             // its descriptors before replying; never read or allocate its body.
             drop(header);
-            eprintln!("kiln: refused an exec request while another exec runs");
+            eprintln!("kiln: refused an exec request: {busy}");
             let bytes = if typed {
                 Frame::Outcome(ExecOutcome::failure(FailureKind::Busy, Stage::Validate,
-                    Cleanup::NoChildStarted, 0, "another exec is active")).encode()?
+                    Cleanup::NoChildStarted, 0, busy)).encode()?
             } else { EXEC_FAILED.to_ne_bytes().to_vec() };
             respond(stream, &bytes, signals, false);
         }
-        _ => eprintln!("kiln: invalid request header during exec"),
+        6 if header.len == 0 && header.fds.is_empty() => {
+            eprintln!("kiln: refused a checkpoint lease request: {busy}");
+            respond(stream, &Frame::Outcome(ExecOutcome::failure(FailureKind::Busy, Stage::Lease,
+                Cleanup::NoChildStarted, 0, busy)).encode()?, signals, false);
+        }
+        _ => eprintln!("kiln: invalid request header while busy"),
     }
     Ok(())
+}
+
+/// How a checkpoint lease ended. Only Released means the holder's
+/// acknowledgment was validated while the lease was continuously held.
+enum LeaseEnd {
+    Released,
+    /// The holder went away, half-closed, sent a malformed or wrong-generation
+    /// acknowledgment, or stalled mid-acknowledgment. No success exists.
+    Ended,
+    /// A forwarded signal stops the sandbox; the lease ends without success.
+    Stop(i32),
+    /// `kiln rm` arrived; the lease ends without success first.
+    Removed(UnixStream),
+}
+
+/// Proves no workload process exists: the exec cgroup reads empty and PID 1
+/// has no child at all. Every process in the sandbox's PID namespace other
+/// than PID 1 descends from it (orphans are reparented to it), so ECHILD
+/// means PID 1 is alone. Exited children are reaped on the way.
+fn prove_quiescent(scope: &ExecCgroup) -> Result<()> {
+    anyhow::ensure!(!scope.populated()?, "exec cgroup is populated");
+    loop {
+        match wait_raw(-1, libc::WNOHANG) {
+            Ok(Some(_)) => continue,
+            Ok(None) => anyhow::bail!("a child process is still running"),
+            Err(Errno::ECHILD) => return Ok(()),
+            Err(e) => return Err(e).context("waitpid"),
+        }
+    }
+}
+
+/// Operation 6. Grants a lease only when idle and provably quiescent, then
+/// refuses every exec and lease request until the lease ends. The lease lives
+/// exactly as long as the holder's connection: PID 1 has no lease timer, so a
+/// holder that is still reading the source is never released underneath.
+/// Only a valid acknowledgment, framed within FRAME_TIMEOUT of its first byte,
+/// earns the Released frame.
+fn hold_lease(holder: &UnixStream, listener: &UnixListener, scope: &ExecCgroup, signals: &SignalFd,
+    leases: &mut u64) -> Result<LeaseEnd> {
+    // As at exec admission: a stop that arrived after accept() belongs to the
+    // sandbox, not to this lease.
+    if let Some(code) = drain_idle_signals(signals)? {
+        return Ok(LeaseEnd::Stop(code));
+    }
+    if let Err(e) = prove_quiescent(scope) {
+        // Idle PID 1 with a workload left would be a cleanup failure: refuse,
+        // then stop rather than admit anything beside possible leftovers.
+        respond(holder, &Frame::Outcome(ExecOutcome::failure(FailureKind::CleanupFailed, Stage::Lease,
+            Cleanup::NoChildStarted, error_errno(&e), &format!("idle sandbox is not quiescent: {e:#}"))).encode()?,
+            signals, true);
+        return Err(e.context("checkpoint lease refused; stopping sandbox"));
+    }
+    *leases = leases.checked_add(1).context("lease generation overflow")?;
+    let generation = *leases;
+    let granted = Frame::Lease(Lease { state: LeaseState::Granted, generation }).encode()?;
+    if let Err(e) = send_response(holder, &granted, signals, true) {
+        // A partially delivered grant is not a lease the holder can use.
+        eprintln!("kiln: checkpoint lease grant not delivered: {e:#}");
+        return Ok(LeaseEnd::Ended);
+    }
+    let mut busy = BusyHeaders::new();
+    let mut ack = AckReader::new();
+    let end = loop {
+        let mut fds = [libc::pollfd { fd: -1, events: 0, revents: 0 }; LEASE_WATCH + MAX_BUSY_PENDING];
+        fds[0] = libc::pollfd { fd: signals.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        fds[1] = libc::pollfd { fd: holder.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        fds[2] = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        busy.watch(&mut fds[LEASE_WATCH..]);
+        let timeout = match (busy.timeout(), ack.timeout()) {
+            (-1, t) | (t, -1) => t,
+            (a, b) => a.min(b),
+        };
+        poll(&mut fds, timeout)?;
+        poll_error(fds[0].revents, "signalfd")?;
+        poll_error(fds[2].revents, "control listener")?;
+        // Removal, probes and refused requests first, as during an exec.
+        let mut completed = busy.advance(&fds[LEASE_WATCH..], fds[2].revents & libc::POLLIN != 0, listener)?;
+        if let Some(remover) = answer_busy_headers(&mut completed, signals, LEASE_BUSY)? {
+            break LeaseEnd::Removed(remover);
+        }
+        if let Some(code) = drain_idle_signals(signals)? {
+            break LeaseEnd::Stop(code);
+        }
+        if fds[1].revents == 0 && !ack.expired() { continue; }
+        match ack.read(holder) {
+            Ok(None) => continue,
+            Ok(Some(acknowledged)) if acknowledged == generation => {
+                // Nothing can have started while the lease was held; recheck
+                // anyway so Released always certifies a quiescent interval.
+                prove_quiescent(scope).context("sandbox not quiescent at lease release")?;
+                let released = Frame::Lease(Lease { state: LeaseState::Released, generation }).encode()?;
+                if let Err(e) = send_response(holder, &released, signals, true) {
+                    eprintln!("kiln: checkpoint lease release not delivered: {e:#}");
+                    break LeaseEnd::Ended;
+                }
+                break LeaseEnd::Released;
+            }
+            Ok(Some(other)) => {
+                eprintln!("kiln: checkpoint lease {generation} acknowledged as {other}; ended without release");
+                break LeaseEnd::Ended;
+            }
+            Err(e) => {
+                eprintln!("kiln: checkpoint lease {generation} ended without release: {e:#}");
+                break LeaseEnd::Ended;
+            }
+        }
+    };
+    if !matches!(end, LeaseEnd::Released | LeaseEnd::Ended) { return Ok(end); }
+    // Requests queued while the lease was held are refused, as after an exec.
+    if let Some(remover) = busy.finish_backlog(listener, signals, LEASE_BUSY)? {
+        return Ok(LeaseEnd::Removed(remover));
+    }
+    Ok(end)
+}
+
+/// Incremental reader for the holder's 16-byte acknowledgment. Framing has
+/// one absolute FRAME_TIMEOUT window from its first byte; before that byte the
+/// holder may take as long as it needs.
+struct AckReader { bytes: [u8; protocol::ACK_LEN + 1], at: usize, deadline: Option<Instant> }
+
+impl AckReader {
+    fn new() -> Self { Self { bytes: [0; protocol::ACK_LEN + 1], at: 0, deadline: None } }
+
+    fn timeout(&self) -> i32 {
+        self.deadline.map_or(-1, |d| poll_millis(d.saturating_duration_since(Instant::now())))
+    }
+
+    fn expired(&self) -> bool { self.deadline.is_some_and(|d| Instant::now() >= d) }
+
+    /// Returns the acknowledged generation once all 16 bytes arrived. EOF,
+    /// a reset, an expired window or any malformed or trailing byte is an error.
+    fn read(&mut self, holder: &UnixStream) -> Result<Option<u64>> {
+        loop {
+            anyhow::ensure!(!self.expired(), "lease acknowledgment framing deadline exceeded");
+            let n = unsafe { libc::recv(holder.as_raw_fd(), self.bytes[self.at..].as_mut_ptr().cast(),
+                self.bytes.len() - self.at, libc::MSG_DONTWAIT) };
+            if n < 0 {
+                match Errno::last() {
+                    Errno::EINTR => continue,
+                    Errno::EAGAIN => return Ok(None),
+                    e => return Err(e).context("read lease acknowledgment"),
+                }
+            }
+            anyhow::ensure!(n > 0, "lease holder closed before acknowledging");
+            if self.deadline.is_none() { self.deadline = Some(Instant::now() + protocol::FRAME_TIMEOUT); }
+            self.at += n as usize;
+            anyhow::ensure!(self.at <= protocol::ACK_LEN, "trailing bytes after lease acknowledgment");
+            if self.at == protocol::ACK_LEN {
+                return protocol::decode_ack(&self.bytes[..protocol::ACK_LEN]).map(Some);
+            }
+        }
+    }
 }
 
 /// Reaps every child that has exited, including orphans that were reparented
@@ -1494,5 +1683,206 @@ mod tests {
         .to_string();
 
         assert!(err.contains("framing deadline exceeded"), "{err}");
+    }
+
+    impl Server {
+        /// Takes operation 6 and returns the lease connection and generation.
+        fn lease(&self) -> (UnixStream, u64) {
+            let mut stream = self.connect();
+            stream.write_all(&[6, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            match protocol::read_frame(&mut stream, Some(Instant::now() + Duration::from_secs(5))).unwrap() {
+                Frame::Lease(Lease { state: LeaseState::Granted, generation }) => (stream, generation),
+                other => panic!("expected a grant, got {other:?}"),
+            }
+        }
+        /// A lease request that must be refused with one outcome.
+        fn lease_refused(&self) -> ExecOutcome {
+            let mut stream = self.connect();
+            stream.write_all(&[6, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            match protocol::read_reply(&mut stream, Some(Instant::now() + Duration::from_secs(5))).unwrap() {
+                Frame::Outcome(o) => o,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        fn pid(&self) -> nix::unistd::Pid { nix::unistd::Pid::from_raw(self.child.id() as i32) }
+        /// The first exec after a lease ended. A request racing the end of the
+        /// lease may still be refused as busy, or dropped unanswered if its
+        /// header was incomplete when the lease's backlog was finalized (as
+        /// at the end of an exec); it never runs during the lease.
+        fn exec_after_lease(&self) -> ExecOutcome {
+            for _ in 0..100 {
+                let (mut stream, _out, _err) = self.start_exec(&["/bin/true"]);
+                match protocol::read_reply(&mut stream, Some(Instant::now() + Duration::from_secs(5))) {
+                    Ok(Frame::Outcome(o)) if o.kind == FailureKind::Busy => assert_eq!(o.diagnostic, LEASE_BUSY),
+                    Ok(Frame::Outcome(o)) => return o,
+                    Ok(other) => panic!("unexpected {other:?}"),
+                    Err(_) => {}
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("lease never ended");
+        }
+    }
+
+    fn release(stream: &mut UnixStream, generation: u64) -> Result<Frame> {
+        stream.write_all(&protocol::encode_ack(generation))?;
+        protocol::read_reply(stream, Some(Instant::now() + Duration::from_secs(5)))
+    }
+
+    fn assert_lease_busy(o: &ExecOutcome, stage: Stage) {
+        assert_eq!((o.kind, o.stage, o.cleanup, o.status, o.diagnostic.as_str()),
+            (FailureKind::Busy, stage, Cleanup::NoChildStarted, None, LEASE_BUSY));
+    }
+
+    #[test]
+    fn lease_excludes_exec_answers_probes_and_needs_no_timer() {
+        let server = Server::start();
+        let (mut lease, generation) = server.lease();
+        assert_eq!(generation, 1);
+        let marker = server.root.join("ran-during-lease");
+        let touch = format!("touch {}", marker.display());
+        assert_lease_busy(&server.exec(&["/bin/sh", "-c", &touch]).0, Stage::Validate);
+        assert_lease_busy(&server.exec_options(&["/bin/sh", "-c", &touch], &options(None, &[])).0, Stage::Validate);
+        assert_lease_busy(&server.lease_refused(), Stage::Lease);
+        // Legacy operation 1 is refused with its i32 status.
+        let (mut legacy, _, _) = server.start_exec_header(1, 0);
+        let mut status = [0u8; 4];
+        legacy.read_exact(&mut status).unwrap();
+        assert_eq!(i32::from_ne_bytes(status), EXEC_FAILED);
+        server.probe();
+        // Longer than any framing window: PID 1 has no lease timer.
+        std::thread::sleep(REQUEST_READ_TIMEOUT * 2 + Duration::from_millis(200));
+        assert_lease_busy(&server.exec(&["/bin/sh", "-c", &touch]).0, Stage::Validate);
+        server.probe();
+        assert_eq!(release(&mut lease, generation).unwrap(),
+            Frame::Lease(Lease { state: LeaseState::Released, generation }));
+        assert!(!marker.exists(), "a command ran during the lease");
+        assert_eq!(server.exec_after_lease(), ExecOutcome::command(CommandStatus::Exited(0)));
+        // Generations increase per PID 1.
+        let (mut lease, generation) = server.lease();
+        assert_eq!(generation, 2);
+        assert!(matches!(release(&mut lease, 2).unwrap(), Frame::Lease(Lease { state: LeaseState::Released, generation: 2 })));
+    }
+
+    #[test]
+    fn lease_ends_without_release_on_death_eof_or_bad_acknowledgment() {
+        let server = Server::start();
+        let mut next = 0;
+        let mut lease = || { let (stream, g) = server.lease(); next += 1; assert_eq!(g, next); (stream, g) };
+        // Holder death.
+        drop(lease().0);
+        assert_eq!(server.exec_after_lease(), ExecOutcome::command(CommandStatus::Exited(0)));
+        // Half-close before acknowledging abandons the lease.
+        let (stream, _) = lease();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eof(&stream, Duration::from_secs(5), "half-closed holder");
+        assert_eq!(server.exec_after_lease().status, Some(CommandStatus::Exited(0)));
+        // Wrong generation, bad magic, generation 0 and a trailing byte.
+        let wrong: [fn(u64) -> Vec<u8>; 4] = [|g| protocol::encode_ack(g + 1).to_vec(),
+            |g| { let mut a = protocol::encode_ack(g); a[0] = b'X'; a.to_vec() },
+            |_| protocol::encode_ack(0).to_vec(),
+            |g| { let mut a = protocol::encode_ack(g).to_vec(); a.push(0); a }];
+        for bad in wrong {
+            let (mut stream, g) = lease();
+            stream.write_all(&bad(g)).unwrap();
+            assert_eof(&stream, Duration::from_secs(5), "invalid acknowledgment");
+            assert_eq!(server.exec_after_lease().status, Some(CommandStatus::Exited(0)));
+        }
+        // A partial acknowledgment has one framing window from its first byte.
+        let (mut stream, g) = lease();
+        let started = Instant::now();
+        stream.write_all(&protocol::encode_ack(g)[..8]).unwrap();
+        assert_eof(&stream, Duration::from_secs(5), "stalled acknowledgment");
+        assert!(started.elapsed() >= protocol::FRAME_TIMEOUT - Duration::from_millis(50));
+        assert_eq!(server.exec_after_lease().status, Some(CommandStatus::Exited(0)));
+        // A late acknowledgment after the lease ended earns nothing.
+        assert!(release(&mut stream, g).is_err());
+    }
+
+    #[test]
+    fn lease_is_refused_while_an_exec_runs() {
+        let server = Server::start();
+        let (active, out, err, _) = server.start_sleeper();
+        let o = server.lease_refused();
+        assert_eq!((o.kind, o.stage, o.cleanup, o.diagnostic.as_str()),
+            (FailureKind::Busy, Stage::Lease, Cleanup::NoChildStarted, EXEC_BUSY));
+        drop((active, out, err));
+        // The exec's end does not turn its queued refusal into a lease.
+        std::thread::sleep(Duration::from_millis(50));
+        let (mut lease, g) = server.lease();
+        assert!(matches!(release(&mut lease, g).unwrap(), Frame::Lease(_)));
+    }
+
+    #[test]
+    fn removal_ends_a_lease_without_release() {
+        let server = Server::start();
+        let (lease, _) = server.lease();
+        let mut remover = server.connect();
+        remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mut status = [0u8; 4];
+        remover.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        remover.read_exact(&mut status).unwrap();
+        assert_eq!(i32::from_ne_bytes(status), 0);
+        assert_eof(&lease, Duration::from_secs(5), "removed lease");
+    }
+
+    #[test]
+    fn stop_signal_ends_a_lease_without_release() {
+        let server = Server::start();
+        let (lease, _) = server.lease();
+        kill(server.pid(), Signal::SIGTERM).unwrap();
+        assert_eof(&lease, Duration::from_secs(5), "stopped lease");
+    }
+
+    #[test]
+    fn lease_requires_a_provably_quiescent_sandbox() {
+        let server = Server::start();
+        fs::write(server.root.join("expect-fatal"), "").unwrap();
+        fs::write(server.root.join("events"), "populated 1\n").unwrap();
+        let o = server.lease_refused();
+        assert_eq!((o.kind, o.stage, o.cleanup), (FailureKind::CleanupFailed, Stage::Lease, Cleanup::NoChildStarted));
+        assert!(o.diagnostic.contains("not quiescent"), "{}", o.diagnostic);
+    }
+
+    #[test]
+    fn malformed_lease_requests_close_unanswered() {
+        let server = Server::start();
+        let mut body = server.connect();
+        body.write_all(&[6, 0, 0, 0, 1, 0, 0, 0, 0]).unwrap();
+        assert_eof(&body, Duration::from_secs(5), "lease with a body");
+        let (with_fds, _, _) = server.start_exec_header(6, 0);
+        assert_eof(&with_fds, Duration::from_secs(5), "lease with descriptors");
+        let mut reserved = server.connect();
+        reserved.write_all(&[6, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eof(&reserved, Duration::from_secs(5), "lease with reserved bytes");
+        assert_eq!(server.exec(&["/bin/true"]).0, ExecOutcome::command(CommandStatus::Exited(0)));
+    }
+
+    /// Adversarial-review LOW from exec options: the separate capability probe
+    /// had one two-second exchange deadline, so operation 5 failed where
+    /// operation 4 waited behind connections PID 1 frames first. The probe's
+    /// reply now waits like an exec reply; its connect stays bounded.
+    #[test]
+    fn feature_probes_wait_behind_stalled_connections_like_exec() {
+        let server = Server::start();
+        let socket = server.root.join("control.sock");
+        for probe in [0, 1] {
+            let stalled = [server.partial_header(), server.partial_header()];
+            let started = Instant::now();
+            let mut stage = Stage::Connect;
+            if probe == 0 {
+                assert!(crate::persistent::require_exec_options(&socket, &mut stage).unwrap().is_none());
+            } else {
+                let caps = crate::persistent::probe_features(&socket, &mut stage).unwrap();
+                assert_eq!(caps.features & protocol::CHECKPOINT_LEASE_FEATURE, protocol::CHECKPOINT_LEASE_FEATURE);
+            }
+            assert!(started.elapsed() > protocol::FRAME_TIMEOUT, "probe did not queue behind both connections");
+            assert_eq!(stage, Stage::Handshake);
+            drop(stalled);
+        }
+        // Operation 4 behaves the same way, as it always did.
+        let stalled = [server.partial_header(), server.partial_header()];
+        assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
+        drop(stalled);
     }
 }

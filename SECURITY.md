@@ -115,6 +115,14 @@ relying on it:
   Landlock and seccomp inside the sandbox's root. Values are not secret in
   this design: they are visible to the command and to anything that can read
   its environment.
+- **Checkpoint leases and image identity.** Operation 6 (bit `0x40`) is a
+  root-only control request, like exec. A lease stops command admission, but
+  it is not an isolation mechanism. The lease holder is trusted to read the
+  source only between Granted and its acknowledgment. Image identity is an
+  integrity fingerprint of operator-provisioned content, not a signature.
+  The registry, the run references and the layout records are root-only
+  files; a damaged or missing record fails closed (unknown image, or not a
+  checkpoint source). See [checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md).
 - **One-shot terminal passthrough.** `kiln run` preserves the caller's
   standard streams and controlling terminal for interactive use. It blocks
   the terminal-injection ioctls `TIOCSTI` and `TIOCLINUX`, but code in the

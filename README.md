@@ -338,6 +338,18 @@ the CLI checks before sending anything; older sandboxes still run plain execs.
 The frame layout and limits are in the
 [protocol document](docs/exec-protocol-v1.md#exec-options-operation-5).
 
+A checkpoint manager can hold a persistent sandbox still while it reads the
+sandbox's upper layer: `kiln checkpoint-lease --protocol=1 --status-fd=N ID`
+takes operation 6. PID 1 grants it only when no workload process exists,
+refuses every exec until the lease ends, and keeps no timer. The lease ends
+successfully only when the driver acknowledges it after its last read. The
+sandbox must have a registered image (`kiln image register NAME`) and
+verified pinned overlay options; older sandboxes and PID 1 instances without
+capability bit `0x40` are refused before any lease byte. See
+[checkpoint-lease-v1.md](docs/checkpoint-lease-v1.md) and
+[image-identity-v1.md](docs/image-identity-v1.md). Capture itself (walking and
+copying) is not implemented yet.
+
 ## Notes
 
 - **PID 1 ignores signals from inside its own namespace.** `kill -9 $$` inside

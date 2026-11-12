@@ -85,10 +85,23 @@ for dirpath, dirnames, filenames in os.walk(root):
         if os.path.islink(path):
             shift(path)
 PY
-python3 -I - "$stage" "$dest" <<'PY'
-import ctypes, os, sys
+# Replace under kiln's image registry lock (an flock on the images directory).
+# A name registered with `kiln image register` keeps its content: install
+# changed content under a new name, or `kiln image unregister alpine` first.
+python3 -I - "$stage" "$dest" /var/lib/kiln/image-registry/alpine <<'PY'
+import ctypes, fcntl, os, sys
 
-stage, dest = sys.argv[1:]
+stage, dest, entry = sys.argv[1:]
+lock = os.open(os.path.dirname(dest), os.O_RDONLY | os.O_DIRECTORY)
+fcntl.flock(lock, fcntl.LOCK_EX)
+try:
+    with open(entry, encoding="utf-8") as f:
+        registered = "state registered" in f.read().splitlines()
+except FileNotFoundError:
+    registered = False
+if registered:
+    sys.exit(f"{dest} is registered in the kiln image registry; refusing to replace it "
+             "(install under a new image name, or run: kiln image unregister alpine)")
 if not os.path.lexists(dest):
     os.rename(stage, dest)
 else:
