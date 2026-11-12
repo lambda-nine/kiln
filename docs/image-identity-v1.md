@@ -59,11 +59,22 @@ identity (`identity none image registry unusable: …`).
 - **Registering again.** Unchanged content in the same directory is a no-op.
   Anything else replaces the registration, and that is refused while the name
   is referenced (below).
-- **One real snapshot.** Registration walks the tree twice, and the two walks
-  must produce the same digest, entry count and byte count. Each directory's
-  own metadata must also be unchanged after its entries are walked. A tree
-  that changes during registration is refused rather than registered under a
-  digest of a state it never had.
+- **Registration needs a quiescent image.** Registration walks the tree
+  twice, and the two walks must produce the same digest, entry count and byte
+  count. Each directory's own metadata must also be unchanged after its
+  entries are walked. These checks catch an unsynchronized change made while
+  the image is being registered. They are not an atomic snapshot: a writer
+  that coordinates with the walk, for example by watching it with inotify, can
+  show both walks the same mixed state, and no finite number of walks rules
+  that out. So registration requires an image nobody is changing:
+  - cooperating installers, such as `fetch-alpine.sh`, hold the exclusive
+    images flock while they change an image;
+  - host root is trusted not to change an image while it is being registered.
+- **The digest counts only when re-verified.** Capture and fork rehash the
+  tree and compare it with the registration (`verify`). A mismatch, including
+  one from a digest of a state the tree never had, fails closed with no
+  checkpoint. A future version may close the gap by hashing a staged or
+  immutable copy of the image instead of the live directory.
 
 ## Serialization
 

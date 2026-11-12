@@ -339,9 +339,12 @@ pub fn register(roots: &Roots, name: &str) -> Result<Entry> {
     let _lock = lock(&roots.images, true)?;
     let dir = open_image(roots, name)?;
     let before = dir_identity(&dir)?;
-    // Two complete walks must agree, so the registered digest is one state
-    // the tree really had, not a mix of states from before and after a
-    // change that raced the first walk.
+    // Two complete walks must agree. This catches an unsynchronized change
+    // racing registration; it is not an atomic snapshot (a writer that
+    // coordinates with the walk can show both walks the same mixed state).
+    // Registration therefore requires a quiescent image, and the digest is
+    // authoritative only where capture and fork rehash and compare it,
+    // failing closed on a mismatch.
     let tree = tree_digest(&dir)?;
     let again = tree_digest(&dir)?;
     ensure!((tree.sha256, tree.entries, tree.bytes) == (again.sha256, again.entries, again.bytes),
@@ -1057,9 +1060,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Hardening from the adversarial review: a change racing registration
-    /// either fails the registration or is wholly included; a registered
-    /// digest always verifies immediately afterwards.
+    /// Hardening from the adversarial review: an unsynchronized change racing
+    /// registration either fails the registration or is wholly included, so
+    /// the digest verifies afterwards. (A writer that coordinates with the
+    /// walk is outside this check; registration requires a quiescent image.)
     #[test]
     fn registration_publishes_only_a_real_snapshot() {
         let (root, roots) = scratch("registration-race");

@@ -46,7 +46,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   - **Cancellation.** Driver closure cancels a pending probe or grant.
   - **Mount boundary.** The image walk refuses same-filesystem bind mounts by mount ID.
   - **Hardlinks.** The tree manifest records hardlink topology for every non-directory type.
-  - **Snapshot.** Registration must observe one unchanged snapshot (two agreeing walks, stable directories).
+  - **Quiescent registration.** Registration walks the tree twice and requires the walks to agree and the
+    directories to stay stable. This catches unsynchronized changes during registration, but it is not an
+    atomic snapshot. Registration requires a quiescent image, and capture and fork re-verify the digest,
+    which fails closed on a mismatch.
   - **Trusted registry.** A symlinked, foreign-owned or group- or world-writable registry root is refused
     everywhere.
 
