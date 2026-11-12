@@ -316,7 +316,7 @@ def scripted_frame(kind, payload):
     return struct.pack("<8sHHI", b"KILNEXO\0", 1, kind, len(payload)) + payload
 
 
-SCRIPTED_CAPS = scripted_frame(2, struct.pack("<IHHHH4x", 0x7f, 1, 1, 3, 4) + b"fakeshim")
+SCRIPTED_CAPS = scripted_frame(2, struct.pack("<IHHHH4x", 0x7f, 1, 1, 4, 4) + b"fakeshim")
 COMMAND_SUCCESS = scripted_frame(1, struct.pack("<BBBBiHHiI4x", 1, 1, 2, 0, 0, 0, 0, 0, 0))
 
 
