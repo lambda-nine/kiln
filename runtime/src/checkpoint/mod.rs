@@ -75,6 +75,8 @@ pub enum Reason {
     SpecMismatch,
     DiskTooSmall,
     Corrupt,
+    /// A generation-checked removal found another generation published.
+    GenerationMismatch,
     Io,
     InvalidRequest,
 }
@@ -91,6 +93,7 @@ impl Reason {
             Reason::SpecMismatch => "checkpoint_spec_mismatch",
             Reason::DiskTooSmall => "checkpoint_disk_too_small",
             Reason::Corrupt => "checkpoint_corrupt",
+            Reason::GenerationMismatch => "checkpoint_generation_mismatch",
             Reason::Io => "checkpoint_io",
             Reason::InvalidRequest => "invalid_request",
         }

@@ -163,12 +163,16 @@ enum CheckpointCommand {
         #[arg(long)]
         verify: bool,
     },
-    /// Remove an artifact and any staging of it.
+    /// Remove an artifact and any staging of it. With --generation, only
+    /// that capture generation: a published artifact of another one is
+    /// refused (checkpoint_generation_mismatch) and nothing is touched.
     Rm {
         #[arg(long)]
         instance: String,
         #[arg(long)]
         checkpoint: String,
+        #[arg(long)]
+        generation: Option<u64>,
     },
     /// List every artifact, staging and unknown entry, removing nothing.
     Ls,
@@ -381,7 +385,7 @@ fn run() -> Result<()> {
                     if verify { artifact.verify_objects()?; }
                     Ok(artifact.record(&artifact.charge(store.require_quota)?))
                 })(),
-                CheckpointCommand::Rm { instance, checkpoint } => store.remove(&instance, &checkpoint)
+                CheckpointCommand::Rm { instance, checkpoint, generation } => store.remove(&instance, &checkpoint, generation)
                     .map(|existed| format!("kiln-checkpoint-removed 1\nexisted {}\n", if existed { "yes" } else { "no" })),
                 CheckpointCommand::Ls => store.inventory_text(),
             };

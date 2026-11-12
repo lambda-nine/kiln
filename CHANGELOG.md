@@ -5,6 +5,14 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Make checkpoint removal generation-checked (kilnd checkpoint C3 adversarial
+  review, H1): `kiln checkpoint rm --generation G` reads the published header
+  under the exclusive lock and refuses another generation with the new
+  `checkpoint_generation_mismatch`, touching nothing; staging and interrupted
+  removals of other generations are left alone, and removal directories now
+  carry their generation (`.removing-C-G-PID-N`). Without `--generation`, `rm`
+  behaves as before.
+
 - Prepare the repository for public visibility: open the README with status,
   the four Lambda IX repositories, a quickstart and the license; drop a
   reference to an unrelated project from ARCHITECTURE.md and the agent notes;

@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(digest(&again), digest(&record), "a fork's checkpoint has the original content digest");
         // Deleting the checkpoint leaves forks intact.
         drop(artifact);
-        assert!(store.remove(INSTANCE, &cp(1)).unwrap());
+        assert!(store.remove(INSTANCE, &cp(1), None).unwrap());
         assert_eq!(fs::read(forks[1].join("workspace/a.txt")).unwrap(), b"alpha\n");
         assert!(store.open(INSTANCE, &cp(1), false).is_err());
         fs::set_permissions(forks[1].join("workspace/sub/deeper"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -419,6 +419,66 @@ mod tests {
     }
 
     use std::os::unix::fs::MetadataExt;
+
+    /// A generation-checked removal: another generation's artifact is refused and left
+    /// intact, other generations' staging is left alone, a live writer of this
+    /// generation is busy before anything changes, and an older kiln's unnamed
+    /// interrupted removal is left for an unchecked removal.
+    #[test]
+    fn generation_checked_removal_touches_only_its_generation() {
+        let root = scratch("rmgen");
+        fs::create_dir(root.join("runs")).unwrap();
+        let store = Store::under(&root.join("runs"), false);
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a"), b"one\n").unwrap();
+        capture_dir(&store, &src, &cp(5), 1 << 20).unwrap();
+        let idir = root.join("runs").join(super::super::store::NAMESPACE).join(INSTANCE);
+        let private = |name: &str| {
+            fs::create_dir(idir.join(name)).unwrap();
+            fs::set_permissions(idir.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let listed = || -> Vec<String> {
+            let mut v: Vec<String> = store.inventory().unwrap().into_iter().map(|(_, n, _)| n).collect();
+            v.sort();
+            v
+        };
+        private(&format!(".staging-{}-2-00000000000000aa", cp(5)));
+        private(&format!(".staging-{}-1-00000000000000bb", cp(5)));
+        private(&format!(".removing-{}-2-77-0", cp(5)));
+        private(&format!(".removing-{}-77-1", cp(5)));
+        let before = listed();
+        // Generation 2 while generation 1 is published: refused, nothing touched.
+        let e = store.remove(INSTANCE, &cp(5), Some(2)).unwrap_err();
+        assert_eq!(super::super::reason_of(&e), Reason::GenerationMismatch, "{e:#}");
+        assert_eq!(listed(), before);
+        store.open(INSTANCE, &cp(5), false).unwrap().verify_objects().unwrap();
+        // Zero is no generation.
+        let e = store.remove(INSTANCE, &cp(5), Some(0)).unwrap_err();
+        assert_eq!(super::super::reason_of(&e), Reason::InvalidRequest);
+        // A live writer of generation 1's staging makes generation 1's removal busy,
+        // with nothing removed.
+        let held = fs::File::open(idir.join(format!(".staging-{}-1-00000000000000bb", cp(5)))).unwrap();
+        assert_eq!(unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) }, 0);
+        let e = store.remove(INSTANCE, &cp(5), Some(1)).unwrap_err();
+        assert_eq!(super::super::reason_of(&e), Reason::Busy);
+        assert_eq!(listed(), before);
+        drop(held);
+        // Generation 1: its artifact and staging go; generation 2's and the unnamed
+        // interrupted removal stay.
+        assert!(store.remove(INSTANCE, &cp(5), Some(1)).unwrap());
+        assert_eq!(listed(), [format!(".removing-{}-2-77-0", cp(5)), format!(".removing-{}-77-1", cp(5)),
+            format!(".staging-{}-2-00000000000000aa", cp(5))]);
+        assert!(store.open(INSTANCE, &cp(5), false).is_err());
+        // Nothing of generation 3 exists: absent, as an unchecked removal reports it.
+        assert!(!store.remove(INSTANCE, &cp(5), Some(3)).unwrap());
+        // Generation 2 takes its staging and removal; the unchecked removal takes the rest.
+        assert!(store.remove(INSTANCE, &cp(5), Some(2)).unwrap());
+        assert_eq!(listed(), [format!(".removing-{}-77-1", cp(5))]);
+        assert!(store.remove(INSTANCE, &cp(5), None).unwrap());
+        assert!(listed().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn empty_upper_and_refusals_leave_no_staging() {
@@ -445,10 +505,10 @@ mod tests {
         fs::remove_file(src.join("big")).unwrap();
         assert_eq!(super::super::reason_of(&capture_dir(&store, &src, &cp(1), 1 << 20).unwrap_err()), Reason::Busy);
         // A shared reader blocks removal (busy), and removal is idempotent.
-        assert_eq!(super::super::reason_of(&store.remove(INSTANCE, &cp(1)).unwrap_err()), Reason::Busy);
+        assert_eq!(super::super::reason_of(&store.remove(INSTANCE, &cp(1), None).unwrap_err()), Reason::Busy);
         drop(a);
-        assert!(store.remove(INSTANCE, &cp(1)).unwrap());
-        assert!(!store.remove(INSTANCE, &cp(1)).unwrap());
+        assert!(store.remove(INSTANCE, &cp(1), None).unwrap());
+        assert!(!store.remove(INSTANCE, &cp(1), None).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -669,7 +729,7 @@ mod tests {
             super::super::store::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |phase: &str| {
                 if phase != "published" { return; }
                 let store = Store::under(&runs, false);
-                let removed = store.remove(INSTANCE, &checkpoint).map_err(|e| super::super::reason_of(&e));
+                let removed = store.remove(INSTANCE, &checkpoint, None).map_err(|e| super::super::reason_of(&e));
                 let opened = store.open(INSTANCE, &checkpoint, false).map(|_| ()).map_err(|e| super::super::reason_of(&e));
                 seen.borrow_mut().push((removed, opened));
             })));
@@ -681,7 +741,7 @@ mod tests {
         assert!(first.contains("\ngeneration 1\n") && first.contains("\nlogical-bytes 14\n"), "{first}");
         let store = Store::under(&runs, false);
         assert_eq!(store.open(INSTANCE, &checkpoint, false).unwrap().header.generation, 1);
-        store.remove(INSTANCE, &checkpoint).unwrap();
+        store.remove(INSTANCE, &checkpoint, None).unwrap();
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -748,7 +808,7 @@ mod tests {
                 eprintln!("restore elapsed={:?} VmHWM={} kB", started.elapsed(), hwm());
                 drop(artifact);
                 fs::remove_dir_all(&dest).unwrap();
-                store.remove(INSTANCE, &cp(404)).unwrap();
+                store.remove(INSTANCE, &cp(404), None).unwrap();
             }
             other => panic!("unknown step {other}"),
         }

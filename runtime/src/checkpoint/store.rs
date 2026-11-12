@@ -642,31 +642,79 @@ impl Store {
     /// Removes a checkpoint's published artifact and any staging or
     /// interrupted removal of it, under each one's exclusive lock (a capture
     /// or restore in progress makes this `checkpoint_busy`). Each directory is
-    /// renamed to `.removing-…` before deletion. Returns whether anything
-    /// existed; the instance directory stays.
-    pub fn remove(&self, instance: &str, checkpoint: &str) -> Result<bool> {
+    /// renamed to `.removing-<checkpoint>-<generation>-…` before deletion.
+    /// Returns whether anything existed; the instance directory stays.
+    ///
+    /// With `generation`, only that capture generation is removed, and every
+    /// check happens before anything is touched:
+    ///
+    /// - a published artifact of another generation is
+    ///   `checkpoint_generation_mismatch`, and one whose header can't be read
+    ///   (so its generation can't be proven) is `checkpoint_corrupt`;
+    /// - staging and removal directories of another generation are left
+    ///   alone, unlocked and uncounted; those of this generation are locked
+    ///   like the artifact, so a live writer makes the whole removal busy;
+    /// - an interrupted removal whose name and header name no generation
+    ///   (an older kiln's) is left alone.
+    ///
+    /// Without `generation` it removes every generation, as before.
+    pub fn remove(&self, instance: &str, checkpoint: &str, generation: Option<u64>) -> Result<bool> {
         validate_instance(instance)?;
         validate_checkpoint_id(checkpoint)?;
+        ensure!(generation != Some(0), refuse(Reason::InvalidRequest, "the generation must be nonzero"));
         let Some(root) = open_private_dir(None, &self.root, NAMESPACE, false)? else { return Ok(false) };
         let ipath = self.root.join(instance);
         let Some(ifd) = open_private_dir(Some(&root), &ipath, instance, false)? else { return Ok(false) };
-        let mut existed = false;
+        // Every directory this removal takes, locked, before the first change.
+        let mut doomed: Vec<(String, u64, OwnedFd)> = Vec::new();
         for name in names(&ifd)? {
             let Ok(name) = String::from_utf8(name) else { continue };
-            let ours = name == checkpoint || [".staging-", ".removing-"].iter()
-                .any(|p| name.starts_with(&format!("{p}{checkpoint}-")));
-            if !ours { continue; }
-            existed = true;
-            let dir = open_private_dir(Some(&ifd), &ipath.join(&name), &name, false)?
-                .with_context(|| format!("{name} vanished"))?;
+            let Some(kind) = Owned::of(&name, checkpoint) else { continue };
+            let open = || open_private_dir(Some(&ifd), &ipath.join(&name), &name, false)?
+                .with_context(|| format!("{name} vanished"));
+            let header_generation = |dir: &OwnedFd| -> Option<u64> {
+                let bytes = read_private(dir, HEADER, MAX_RECORD).ok()?;
+                Header::parse(std::str::from_utf8(&bytes).ok()?).ok()
+                    .filter(|h| h.instance == instance && h.checkpoint == checkpoint).map(|h| h.generation)
+            };
+            let (seen, dir) = match kind {
+                Owned::Published => {
+                    let dir = open()?;
+                    let seen = header_generation(&dir);
+                    match (generation, seen) {
+                        (Some(wanted), Some(seen)) if seen != wanted => {
+                            return Err(refuse(Reason::GenerationMismatch, format!(
+                                "the published checkpoint is generation {seen}, not {wanted}; nothing was removed")));
+                        }
+                        (Some(_), None) => {
+                            return Err(refuse(Reason::Corrupt,
+                                "the published checkpoint's header can't prove its generation; nothing was removed"));
+                        }
+                        _ => (seen, dir),
+                    }
+                }
+                Owned::Named(seen) => {
+                    if generation.is_some_and(|wanted| wanted != seen) { continue; }
+                    (Some(seen), open()?)
+                }
+                Owned::LegacyRemoving => {
+                    let dir = open()?;
+                    let seen = header_generation(&dir);
+                    if generation.is_some() && seen != generation { continue; }
+                    (seen, dir)
+                }
+            };
             flock(&dir, true)?;
-            let doomed = if name.starts_with(".removing-") { name.clone() }
-                else { format!(".removing-{checkpoint}-{}-{}", std::process::id(), next()) };
-            if doomed != name { rename(&ifd, &name, &doomed, libc::RENAME_NOREPLACE)?; sync(&ifd)?; }
-            fs::remove_dir_all(ipath.join(&doomed)).with_context(|| format!("delete {doomed}"))?;
+            doomed.push((name, seen.unwrap_or(0), dir));
+        }
+        for (name, seen, _lock) in &doomed {
+            let target = if name.starts_with(".removing-") { name.clone() }
+                else { format!(".removing-{checkpoint}-{seen}-{}-{}", std::process::id(), next()) };
+            if target != *name { rename(&ifd, name, &target, libc::RENAME_NOREPLACE)?; sync(&ifd)?; }
+            fs::remove_dir_all(ipath.join(&target)).with_context(|| format!("delete {target}"))?;
             sync(&ifd)?;
         }
-        Ok(existed)
+        Ok(!doomed.is_empty())
     }
 
     /// The image each artifact or staging directory references, for image
@@ -688,6 +736,35 @@ impl Store {
             out.push((label, image));
         }
         Ok(out)
+    }
+}
+
+/// What one name in an instance directory is to a removal of `checkpoint`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owned {
+    /// `<checkpoint>`: its generation is in its header.
+    Published,
+    /// `.staging-<checkpoint>-<G>-<nonce>` or `.removing-<checkpoint>-<G>-<pid>-<n>`
+    /// (`G` 0: removed without a known generation).
+    Named(u64),
+    /// `.removing-<checkpoint>-<pid>-<n>`, an older kiln's interrupted removal.
+    LegacyRemoving,
+}
+
+impl Owned {
+    fn of(name: &str, checkpoint: &str) -> Option<Self> {
+        if name == checkpoint { return Some(Owned::Published); }
+        let number = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+        if let Some(rest) = name.strip_prefix(&format!(".staging-{checkpoint}-")) {
+            return rest.split_once('-').and_then(|(g, _)| number(g)).map(Owned::Named);
+        }
+        let rest = name.strip_prefix(&format!(".removing-{checkpoint}-"))?;
+        let parts: Vec<&str> = rest.split('-').collect();
+        match parts.as_slice() {
+            [g, _, _] => number(g).map(Owned::Named),
+            [_, _] => Some(Owned::LegacyRemoving),
+            _ => None,
+        }
     }
 }
 

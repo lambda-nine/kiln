@@ -25,7 +25,7 @@ All need root.
 ```text
 kiln checkpoint capture --instance I --checkpoint C --generation G --max-bytes R ID
 kiln checkpoint inspect --instance I --checkpoint C [--verify]
-kiln checkpoint rm --instance I --checkpoint C
+kiln checkpoint rm --instance I --checkpoint C [--generation G]
 kiln checkpoint ls
 kiln create --from-checkpoint I/C [the usual create options]
 ```
@@ -67,6 +67,23 @@ limit-bytes <R>
   `existed yes|no`. `ls` prints `kiln-checkpoint-inventory 1` and one
   `published|staging|removing|unknown <instance or -> <name>` line per entry,
   and removes nothing.
+- `rm --generation G` removes only capture generation `G`, and decides
+  everything before touching anything:
+  - a published artifact whose header names another generation is
+    `checkpoint_generation_mismatch`, and one whose header can't be read (so
+    its generation can't be proven) is `checkpoint_corrupt`; either way
+    nothing is removed;
+  - `.staging-C-G-…` and `.removing-C-G-…` directories of `G` are locked and
+    removed with the artifact (a live writer of one makes the whole removal
+    `checkpoint_busy`); those of other generations are left alone, unlocked
+    and uncounted;
+  - an interrupted removal named by an older kiln (`.removing-C-PID-N`, no
+    generation) is removed only if its header names `G`, else left alone;
+  - `existed` counts only what `G` had; with nothing of `G`, it is `no`.
+
+  Without `--generation`, `rm` removes every generation as before (an
+  operator's removal). Removal renames each directory to
+  `.removing-C-G-PID-N` first (`G` 0 when unknown).
 - `kiln create --from-checkpoint` runs every check below before allocating
   anything (exit 124, the reason token at the start of the cause). A failure
   after allocation (a corrupt object found while copying, a full disk)
@@ -297,6 +314,7 @@ runtime paths and kernel xattr names appear as they are.
 | `checkpoint_size_limit` | Over 65,536 entries or a 16 MiB manifest; retained metadata over the 32 MiB worker heap budget; file bytes (each file rounded up to 4 KiB) plus 16 KiB per entry over R; the artifact's quota filled; or the final charge S over R. |
 | `checkpoint_io` | A source entry changed or was replaced during the copy, PID 1 ended the lease, the run's identity or metadata changed, or the release failed. |
 | `checkpoint_corrupt` | Any artifact check failed (below). |
+| `checkpoint_generation_mismatch` | `rm --generation G` found a published artifact of another generation; nothing was removed. |
 | `invalid_request` | A malformed ID or limit, or a missing sandbox or checkpoint. |
 
 Fork refusals add `checkpoint_spec_mismatch` (image name, root-write policy

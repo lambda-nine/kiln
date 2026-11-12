@@ -457,6 +457,26 @@ def run_allowance():
     print("ok: worst-case metadata restores within S")
 
 
+def run_generation_rm():
+    """kilnd C3 adversarial review H1: a removal naming another generation must
+    leave the published artifact intact."""
+    src = create()
+    sh(src, "echo generation-one > /workspace/generation")
+    captured(src, 61)
+    checkpoint = ("--instance", INSTANCE, "--checkpoint", cp(61))
+    refused(kiln("checkpoint", "rm", *checkpoint, "--generation", "2", check=False),
+            "checkpoint_generation_mismatch", "generation 1")
+    assert record(kiln("checkpoint", "inspect", *checkpoint, "--verify").stdout)["generation"] == "1"
+    out = kiln("checkpoint", "rm", *checkpoint, "--generation", "3", check=False)
+    assert out.returncode == 125, out
+    out = kiln("checkpoint", "rm", *checkpoint, "--generation", "1").stdout.decode()
+    assert out == "kiln-checkpoint-removed 1\nexisted yes\n", out
+    out = kiln("checkpoint", "rm", *checkpoint, "--generation", "1").stdout.decode()
+    assert out == "kiln-checkpoint-removed 1\nexisted no\n", out
+    remove(src)
+    print("ok: generation-checked removal refuses another generation and keeps its artifact")
+
+
 def run_namespace():
     for d in (CPS, f"{CPS}/{INSTANCE}"):
         if not os.path.isdir(d):
@@ -479,6 +499,7 @@ def main():
         subprocess.run(["cp", "-a", f"{IMAGES}/alpine", f"{IMAGES}/{IMAGE}"], check=True, timeout=120)
         kiln("image", "register", IMAGE, timeout=300)
         run_namespace()
+        run_generation_rm()
         run_round_trip()
         run_refusals()
         run_fork_refusals()
