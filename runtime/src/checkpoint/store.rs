@@ -33,7 +33,7 @@ use anyhow::{Context, Result, bail, ensure};
 use nix::errno::Errno;
 
 use super::manifest::{Body, Manifest, Stats, content_sha256};
-use super::walk::{Bookkeeping, Sink, copy_and_hash, fstat, openat, openat_mode};
+use super::walk::{Bookkeeping, Sink, copy_and_hash, fstat, fstatat, openat, openat_mode};
 use super::{BINDING_DOMAIN, ENTRY_ALLOWANCE, FORMAT, MAX_LIMIT_BYTES, MAX_MANIFEST_BYTES, MIN_LIMIT_BYTES, Reason,
     hex32, refuse, validate_checkpoint_id, validate_instance};
 use crate::sha256::{Sha256, hex};
@@ -76,8 +76,13 @@ fn nonce() -> Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-// Test hooks at the capture's transitions (`staged`: validated, before the
-// charge check; `published`: renamed, before the reply).
+// Test hooks (compiled out of non-test builds): the capture's transitions
+// (`begin_checked`: the namespace was found free, before the staging
+// directory is created; `staged`: validated, before the charge check;
+// `published`: renamed, before the reply) and the removal's (`remove_opened`:
+// a directory was opened, before it is locked; `remove_locked`: everything is
+// locked and checked, before the first change; `remove_renamed`: a directory
+// carries its removal name, before it is deleted).
 #[cfg(test)]
 pub(crate) type Hook = Option<Box<dyn FnMut(&str)>>;
 #[cfg(test)]
@@ -87,7 +92,8 @@ thread_local! {
 
 fn hook(_phase: &str) {
     #[cfg(test)]
-    HOOK.with(|h| if let Some(f) = h.borrow_mut().as_mut() { f(_phase) });
+    // A hook's own store calls don't re-enter it.
+    HOOK.with(|h| if let Ok(mut f) = h.try_borrow_mut() && let Some(f) = f.as_mut() { f(_phase) });
 }
 
 pub fn object_name(n: u32) -> String { format!("{n:08x}") }
@@ -347,6 +353,7 @@ impl Store {
         let taken = names(&instance)?.into_iter().any(|n| n == header.checkpoint.as_bytes()
             || [".staging-", ".removing-"].iter().any(|p| n.starts_with(format!("{p}{}-", header.checkpoint).as_bytes())));
         ensure!(!taken, refuse(Reason::Busy, format!("checkpoint {} already exists or has an operation", header.checkpoint)));
+        hook("begin_checked");
         let name = staging_name(&header.checkpoint, header.generation, nonce()?);
         let path = ipath.join(&name);
         let cname = cstr(&name)?;
@@ -645,19 +652,34 @@ impl Store {
     /// renamed to `.removing-<checkpoint>-<generation>-…` before deletion.
     /// Returns whether anything existed; the instance directory stays.
     ///
+    /// Names are rebound: once a removal deletes a checkpoint, a capture may
+    /// publish a new generation under the same name. So every directory is
+    /// opened, locked, and only then proven to be what its name still denotes
+    /// (same device and inode); nothing inside it is trusted before that. A
+    /// name that no longer denotes the locked directory (or is gone) makes the
+    /// removal `checkpoint_busy` with nothing changed. While the lock is held
+    /// the binding can't change: every rename or deletion of an entry here is
+    /// made by a holder of that entry's exclusive lock, and publication only
+    /// creates a name (`RENAME_NOREPLACE`). After its rename, each directory
+    /// is proven again under its removal name before it is deleted.
+    ///
     /// With `generation`, only that capture generation is removed, and every
     /// check happens before anything is touched:
     ///
     /// - a published artifact of another generation is
     ///   `checkpoint_generation_mismatch`, and one whose header can't be read
     ///   (so its generation can't be proven) is `checkpoint_corrupt`;
-    /// - staging and removal directories of another generation are left
-    ///   alone, unlocked and uncounted; those of this generation are locked
-    ///   like the artifact, so a live writer makes the whole removal busy;
-    /// - an interrupted removal whose name and header name no generation
-    ///   (an older kiln's) is left alone.
+    /// - staging and removal directories named with another generation are
+    ///   left alone, unlocked and uncounted; those of this generation are
+    ///   locked like the artifact, so a live writer makes the whole removal
+    ///   busy;
+    /// - an interrupted removal whose name names no generation (an older
+    ///   kiln's) is locked and removed only if its header names this one;
+    /// - names that start like this checkpoint's staging or removal names but
+    ///   don't parse are left alone.
     ///
-    /// Without `generation` it removes every generation, as before.
+    /// Without `generation` it removes every generation, and every name that
+    /// starts like this checkpoint's staging or removal names, as before.
     pub fn remove(&self, instance: &str, checkpoint: &str, generation: Option<u64>) -> Result<bool> {
         validate_instance(instance)?;
         validate_checkpoint_id(checkpoint)?;
@@ -665,22 +687,32 @@ impl Store {
         let Some(root) = open_private_dir(None, &self.root, NAMESPACE, false)? else { return Ok(false) };
         let ipath = self.root.join(instance);
         let Some(ifd) = open_private_dir(Some(&root), &ipath, instance, false)? else { return Ok(false) };
-        // Every directory this removal takes, locked, before the first change.
+        let changed = |name: &str| refuse(Reason::Busy, format!(
+            "{name} changed while this removal checked it; nothing was removed"));
+        // Every directory this removal takes, locked and proven, before the first change.
         let mut doomed: Vec<(String, u64, OwnedFd)> = Vec::new();
         for name in names(&ifd)? {
             let Ok(name) = String::from_utf8(name) else { continue };
             let Some(kind) = Owned::of(&name, checkpoint) else { continue };
-            let open = || open_private_dir(Some(&ifd), &ipath.join(&name), &name, false)?
-                .with_context(|| format!("{name} vanished"));
-            let header_generation = |dir: &OwnedFd| -> Option<u64> {
-                let bytes = read_private(dir, HEADER, MAX_RECORD).ok()?;
+            // Generations in names decide before anything is opened.
+            match (kind, generation) {
+                (Owned::Named(seen), Some(wanted)) if seen != wanted => continue,
+                (Owned::Malformed, Some(_)) => continue,
+                _ => {}
+            }
+            let dir = open_private_dir(Some(&ifd), &ipath.join(&name), &name, false)?.ok_or_else(|| changed(&name))?;
+            hook("remove_opened");
+            flock(&dir, true)?;
+            ensure!(denotes(&ifd, &name, &dir)?, changed(&name));
+            // Only now is its header this name's header.
+            let header_generation = || -> Option<u64> {
+                let bytes = read_private(&dir, HEADER, MAX_RECORD).ok()?;
                 Header::parse(std::str::from_utf8(&bytes).ok()?).ok()
                     .filter(|h| h.instance == instance && h.checkpoint == checkpoint).map(|h| h.generation)
             };
-            let (seen, dir) = match kind {
+            let seen = match kind {
                 Owned::Published => {
-                    let dir = open()?;
-                    let seen = header_generation(&dir);
+                    let seen = header_generation();
                     match (generation, seen) {
                         (Some(wanted), Some(seen)) if seen != wanted => {
                             return Err(refuse(Reason::GenerationMismatch, format!(
@@ -690,27 +722,27 @@ impl Store {
                             return Err(refuse(Reason::Corrupt,
                                 "the published checkpoint's header can't prove its generation; nothing was removed"));
                         }
-                        _ => (seen, dir),
+                        _ => seen,
                     }
                 }
-                Owned::Named(seen) => {
-                    if generation.is_some_and(|wanted| wanted != seen) { continue; }
-                    (Some(seen), open()?)
-                }
+                Owned::Named(seen) => Some(seen),
                 Owned::LegacyRemoving => {
-                    let dir = open()?;
-                    let seen = header_generation(&dir);
+                    let seen = header_generation();
                     if generation.is_some() && seen != generation { continue; }
-                    (seen, dir)
+                    seen
                 }
+                Owned::Malformed => None,
             };
-            flock(&dir, true)?;
             doomed.push((name, seen.unwrap_or(0), dir));
         }
-        for (name, seen, _lock) in &doomed {
+        hook("remove_locked");
+        for (name, seen, held) in &doomed {
             let target = if name.starts_with(".removing-") { name.clone() }
                 else { format!(".removing-{checkpoint}-{seen}-{}-{}", std::process::id(), next()) };
             if target != *name { rename(&ifd, name, &target, libc::RENAME_NOREPLACE)?; sync(&ifd)?; }
+            ensure!(denotes(&ifd, &target, held)?, refuse(Reason::Io, format!(
+                "{target} is not the directory this removal locked; it was left in place")));
+            hook("remove_renamed");
             fs::remove_dir_all(ipath.join(&target)).with_context(|| format!("delete {target}"))?;
             sync(&ifd)?;
         }
@@ -749,6 +781,9 @@ enum Owned {
     Named(u64),
     /// `.removing-<checkpoint>-<pid>-<n>`, an older kiln's interrupted removal.
     LegacyRemoving,
+    /// Any other name starting `.staging-<checkpoint>-` or
+    /// `.removing-<checkpoint>-`: swept only by an unchecked removal.
+    Malformed,
 }
 
 impl Owned {
@@ -756,15 +791,26 @@ impl Owned {
         if name == checkpoint { return Some(Owned::Published); }
         let number = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
         if let Some(rest) = name.strip_prefix(&format!(".staging-{checkpoint}-")) {
-            return rest.split_once('-').and_then(|(g, _)| number(g)).map(Owned::Named);
+            return Some(rest.split_once('-').and_then(|(g, _)| number(g)).map_or(Owned::Malformed, Owned::Named));
         }
         let rest = name.strip_prefix(&format!(".removing-{checkpoint}-"))?;
         let parts: Vec<&str> = rest.split('-').collect();
-        match parts.as_slice() {
-            [g, _, _] => number(g).map(Owned::Named),
-            [_, _] => Some(Owned::LegacyRemoving),
-            _ => None,
-        }
+        Some(match parts.as_slice() {
+            [g, _, _] => number(g).map_or(Owned::Malformed, Owned::Named),
+            [_, _] => Owned::LegacyRemoving,
+            _ => Owned::Malformed,
+        })
+    }
+}
+
+/// Whether `name` in `dir` still denotes the open directory `held`: the same
+/// device and inode, not following a link. A missing name denotes nothing.
+fn denotes(dir: &OwnedFd, name: &str, held: &OwnedFd) -> Result<bool> {
+    let ours = fstat(held.as_raw_fd())?;
+    match fstatat(dir.as_raw_fd(), &cstr(name)?) {
+        Ok(st) => Ok(st.st_dev == ours.st_dev && st.st_ino == ours.st_ino),
+        Err(e) if e.downcast_ref::<Errno>() == Some(&Errno::ENOENT) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

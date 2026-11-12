@@ -5,6 +5,16 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Bind checkpoint removal to the directories it checked (kilnd checkpoint C3
+  adversarial recheck, H1-R1): `kiln checkpoint rm` now locks each directory
+  before reading its header, and checks that the name still denotes the
+  locked directory (same device and inode) before trusting it and again after
+  renaming it. A remover that lost a race to another removal and a capture of
+  a new generation under the same name is `checkpoint_busy` and removes
+  nothing, instead of deleting the new generation. Unchecked `rm` sweeps
+  malformed `.staging-C-*` and `.removing-C-*` names again, as before
+  generation-checked removal; `rm --generation` still leaves them alone.
+
 - Make checkpoint removal generation-checked (kilnd checkpoint C3 adversarial
   review, H1): `kiln checkpoint rm --generation G` reads the published header
   under the exclusive lock and refuses another generation with the new

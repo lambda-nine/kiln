@@ -480,6 +480,162 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Runs `f` on its own thread with the store's test hook set: at each
+    /// phase in `pause`, the thread reports the phase and waits for a go.
+    fn paused<T: Send + 'static>(pause: &'static [&'static str], f: impl FnOnce() -> T + Send + 'static)
+        -> (std::sync::mpsc::Receiver<&'static str>, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<T>) {
+        let (at_tx, at_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            super::super::store::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if let Some(p) = pause.iter().find(|p| **p == phase) {
+                    at_tx.send(*p).unwrap();
+                    go_rx.recv().unwrap();
+                }
+            })));
+            let out = f();
+            super::super::store::HOOK.with(|h| *h.borrow_mut() = None);
+            out
+        });
+        (at_rx, go_tx, thread)
+    }
+
+    fn reached(at: &std::sync::mpsc::Receiver<&'static str>, phase: &str) {
+        assert_eq!(at.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), phase);
+    }
+
+    fn capture_generation(store: &Store, src: &Path, checkpoint: &str, generation: u64) -> Result<String> {
+        let mut h = header(checkpoint, 1 << 20);
+        h.generation = generation;
+        let opts = Options { generated: &[], budget: 1 << 20, ids: me() };
+        write_artifact(store, &h, &open_dir(src)?, &opts, &manifest_of, &mut |_| Ok(()))
+    }
+
+    /// Adversarial review regression (rebound name): a remover that opened
+    /// generation 1, then lost the race to another removal and a capture that
+    /// published generation 2 under the same name, must not remove generation
+    /// 2, whether it checks a generation or not.
+    #[test]
+    fn a_stale_removal_never_deletes_a_replacement_generation() {
+        for (n, generation) in [(499, Some(1)), (498, None)] {
+            let root = scratch("rm-rebound");
+            let runs = root.join("runs");
+            fs::create_dir(&runs).unwrap();
+            let src = root.join("src");
+            fs::create_dir(&src).unwrap();
+            fs::write(src.join("a"), b"generation one\n").unwrap();
+            let checkpoint = cp(n);
+            let store = Store::under(&runs, false);
+            capture_dir(&store, &src, &checkpoint, 1 << 20).unwrap();
+            let (thread_runs, thread_checkpoint) = (runs.clone(), checkpoint.clone());
+            let (at, go, stale) = paused(&["remove_opened"], move ||
+                Store::under(&thread_runs, false).remove(INSTANCE, &thread_checkpoint, generation));
+            reached(&at, "remove_opened");
+            // Meanwhile another removal takes generation 1, and generation 2 is published.
+            assert!(store.remove(INSTANCE, &checkpoint, Some(1)).unwrap());
+            fs::write(src.join("a"), b"generation two\n").unwrap();
+            let record = capture_generation(&store, &src, &checkpoint, 2).unwrap();
+            assert!(record.contains("\ngeneration 2\n"), "{record}");
+            go.send(()).unwrap();
+            let e = stale.join().unwrap().expect_err("the stale removal removed something");
+            assert_eq!(super::super::reason_of(&e), Reason::Busy, "{e:#}");
+            let after = store.open(INSTANCE, &checkpoint, false).expect("generation 2 was removed");
+            assert_eq!(after.header.generation, 2);
+            after.verify_objects().unwrap();
+            drop(after);
+            assert_eq!(store.inventory().unwrap().len(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// The opposite interleaving: a capture that was admitted before
+    /// generation 1 was published reaches publication while a generation-1
+    /// removal holds its locks. Before the rename the name is taken and the
+    /// capture is busy; after it, the capture publishes generation 2 and the
+    /// removal deletes only the directory it locked.
+    #[test]
+    fn a_capture_publishing_during_a_removal_keeps_its_generation() {
+        for (n, remover_at) in [(497, "remove_locked"), (496, "remove_renamed")] {
+            let root = scratch("rm-publish");
+            let runs = root.join("runs");
+            fs::create_dir(&runs).unwrap();
+            let (one, two) = (root.join("one"), root.join("two"));
+            fs::create_dir(&one).unwrap();
+            fs::create_dir(&two).unwrap();
+            fs::write(one.join("a"), b"generation one\n").unwrap();
+            fs::write(two.join("a"), b"generation two\n").unwrap();
+            let checkpoint = cp(n);
+            let store = Store::under(&runs, false);
+            // Generation 2's capture finds the name free, then generation 1 is published.
+            let (r, c, t) = (runs.clone(), checkpoint.clone(), two.clone());
+            let (cat, cgo, capture) = paused(&["begin_checked", "staged"], move ||
+                capture_generation(&Store::under(&r, false), &t, &c, 2));
+            reached(&cat, "begin_checked");
+            capture_dir(&store, &one, &checkpoint, 1 << 20).unwrap();
+            cgo.send(()).unwrap();
+            reached(&cat, "staged");
+            // Generation 1's removal locks everything (generation 2's staging is
+            // another generation's, left alone) and pauses.
+            let (r, c) = (runs.clone(), checkpoint.clone());
+            let pause: &'static [&'static str] = if remover_at == "remove_locked" { &["remove_locked"] }
+                else { &["remove_renamed"] };
+            let (rat, rgo, remover) = paused(pause, move || Store::under(&r, false).remove(INSTANCE, &c, Some(1)));
+            reached(&rat, remover_at);
+            cgo.send(()).unwrap();
+            let published = capture.join().unwrap();
+            rgo.send(()).unwrap();
+            assert!(remover.join().unwrap().unwrap());
+            let names: Vec<String> = store.inventory().unwrap().into_iter().map(|(_, n, _)| n).collect();
+            if remover_at == "remove_locked" {
+                let e = published.expect_err("published over a locked artifact");
+                assert_eq!(super::super::reason_of(&e), Reason::Busy, "{e:#}");
+                assert!(names.is_empty(), "{names:?}");
+            } else {
+                assert!(published.unwrap().contains("\ngeneration 2\n"));
+                assert_eq!(names, std::slice::from_ref(&checkpoint));
+                let after = store.open(INSTANCE, &checkpoint, false).unwrap();
+                assert_eq!(after.header.generation, 2);
+                after.verify_objects().unwrap();
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// An unchecked removal sweeps every name that starts like the
+    /// checkpoint's staging or removal names, as before generations were
+    /// checked; a checked removal leaves the ones it can't parse alone.
+    #[test]
+    fn an_unchecked_removal_sweeps_malformed_names() {
+        let root = scratch("rm-malformed");
+        fs::create_dir(root.join("runs")).unwrap();
+        let store = Store::under(&root.join("runs"), false);
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a"), b"one\n").unwrap();
+        capture_dir(&store, &src, &cp(6), 1 << 20).unwrap();
+        let idir = root.join("runs").join(super::super::store::NAMESPACE).join(INSTANCE);
+        let malformed = [format!(".staging-{}-x", cp(6)), format!(".staging-{}-5", cp(6)),
+            format!(".removing-{}-a-b-c-d", cp(6)), format!(".removing-{}-x-1-2", cp(6))];
+        for name in &malformed {
+            fs::create_dir(idir.join(name)).unwrap();
+            fs::set_permissions(idir.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let listed = || -> Vec<String> {
+            let mut v: Vec<String> = store.inventory().unwrap().into_iter().map(|(_, n, _)| n).collect();
+            v.sort();
+            v
+        };
+        let mut left = malformed.to_vec();
+        left.sort();
+        assert!(store.remove(INSTANCE, &cp(6), Some(1)).unwrap());
+        assert_eq!(listed(), left);
+        assert!(!store.remove(INSTANCE, &cp(6), Some(1)).unwrap());
+        assert_eq!(listed(), left);
+        assert!(store.remove(INSTANCE, &cp(6), None).unwrap());
+        assert!(listed().is_empty(), "{:?}", listed());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn empty_upper_and_refusals_leave_no_staging() {
         let root = scratch("empty");
@@ -762,6 +918,7 @@ mod tests {
         {
             let (runs, checkpoint, observed) = (runs.clone(), checkpoint.clone(), observed.clone());
             super::super::store::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if !["staged", "published"].contains(&phase) { return; }
                 let store = Store::under(&runs, false);
                 observed.borrow_mut().push((phase.to_owned(), store.open(INSTANCE, &checkpoint, false).is_ok()));
             })));

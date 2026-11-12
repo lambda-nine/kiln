@@ -78,12 +78,31 @@ limit-bytes <R>
     `checkpoint_busy`); those of other generations are left alone, unlocked
     and uncounted;
   - an interrupted removal named by an older kiln (`.removing-C-PID-N`, no
-    generation) is removed only if its header names `G`, else left alone;
+    generation) is locked to read its header, and removed only if the
+    header names `G`, else left alone;
+  - names that start `.staging-C-` or `.removing-C-` but don't parse are
+    left alone;
   - `existed` counts only what `G` had; with nothing of `G`, it is `no`.
 
-  Without `--generation`, `rm` removes every generation as before (an
-  operator's removal). Removal renames each directory to
-  `.removing-C-G-PID-N` first (`G` 0 when unknown).
+  Without `--generation`, `rm` removes every generation and every name that
+  starts `.staging-C-` or `.removing-C-`, as before (an operator's removal).
+  Removal renames each directory to `.removing-C-G-PID-N` first (`G` 0 when
+  unknown).
+
+  A checkpoint's name is reused: once one removal deletes it, a capture may
+  publish a new generation as `C`. So `rm` opens each directory, takes its
+  exclusive lock, and only then checks that the name still denotes that
+  directory (same device and inode) before reading its header or counting
+  it. A name that has since been rebound, or is gone, makes the removal
+  `checkpoint_busy` with nothing removed, with or without `--generation`.
+  While the lock is held the name can't be rebound: every rename or deletion
+  of a checkpoint directory is made under that directory's exclusive lock
+  (by this kiln or a later one; an older kiln's `rm` doesn't check), and
+  publication only creates a name, never replacing one. After the rename,
+  `rm` checks again that its removal name denotes the locked directory before
+  deleting it. A capture that publishes while `rm` holds its locks is
+  `checkpoint_busy` until `rm` has renamed the old artifact away, and the
+  new generation it publishes after that is never touched.
 - `kiln create --from-checkpoint` runs every check below before allocating
   anything (exit 124, the reason token at the start of the cause). A failure
   after allocation (a corrupt object found while copying, a full disk)
@@ -129,7 +148,8 @@ flock follows the directory through its rename into place, so nobody can
 open, remove or replace the artifact before the capture has answered.
 `inspect` and a fork's restore hold a shared lock on the artifact for as
 long as they read it; `rm` takes an exclusive one on each directory it
-removes. All are non-blocking: a held lock is `checkpoint_busy`. Two
+removes, before reading it, and checks the name still denotes it (above).
+All are non-blocking: a held lock is `checkpoint_busy`. Two
 captures of one checkpoint may both stage; exactly one rename succeeds, and
 the other is `checkpoint_busy` and removes only its own staging directory.
 
@@ -307,7 +327,7 @@ runtime paths and kernel xattr names appear as they are.
 | Reason | When |
 |---|---|
 | `sandbox_unsupported:workspace_checkpoint` | The run has no image identity, no verified layout or no policy record (an older kiln created it), or its PID 1 doesn't grant leases. |
-| `checkpoint_busy` | The source runs or queues a command, holds another lease, or the checkpoint already exists or has an operation. |
+| `checkpoint_busy` | The source runs or queues a command, holds another lease, or the checkpoint already exists or has an operation; or `rm` found a name rebound to another directory after it opened it. |
 | `checkpoint_layout_unsupported` | A protected-path violation (anything beneath `/dev`, `/proc` or `/sys/fs/cgroup`; a mount target or ancestor that is not a plain, non-opaque directory; `/etc` not a directory when DNS is generated); a generated file replaced by a directory or hardlinked; a mount crossing; a path over 4,096 bytes or deeper than 128; a writable path overlapping a reserved one, or absent or not a plain directory in the merged view (read-only root). |
 | `checkpoint_metadata_unsupported` | A FIFO, socket, block device or non-whiteout character device; a POSIX ACL; a file capability; any other `security.*`, `trusted.*` or `system.*` xattr; an overlay redirect, metacopy, index handle (`upper`, `nlink`), xattr whiteout or its `opaque=x` marker, escaped (`trusted.overlay.overlay.*`), misplaced or unknown overlay xattr; a `user.overlay.*` xattr; a user xattr on a symlink or whiteout; more than 32 user xattrs or 4 KiB of them; an owner outside the sandbox range; a hardlink with names outside the upper; a hardlinked symlink; a symlink target over 1,023 bytes. |
 | `checkpoint_image_unavailable` | The image is no longer registered with the generation, digest and directory the source recorded, or its rehash differs. |
