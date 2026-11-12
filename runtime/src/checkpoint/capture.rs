@@ -480,6 +480,21 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Retries `f` while it is `checkpoint_busy`. Other tests in this binary
+    /// fork children, and a child forked while a capture or removal held a
+    /// lock keeps a copy of that descriptor (and so the lock) until it execs;
+    /// the race tests below must not mistake that for the interleaving under
+    /// test.
+    fn unbusy<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+        for _ in 0..200 {
+            match f() {
+                Err(e) if super::super::reason_of(&e) == Reason::Busy => std::thread::sleep(std::time::Duration::from_millis(10)),
+                other => return other,
+            }
+        }
+        f()
+    }
+
     /// Runs `f` on its own thread with the store's test hook set: at each
     /// phase in `pause`, the thread reports the phase and waits for a go.
     fn paused<T: Send + 'static>(pause: &'static [&'static str], f: impl FnOnce() -> T + Send + 'static)
@@ -532,14 +547,14 @@ mod tests {
                 Store::under(&thread_runs, false).remove(INSTANCE, &thread_checkpoint, generation));
             reached(&at, "remove_opened");
             // Meanwhile another removal takes generation 1, and generation 2 is published.
-            assert!(store.remove(INSTANCE, &checkpoint, Some(1)).unwrap());
+            assert!(unbusy(|| store.remove(INSTANCE, &checkpoint, Some(1))).unwrap());
             fs::write(src.join("a"), b"generation two\n").unwrap();
-            let record = capture_generation(&store, &src, &checkpoint, 2).unwrap();
+            let record = unbusy(|| capture_generation(&store, &src, &checkpoint, 2)).unwrap();
             assert!(record.contains("\ngeneration 2\n"), "{record}");
             go.send(()).unwrap();
             let e = stale.join().unwrap().expect_err("the stale removal removed something");
             assert_eq!(super::super::reason_of(&e), Reason::Busy, "{e:#}");
-            let after = store.open(INSTANCE, &checkpoint, false).expect("generation 2 was removed");
+            let after = unbusy(|| store.open(INSTANCE, &checkpoint, false)).expect("generation 2 was removed");
             assert_eq!(after.header.generation, 2);
             after.verify_objects().unwrap();
             drop(after);
@@ -579,7 +594,7 @@ mod tests {
             let (r, c) = (runs.clone(), checkpoint.clone());
             let pause: &'static [&'static str] = if remover_at == "remove_locked" { &["remove_locked"] }
                 else { &["remove_renamed"] };
-            let (rat, rgo, remover) = paused(pause, move || Store::under(&r, false).remove(INSTANCE, &c, Some(1)));
+            let (rat, rgo, remover) = paused(pause, move || unbusy(|| Store::under(&r, false).remove(INSTANCE, &c, Some(1))));
             reached(&rat, remover_at);
             cgo.send(()).unwrap();
             let published = capture.join().unwrap();
@@ -593,7 +608,7 @@ mod tests {
             } else {
                 assert!(published.unwrap().contains("\ngeneration 2\n"));
                 assert_eq!(names, std::slice::from_ref(&checkpoint));
-                let after = store.open(INSTANCE, &checkpoint, false).unwrap();
+                let after = unbusy(|| store.open(INSTANCE, &checkpoint, false)).unwrap();
                 assert_eq!(after.header.generation, 2);
                 after.verify_objects().unwrap();
             }
@@ -627,11 +642,11 @@ mod tests {
         };
         let mut left = malformed.to_vec();
         left.sort();
-        assert!(store.remove(INSTANCE, &cp(6), Some(1)).unwrap());
+        assert!(unbusy(|| store.remove(INSTANCE, &cp(6), Some(1))).unwrap());
         assert_eq!(listed(), left);
-        assert!(!store.remove(INSTANCE, &cp(6), Some(1)).unwrap());
+        assert!(!unbusy(|| store.remove(INSTANCE, &cp(6), Some(1))).unwrap());
         assert_eq!(listed(), left);
-        assert!(store.remove(INSTANCE, &cp(6), None).unwrap());
+        assert!(unbusy(|| store.remove(INSTANCE, &cp(6), None)).unwrap());
         assert!(listed().is_empty(), "{:?}", listed());
         fs::remove_dir_all(root).unwrap();
     }
