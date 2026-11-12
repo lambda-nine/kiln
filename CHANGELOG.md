@@ -5,6 +5,14 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Narrow the documented checkpoint lock invariant and pin the stale-removal
+  detail (kilnd checkpoint C3 adversarial recheck, L2 and L3): the invariant
+  now covers published and `.removing-*` directories, naming a capture's
+  unlocked cleanup of its own fresh staging directory as the one safe
+  exception, and the stale-removal regression asserts the binding check's
+  "changed while this removal checked it" detail, not just `checkpoint_busy`.
+  No behaviour change.
+
 - Bind checkpoint removal to the directories it checked (kilnd checkpoint C3
   adversarial recheck, H1-R1): `kiln checkpoint rm` now locks each directory
   before reading its header, and checks that the name still denotes the

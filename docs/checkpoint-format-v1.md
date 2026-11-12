@@ -96,9 +96,17 @@ limit-bytes <R>
   it. A name that has since been rebound, or is gone, makes the removal
   `checkpoint_busy` with nothing removed, with or without `--generation`.
   While the lock is held the name can't be rebound: every rename or deletion
-  of a checkpoint directory is made under that directory's exclusive lock
-  (by this kiln or a later one; an older kiln's `rm` doesn't check), and
-  publication only creates a name, never replacing one. After the rename,
+  of a published `C` or `.removing-C-*` directory is made under that
+  directory's exclusive lock (by this kiln or a later one; an older kiln's
+  `rm` doesn't check), and publication only creates a name, never replacing
+  one. The one exception is a capture's own failure cleanup of its fresh
+  `.staging-C-G-<nonce>` directory, which may delete it unlocked. That is
+  safe: it deletes only the staging name, whose nonce is fresh and random,
+  which is never adopted or created again and leaves only by a rename under
+  its lock (publication or `rm`), so it removes the capture's own directory
+  or nothing, never a published or `.removing-C-*` one; at worst an `rm`
+  holding that staging lock finds the name gone at its rename and returns
+  an error. After the rename,
   `rm` checks again that its removal name denotes the locked directory before
   deleting it. A capture that publishes while `rm` holds its locks is
   `checkpoint_busy` until `rm` has renamed the old artifact away, and the

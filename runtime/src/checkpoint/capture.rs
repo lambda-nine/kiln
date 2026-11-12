@@ -554,6 +554,10 @@ mod tests {
             go.send(()).unwrap();
             let e = stale.join().unwrap().expect_err("the stale removal removed something");
             assert_eq!(super::super::reason_of(&e), Reason::Busy, "{e:#}");
+            // Busy from the binding check itself, not from a forked child that
+            // still holds generation 1's lock.
+            let detail = format!("{checkpoint} changed while this removal checked it; nothing was removed");
+            assert!(format!("{e:#}").contains(&detail), "{e:#}");
             let after = unbusy(|| store.open(INSTANCE, &checkpoint, false)).expect("generation 2 was removed");
             assert_eq!(after.header.generation, 2);
             after.verify_objects().unwrap();

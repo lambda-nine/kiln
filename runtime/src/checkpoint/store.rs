@@ -368,6 +368,8 @@ impl Store {
         // From here the directory is ours, and Drop removes it on failure.
         let dir = match openat(&instance, &cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
             Ok(dir) => dir,
+            // Unlocked: the one exception to `Store::remove`'s lock invariant
+            // (a capture's own fresh staging name; see there).
             Err(e) => { let _ = fs::remove_dir(&path); return Err(e); }
         };
         let mut staging = Staging { path: path.clone(), objects: dir.try_clone()?, instance, dir, name,
@@ -442,6 +444,10 @@ impl Staging {
 }
 
 impl Drop for Staging {
+    // This may run without the staging lock (`begin` fails before or at its
+    // `flock`, for one): the one exception to `Store::remove`'s lock
+    // invariant, safe because it deletes only this capture's own fresh-nonce
+    // staging name, never a published or `.removing-*` one (see there).
     fn drop(&mut self) {
         if !self.published { let _ = fs::remove_dir_all(&self.path); }
     }
@@ -658,10 +664,19 @@ impl Store {
     /// (same device and inode); nothing inside it is trusted before that. A
     /// name that no longer denotes the locked directory (or is gone) makes the
     /// removal `checkpoint_busy` with nothing changed. While the lock is held
-    /// the binding can't change: every rename or deletion of an entry here is
-    /// made by a holder of that entry's exclusive lock, and publication only
-    /// creates a name (`RENAME_NOREPLACE`). After its rename, each directory
-    /// is proven again under its removal name before it is deleted.
+    /// the binding can't change: every rename or deletion of a published or
+    /// `.removing-*` directory is made by a holder of that directory's
+    /// exclusive lock, and publication only creates a name
+    /// (`RENAME_NOREPLACE`). The one exception is a capture's own failure
+    /// cleanup of its fresh `.staging-C-G-<nonce>` directory, which may delete
+    /// it unlocked (`Store::begin`, `Staging::drop`). That is safe: it deletes
+    /// only the staging name, which carries a fresh random nonce, is never
+    /// adopted or created again, and leaves only by a rename under its lock
+    /// (publication or a removal). So it removes this capture's own directory
+    /// or nothing, never a published or `.removing-*` binding; at worst a
+    /// removal holding that staging lock finds the name gone at its rename and
+    /// returns an error. After its rename, each directory is proven again
+    /// under its removal name before it is deleted.
     ///
     /// With `generation`, only that capture generation is removed, and every
     /// check happens before anything is touched:
