@@ -1490,7 +1490,9 @@ mod tests {
             server.wait_for("busy-started");
             let start = Instant::now();
             let (mut busy, out, err) = server.start_exec_header(op, 1024 * 1024);
-            busy.write_all(b"x").unwrap();
+            // PID 1 may already have refused the header and closed; the
+            // refusal stays readable, so a broken pipe here is not a failure.
+            if let Err(e) = busy.write_all(b"x") { assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe); }
             // Removal is already queued while the refused body is incomplete.
             let mut remover = server.connect();
             remover.write_all(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
