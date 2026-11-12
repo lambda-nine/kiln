@@ -606,7 +606,12 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // every child and can't be undone.
     nix::sys::prctl::set_no_new_privs().context("set no_new_privs")?;
     if cfg.read_only {
-        landlock::restrict_writes(&cfg.writable)?;
+        // A restored tree is never extended: an absent writable path fails
+        // the create (preflight already refused it; this is the no-follow
+        // recheck in the merged view).
+        landlock::restrict_writes(&cfg.writable, cfg.fork.is_none()).map_err(|e| if cfg.fork.is_some() {
+            checkpoint::refuse(checkpoint::Reason::LayoutUnsupported, format!("{e:#}"))
+        } else { e })?;
     }
     seccomp::install()?;
     trace::mark("init: credentials, env, seccomp");

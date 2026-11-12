@@ -83,7 +83,7 @@ limit-bytes <R>
         00000000, 00000001, …               0600, one per regular-file inode
       manifest.json                         0600
       complete                              0600
-    .staging-<checkpoint>-<generation>/     a capture in progress or interrupted
+    .staging-<checkpoint>-<generation>-<nonce>/  a capture in progress or interrupted
     .removing-<checkpoint>-…/               a removal in progress or interrupted
 ```
 
@@ -105,11 +105,16 @@ limit-bytes <R>
 
 ### Locks
 
-Capture holds an exclusive `flock` on its staging directory; `inspect` and a
-fork's restore hold a shared one on the artifact for as long as they read it;
-`rm` takes an exclusive one on each directory it removes. All are
-non-blocking: a held lock is `checkpoint_busy`. The flock follows the
-directory through its rename into place.
+Each capture creates its own staging directory exclusively (`mkdirat`, with
+a random 64-bit nonce in the name; an existing directory is never adopted)
+and holds an exclusive `flock` on it from creation through its reply: the
+flock follows the directory through its rename into place, so nobody can
+open, remove or replace the artifact before the capture has answered.
+`inspect` and a fork's restore hold a shared lock on the artifact for as
+long as they read it; `rm` takes an exclusive one on each directory it
+removes. All are non-blocking: a held lock is `checkpoint_busy`. Two
+captures of one checkpoint may both stage; exactly one rename succeeds, and
+the other is `checkpoint_busy` and removes only its own staging directory.
 
 ### The header
 
@@ -286,10 +291,10 @@ runtime paths and kernel xattr names appear as they are.
 |---|---|
 | `sandbox_unsupported:workspace_checkpoint` | The run has no image identity, no verified layout or no policy record (an older kiln created it), or its PID 1 doesn't grant leases. |
 | `checkpoint_busy` | The source runs or queues a command, holds another lease, or the checkpoint already exists or has an operation. |
-| `checkpoint_layout_unsupported` | A protected-path violation (anything beneath `/dev`, `/proc` or `/sys/fs/cgroup`; a mount target or ancestor that is not a plain, non-opaque directory; `/etc` not a directory when DNS is generated); a generated file replaced by a directory or hardlinked; a mount crossing; a path over 4,096 bytes or deeper than 128; a writable path overlapping a reserved one. |
+| `checkpoint_layout_unsupported` | A protected-path violation (anything beneath `/dev`, `/proc` or `/sys/fs/cgroup`; a mount target or ancestor that is not a plain, non-opaque directory; `/etc` not a directory when DNS is generated); a generated file replaced by a directory or hardlinked; a mount crossing; a path over 4,096 bytes or deeper than 128; a writable path overlapping a reserved one, or absent or not a plain directory in the merged view (read-only root). |
 | `checkpoint_metadata_unsupported` | A FIFO, socket, block device or non-whiteout character device; a POSIX ACL; a file capability; any other `security.*`, `trusted.*` or `system.*` xattr; an overlay redirect, metacopy, index handle (`upper`, `nlink`), xattr whiteout or its `opaque=x` marker, escaped (`trusted.overlay.overlay.*`), misplaced or unknown overlay xattr; a `user.overlay.*` xattr; a user xattr on a symlink or whiteout; more than 32 user xattrs or 4 KiB of them; an owner outside the sandbox range; a hardlink with names outside the upper; a hardlinked symlink; a symlink target over 1,023 bytes. |
 | `checkpoint_image_unavailable` | The image is no longer registered with the generation, digest and directory the source recorded, or its rehash differs. |
-| `checkpoint_size_limit` | Over 65,536 entries or a 16 MiB manifest; file bytes (each file rounded up to 4 KiB) plus 16 KiB per entry over R; the artifact's quota filled; or the final charge S over R. |
+| `checkpoint_size_limit` | Over 65,536 entries or a 16 MiB manifest; retained metadata over the 32 MiB worker heap budget; file bytes (each file rounded up to 4 KiB) plus 16 KiB per entry over R; the artifact's quota filled; or the final charge S over R. |
 | `checkpoint_io` | A source entry changed or was replaced during the copy, PID 1 ended the lease, the run's identity or metadata changed, or the release failed. |
 | `checkpoint_corrupt` | Any artifact check failed (below). |
 | `invalid_request` | A malformed ID or limit, or a missing sandbox or checkpoint. |
@@ -313,24 +318,70 @@ by this kernel configuration.
 3. Rehash the image under the shared image lock (`kiln image verify`) and
    require the registration the run recorded: generation, digest and
    directory identity.
-4. Create `.staging-C-G` (0700), take its lock, install the project quota of
-   R while it is empty, create `objects/`, write and sync `header`.
+4. Create `.staging-C-G-<nonce>` exclusively (0700), take its lock, install
+   the project quota of R while it is empty, create `objects/`, write and
+   sync `header`.
 5. Walk the raw upper (below) and copy each regular file into its object,
    syncing each object. The lease connection is checked every 256 entries.
-6. Still under the lease: the run directory, upper, image reference, layout,
-   policy and shim identity must be unchanged. Then acknowledge the lease
-   and require PID 1's Released for the same generation. No source byte is
-   read after this point.
-7. Encode the manifest and validate it with the reader's own rules; write
-   and sync `manifest.json`; sync `objects/`; write and sync `complete`;
-   sync the staging directory; rename it to C (never replacing); sync the
-   instance directory.
-8. Reopen and validate the published artifact, measure A and compute S. If
-   S > R, remove it and fail.
+6. Still under the lease: every writable path must be a plain directory in
+   the merged view (below); the run directory, upper, image reference,
+   layout, policy and shim identity must be unchanged. Then acknowledge the
+   lease and require PID 1's Released for the same generation. No source
+   byte is read after this point.
+7. Validate the manifest with the reader's own rules and encode it; write
+   and sync `manifest.json`; sync `objects/`; write and sync `complete`; sync
+   the staging directory.
+8. Through the same locked descriptor, validate the staged directory exactly
+   as a reader would (contents, modes, header against the original, both
+   digests, manifest, objects), then measure A and compute S. If S > R,
+   fail: nothing was published.
+9. Last: rename the staging directory to C (never replacing) and sync the
+   instance directory. The record is built from the still-locked artifact
+   and the original header; the name is never reopened.
 
-Any failure removes the staging directory. A killed worker leaves only
-staging (never a complete artifact under C), which `ls` lists and `rm`
-removes; the lease ends with the worker's connection.
+Any failure before step 9 removes the staging directory and leaves no
+artifact under C. A killed worker leaves only staging, which `ls` lists and
+`rm` removes; the lease ends with the worker's connection.
+
+### Writable paths
+
+A sandbox restored from a checkpoint never creates directories: its tree is
+the checkpoint's exactly. So for a read-only root, every configured
+writable path and the default scratch directories Landlock opens (`/tmp`,
+`/root`, `/workspace`; `/dev/shm` is a tmpfs) must already be a plain
+directory in the merged view, the captured upper over the verified image:
+an upper directory merges with the image's unless it is opaque, an upper
+whiteout or non-directory hides it, and image components are opened
+without following. Capture checks this under the lease and refuses an
+absent or non-directory writable path with `checkpoint_layout_unsupported`;
+the fork preflight checks it again against the artifact and the fork's
+image; and the fork's init opens every writable path without following and
+without creating (an absent one fails the create). Ordinary creates still
+create missing writable directories.
+
+### Worker memory
+
+Capture and restore stay inside the design's 64 MiB worker limit at the
+largest workspace the caps admit:
+
+- Xattrs are read through one reusable 64 KiB buffer and refused at the
+  first name over the caps (32 user xattrs, 4 KiB); a kept value costs its
+  own bytes, packed per entry.
+- Retained entries, inode and link tables and directory listings in
+  progress share a 32 MiB heap budget (`checkpoint_size_limit` beyond it).
+  A directory listing is bounded as it is read.
+- The manifest is encoded and decoded without a JSON tree: entries are
+  written directly and read one at a time (each re-encoded and compared, so
+  the document stays canonical). The encoded manifest is at most 16 MiB.
+- Restore verifies the rebuilt upper by comparing each walked entry with the
+  manifest as it is produced, never holding a second copy.
+- Restore flushes the new upper (`syncfs`) every 512 entries or 16 MiB, so the
+  dirty page cache and filesystem metadata charged to the worker's memory
+  cgroup stay bounded for many small, xattr-heavy files.
+- Measured on the VM in a 64 MiB cgroup without swap, one operation per
+  process as in production: 16,000 files with 32 xattrs each, and 28,000
+  files with 250-byte names (each near the 16 MiB manifest cap), peak at about
+  33 MB for capture and for restore.
 
 ### The walker
 
@@ -350,7 +401,7 @@ removes; the lease ends with the worker's connection.
 
 ## Storage charge
 
-After publication:
+Measured on the staged directory, before publication:
 
 ```text
 L = sum of regular-file lengths, once per inode, each rounded up to 4 KiB
@@ -381,6 +432,8 @@ Before allocation:
 4. Rehash the image (`verify`): its digest must be the manifest's
    `image_sha256` (`checkpoint_image_unavailable`).
 5. `--disk` must be at least S.
+6. For a read-only root, every writable path must be a plain directory in
+   the merged view of the checkpoint over the image (see Writable paths).
 
 Then the usual create installs the run's quota, creates `upper`, `work` and
 `merged`, takes the image reference (whose recorded digest must again be the
@@ -400,6 +453,8 @@ checkpoint's) and writes the policy record. Before anything mounts:
 - The restored upper is walked with the capture walker and must produce the
   manifest's root and entries exactly, with no bookkeeping, all link counts
   explained, and no inode shared with an artifact object.
+- Writable paths are checked as above: preflight refuses an absent one, and
+  init opens them without creating anything.
 
 The artifact lock is released, then the sandbox's init mounts the overlay.
 Before any privileged mount or DNS write it checks, component by component

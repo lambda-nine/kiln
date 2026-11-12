@@ -12,15 +12,62 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::{CONTENT_DOMAIN, EXCLUDED_XATTRS, FORMAT, MAX_DEPTH, MAX_ENTRIES, MAX_LINK_TARGET, MAX_MANIFEST_BYTES,
-    MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_USER_XATTRS, MAX_USER_XATTR_BYTES, Reason, refuse};
-use crate::cjson::{Json, parse, unbase64};
+use super::{CONTENT_DOMAIN, EXCLUDED_XATTRS, FORMAT, HEAP_BUDGET, MAX_DEPTH, MAX_ENTRIES, MAX_LINK_TARGET,
+    MAX_MANIFEST_BYTES, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_USER_XATTRS, MAX_USER_XATTR_BYTES, Reason, refuse};
+use crate::cjson::{self, Json, parse_at, unbase64};
 use crate::protected::{self, Disposition, Kind as Contract};
 use crate::sha256::{Sha256, hex};
 
 pub const SCOPE: &str = "persistent_overlay";
 
-pub type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+/// One entry's user xattrs, packed into a single allocation: repeated
+/// `u32 name length, name, u32 value length, value` (little endian), in
+/// manifest order. Retained metadata costs its bytes, not a heap block per
+/// name and value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Xattrs { buf: Vec<u8> }
+
+impl Xattrs {
+    pub fn new() -> Self { Self::default() }
+
+    /// Packs pairs in the order given, with exact capacity.
+    pub fn from_pairs<N: AsRef<[u8]>, V: AsRef<[u8]>>(pairs: impl IntoIterator<Item = (N, V)>) -> Self {
+        let mut x = Self::new();
+        for (n, v) in pairs { x.push(n.as_ref(), v.as_ref()); }
+        x.buf.shrink_to_fit();
+        x
+    }
+
+    pub fn push(&mut self, name: &[u8], value: &[u8]) {
+        self.buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(name);
+        self.buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(value);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let mut at = 0;
+        let buf = &self.buf;
+        std::iter::from_fn(move || {
+            if at >= buf.len() { return None; }
+            let mut take = || {
+                let n = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+                let s = &buf[at + 4..at + 4 + n];
+                at += 4 + n;
+                s
+            };
+            let name = take();
+            let value = take();
+            Some((name, value))
+        })
+    }
+
+    /// Heap bytes this value holds.
+    pub fn heap(&self) -> usize { self.buf.capacity() }
+
+    #[cfg(test)]
+    pub fn to_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> { self.iter().map(|(n, v)| (n.to_vec(), v.to_vec())).collect() }
+}
 
 /// Inode metadata of a directory, regular file or the root. IDs are in the
 /// sandbox's namespace (0..=65535), never host IDs.
@@ -51,6 +98,16 @@ pub enum Body {
 pub struct Entry {
     pub path: Vec<u8>,
     pub body: Body,
+}
+
+/// What one retained entry costs the worker's heap budget.
+pub fn entry_heap(e: &Entry) -> usize {
+    let extra = match &e.body {
+        Body::Dir { meta, .. } | Body::File { meta, .. } => meta.xattrs.heap(),
+        Body::Symlink { target, .. } => target.capacity(),
+        _ => 0,
+    };
+    std::mem::size_of::<Entry>() + e.path.capacity() + extra
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,45 +142,95 @@ pub fn content_sha256(manifest: &[u8]) -> [u8; 32] {
     h.finish()
 }
 
-fn mtime_json(m: (i64, u32)) -> Json { Json::Arr(vec![Json::int(m.0), Json::int(m.1)]) }
+// ---------------------------------------------------------------------------
+// Streaming canonical encoder. Keys are written in their sorted order by
+// hand, so no JSON tree is ever built for a manifest.
 
-fn xattrs_json(x: &Xattrs) -> Json {
-    Json::Arr(x.iter().map(|(n, v)| Json::Arr(vec![Json::b64(n), Json::b64(v)])).collect())
+fn key(out: &mut Vec<u8>, first: bool, k: &str) {
+    if !first { out.push(b','); }
+    out.push(b'"');
+    out.extend_from_slice(k.as_bytes());
+    out.extend_from_slice(b"\":");
 }
 
-fn meta_fields(m: &Meta, out: &mut BTreeMap<String, Json>) {
-    out.insert("gid".into(), Json::int(m.gid));
-    out.insert("mode".into(), Json::int(m.mode));
-    out.insert("mtime".into(), mtime_json(m.mtime));
-    out.insert("uid".into(), Json::int(m.uid));
-    out.insert("xattrs".into(), xattrs_json(&m.xattrs));
+fn b64(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'"');
+    cjson::base64_into(out, bytes);
+    out.push(b'"');
+}
+
+fn int(out: &mut Vec<u8>, n: impl std::fmt::Display) { out.extend_from_slice(n.to_string().as_bytes()); }
+
+fn mtime_out(out: &mut Vec<u8>, m: (i64, u32)) { out.push(b'['); int(out, m.0); out.push(b','); int(out, m.1); out.push(b']'); }
+
+fn xattrs_out(out: &mut Vec<u8>, x: &Xattrs) {
+    out.push(b'[');
+    for (i, (n, v)) in x.iter().enumerate() {
+        if i != 0 { out.push(b','); }
+        out.push(b'[');
+        b64(out, n);
+        out.push(b',');
+        b64(out, v);
+        out.push(b']');
+    }
+    out.push(b']');
+}
+
+fn strings_out(out: &mut Vec<u8>, v: &[impl AsRef<str>]) {
+    out.push(b'[');
+    for (i, s) in v.iter().enumerate() {
+        if i != 0 { out.push(b','); }
+        cjson::string(out, s.as_ref());
+    }
+    out.push(b']');
+}
+
+/// `gid`, `mode`, `mtime` then whatever sorts between `mtime` and `uid`,
+/// then `uid` and `xattrs`.
+fn meta_out(out: &mut Vec<u8>, m: &Meta, middle: impl FnOnce(&mut Vec<u8>)) {
+    key(out, true, "gid"); int(out, m.gid);
+    key(out, false, "mode"); int(out, m.mode);
+    key(out, false, "mtime"); mtime_out(out, m.mtime);
+    middle(out);
+    key(out, false, "uid"); int(out, m.uid);
+    key(out, false, "xattrs"); xattrs_out(out, &m.xattrs);
 }
 
 impl Entry {
-    pub fn to_json(&self) -> Json {
-        let mut o = BTreeMap::new();
-        o.insert("path".into(), Json::b64(&self.path));
-        let ty = match &self.body {
-            Body::Dir { meta, opaque } => { meta_fields(meta, &mut o); o.insert("opaque".into(), Json::Bool(*opaque)); "dir" }
-            Body::File { meta, size, sha256, object } => {
-                meta_fields(meta, &mut o);
-                o.insert("size".into(), Json::int(*size));
-                o.insert("sha256".into(), Json::str(hex(sha256)));
-                o.insert("object".into(), Json::int(*object));
-                "file"
-            }
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(b'{');
+        match &self.body {
+            Body::Dir { meta, opaque } => meta_out(out, meta, |out| {
+                key(out, false, "opaque"); out.extend_from_slice(if *opaque { b"true" } else { b"false" });
+                key(out, false, "path"); b64(out, &self.path);
+                key(out, false, "type"); out.extend_from_slice(b"\"dir\"");
+            }),
+            Body::File { meta, size, sha256, object } => meta_out(out, meta, |out| {
+                key(out, false, "object"); int(out, object);
+                key(out, false, "path"); b64(out, &self.path);
+                key(out, false, "sha256"); out.push(b'"'); out.extend_from_slice(hex(sha256).as_bytes()); out.push(b'"');
+                key(out, false, "size"); int(out, size);
+                key(out, false, "type"); out.extend_from_slice(b"\"file\"");
+            }),
             Body::Symlink { uid, gid, mtime, target } => {
-                o.insert("uid".into(), Json::int(*uid));
-                o.insert("gid".into(), Json::int(*gid));
-                o.insert("mtime".into(), mtime_json(*mtime));
-                o.insert("target".into(), Json::b64(target));
-                "symlink"
+                key(out, true, "gid"); int(out, gid);
+                key(out, false, "mtime"); mtime_out(out, *mtime);
+                key(out, false, "path"); b64(out, &self.path);
+                key(out, false, "target"); b64(out, target);
+                key(out, false, "type"); out.extend_from_slice(b"\"symlink\"");
+                key(out, false, "uid"); int(out, uid);
             }
-            Body::HardLink { link } => { o.insert("link".into(), Json::int(*link)); "hardlink" }
-            Body::Whiteout => "whiteout",
-        };
-        o.insert("type".into(), Json::str(ty));
-        Json::Obj(o)
+            Body::HardLink { link } => {
+                key(out, true, "link"); int(out, link);
+                key(out, false, "path"); b64(out, &self.path);
+                key(out, false, "type"); out.extend_from_slice(b"\"hardlink\"");
+            }
+            Body::Whiteout => {
+                key(out, true, "path"); b64(out, &self.path);
+                key(out, false, "type"); out.extend_from_slice(b"\"whiteout\"");
+            }
+        }
+        out.push(b'}');
     }
 
     /// The contract kind of this entry for `protected::check`.
@@ -137,25 +244,35 @@ impl Entry {
     }
 }
 
+const PREFIX: &[u8] = b"{\"entries\":[";
+/// Everything after the entries array is small; a larger tail is corrupt.
+const MAX_TAIL: usize = 512 * 1024;
+
 impl Manifest {
-    pub fn to_json(&self) -> Json {
-        let mut root = BTreeMap::new();
-        meta_fields(&self.root, &mut root);
-        let strings = |v: &[String]| Json::Arr(v.iter().map(|s| Json::str(s.clone())).collect());
-        Json::obj([
-            ("entries", Json::Arr(self.entries.iter().map(Entry::to_json).collect())),
-            ("excluded_paths", strings(&self.excluded_paths)),
-            ("excluded_xattrs", Json::Arr(EXCLUDED_XATTRS.iter().map(|s| Json::str(*s)).collect())),
-            ("format", Json::int(FORMAT)),
-            ("image_sha256", Json::str(self.image_sha256.clone())),
-            ("read_only_root", Json::Bool(self.read_only_root)),
-            ("root", Json::Obj(root)),
-            ("scope", Json::str(SCOPE)),
-            ("writable_paths", strings(&self.writable_paths)),
-        ])
+    /// The fields after `entries`, from `,"excluded_paths":` to the final `}`.
+    fn encode_tail(&self, out: &mut Vec<u8>) {
+        key(out, false, "excluded_paths"); strings_out(out, self.excluded_paths.as_slice());
+        key(out, false, "excluded_xattrs"); strings_out(out, &EXCLUDED_XATTRS[..]);
+        key(out, false, "format"); int(out, FORMAT);
+        key(out, false, "image_sha256"); cjson::string(out, &self.image_sha256);
+        key(out, false, "read_only_root"); out.extend_from_slice(if self.read_only_root { b"true" } else { b"false" });
+        key(out, false, "root"); out.push(b'{'); meta_out(out, &self.root, |_| {}); out.push(b'}');
+        key(out, false, "scope"); cjson::string(out, SCOPE);
+        key(out, false, "writable_paths"); strings_out(out, self.writable_paths.as_slice());
+        out.push(b'}');
     }
 
-    pub fn encode(&self) -> Vec<u8> { self.to_json().encode() }
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(PREFIX);
+        for (i, e) in self.entries.iter().enumerate() {
+            if i != 0 { out.push(b','); }
+            e.encode_into(&mut out);
+        }
+        out.push(b']');
+        self.encode_tail(&mut out);
+        out
+    }
 
     /// The runtime-generated entries the source excluded, recovered from the
     /// published exclusion list (the only list `protected` can produce).
@@ -168,37 +285,76 @@ impl Manifest {
 
     /// Parses and fully validates hostile manifest bytes. Every structural
     /// rule restore depends on is checked here, before anything is created.
+    /// Entries are decoded one at a time (each span re-encoded and compared,
+    /// so the document is canonical) against the worker heap budget; no JSON
+    /// tree of the whole document is built.
     pub fn decode(bytes: &[u8]) -> Result<(Self, Stats)> {
         let corrupt = |e: anyhow::Error| refuse(Reason::Corrupt, format!("manifest: {e:#}"));
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(refuse(Reason::Corrupt, "manifest larger than the format allows"));
         }
-        let json = parse(bytes).map_err(corrupt)?;
-        let manifest = Self::from_json(&json).map_err(corrupt)?;
+        let manifest = Self::decode_inner(bytes).map_err(corrupt)?;
         let stats = manifest.validate()?;
         Ok((manifest, stats))
     }
 
-    fn from_json(json: &Json) -> Result<Self> {
-        let top = object(json, &["entries", "excluded_paths", "excluded_xattrs", "format", "image_sha256",
-            "read_only_root", "root", "scope", "writable_paths"])?;
-        ensure!(int(&top["format"])? == i128::from(FORMAT), "unsupported format");
+    fn decode_inner(bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.starts_with(PREFIX), "manifest does not start with its entries");
+        let mut at = PREFIX.len();
+        let mut entries = Vec::new();
+        let mut heap = 0usize;
+        let mut scratch = Vec::new();
+        if bytes.get(at) == Some(&b']') {
+            at += 1;
+        } else {
+            loop {
+                ensure!(entries.len() < MAX_ENTRIES - 1, "more than {MAX_ENTRIES} entries");
+                let (json, end) = parse_at(bytes, at)?;
+                let e = entry(&json)?;
+                drop(json);
+                scratch.clear();
+                e.encode_into(&mut scratch);
+                ensure!(bytes[at..end] == scratch[..], "manifest entry {} is not canonical", entries.len());
+                heap += entry_heap(&e);
+                ensure!(heap <= HEAP_BUDGET, "manifest exceeds the worker heap budget");
+                entries.push(e);
+                at = end;
+                match bytes.get(at) {
+                    Some(b',') => at += 1,
+                    Some(b']') => { at += 1; break; }
+                    _ => bail!("malformed entries array"),
+                }
+            }
+        }
+        // The tail: `,"excluded_paths":…}`, parsed as an object of its own.
+        let tail = &bytes[at..];
+        ensure!(tail.first() == Some(&b',') && tail.len() <= MAX_TAIL, "malformed manifest tail");
+        let mut object_bytes = Vec::with_capacity(tail.len());
+        object_bytes.push(b'{');
+        object_bytes.extend_from_slice(&tail[1..]);
+        let (json, end) = parse_at(&object_bytes, 0)?;
+        ensure!(end == object_bytes.len(), "trailing data after the manifest");
+        let top = object(&json, &["excluded_paths", "excluded_xattrs", "format", "image_sha256", "read_only_root",
+            "root", "scope", "writable_paths"])?;
+        let Json::Int(format) = top["format"] else { bail!("format is not an integer") };
+        ensure!(format == i128::from(FORMAT), "unsupported format");
         ensure!(top["scope"] == Json::str(SCOPE), "unsupported scope");
-        let excluded_xattrs = strings(&top["excluded_xattrs"])?;
-        ensure!(excluded_xattrs == EXCLUDED_XATTRS, "unexpected excluded xattr list");
+        ensure!(strings(&top["excluded_xattrs"])? == EXCLUDED_XATTRS, "unexpected excluded xattr list");
         let image_sha256 = string(&top["image_sha256"])?.to_owned();
         super::hex32(&image_sha256)?;
         let Json::Bool(read_only_root) = top["read_only_root"] else { bail!("read_only_root is not a boolean") };
-        let entries = array(&top["entries"])?;
-        ensure!(entries.len() < MAX_ENTRIES, "more than {MAX_ENTRIES} entries");
-        Ok(Self {
+        let manifest = Self {
             image_sha256,
             read_only_root,
             writable_paths: strings(&top["writable_paths"])?,
             excluded_paths: strings(&top["excluded_paths"])?,
             root: meta(object(&top["root"], &["gid", "mode", "mtime", "uid", "xattrs"])?)?,
-            entries: entries.iter().map(entry).collect::<Result<_>>()?,
-        })
+            entries,
+        };
+        let mut canonical = Vec::with_capacity(tail.len());
+        manifest.encode_tail(&mut canonical);
+        ensure!(canonical == tail, "manifest tail is not canonical");
+        Ok(manifest)
     }
 
     /// Structural validation (hostile input): writable and excluded sets,
@@ -288,12 +444,16 @@ pub fn check_meta(m: &Meta) -> Result<()> {
 }
 
 pub fn check_user_xattrs(x: &Xattrs) -> Result<()> {
-    ensure!(x.len() <= MAX_USER_XATTRS, "more than {MAX_USER_XATTRS} user xattrs");
     let mut total = 0usize;
-    for (i, (name, value)) in x.iter().enumerate() {
+    let mut count = 0usize;
+    let mut previous: Option<&[u8]> = None;
+    for (name, value) in x.iter() {
+        count += 1;
+        ensure!(count <= MAX_USER_XATTRS, "more than {MAX_USER_XATTRS} user xattrs");
         ensure!(name.starts_with(b"user.") && name.len() > 5 && !name.starts_with(b"user.overlay.")
             && name.len() <= MAX_NAME_BYTES && !name.contains(&0), "xattr outside the user namespace");
-        ensure!(i == 0 || x[i - 1].0 < *name, "xattrs not sorted and unique");
+        ensure!(previous.is_none_or(|p| p < name), "xattrs not sorted and unique");
+        previous = Some(name);
         total += name.len() + value.len();
     }
     ensure!(total <= MAX_USER_XATTR_BYTES, "user xattrs exceed {MAX_USER_XATTR_BYTES} bytes");
@@ -321,27 +481,31 @@ fn string(j: &Json) -> Result<&str> {
 
 fn strings(j: &Json) -> Result<Vec<String>> { array(j)?.iter().map(|s| string(s).map(str::to_owned)).collect() }
 
-fn int(j: &Json) -> Result<i128> {
+fn int_of(j: &Json) -> Result<i128> {
     let Json::Int(n) = j else { bail!("expected an integer") };
     Ok(*n)
 }
 
-fn uint<T: TryFrom<i128>>(j: &Json) -> Result<T> { T::try_from(int(j)?).ok().context("integer out of range") }
+fn uint<T: TryFrom<i128>>(j: &Json) -> Result<T> { T::try_from(int_of(j)?).ok().context("integer out of range") }
 
 fn bytes(j: &Json) -> Result<Vec<u8>> { unbase64(string(j)?) }
 
 fn mtime(j: &Json) -> Result<(i64, u32)> {
     let a = array(j)?;
     ensure!(a.len() == 2, "mtime must be [seconds, nanoseconds]");
-    Ok((i64::try_from(int(&a[0])?).ok().context("mtime out of range")?, uint(&a[1])?))
+    Ok((i64::try_from(int_of(&a[0])?).ok().context("mtime out of range")?, uint(&a[1])?))
 }
 
 fn meta(o: &BTreeMap<String, Json>) -> Result<Meta> {
-    let xattrs = array(&o["xattrs"])?.iter().map(|pair| {
+    let pairs = array(&o["xattrs"])?;
+    ensure!(pairs.len() <= MAX_USER_XATTRS, "more than {MAX_USER_XATTRS} user xattrs");
+    let mut xattrs = Xattrs::new();
+    for pair in pairs {
         let p = array(pair)?;
         ensure!(p.len() == 2, "xattr must be [name, value]");
-        Ok((bytes(&p[0])?, bytes(&p[1])?))
-    }).collect::<Result<_>>()?;
+        xattrs.push(&bytes(&p[0])?, &bytes(&p[1])?);
+    }
+    xattrs.buf.shrink_to_fit();
     Ok(Meta { mode: uint(&o["mode"])?, uid: uint(&o["uid"])?, gid: uint(&o["gid"])?, mtime: mtime(&o["mtime"])?, xattrs })
 }
 
@@ -373,13 +537,15 @@ fn entry(j: &Json) -> Result<Entry> {
 pub(crate) mod tests {
     use super::*;
 
-    pub fn meta(mode: u32, xattrs: Xattrs) -> Meta { Meta { mode, uid: 0, gid: 0, mtime: (1_700_000_000, 5), xattrs } }
+    pub fn meta(mode: u32, xattrs: Vec<(Vec<u8>, Vec<u8>)>) -> Meta {
+        Meta { mode, uid: 0, gid: 0, mtime: (1_700_000_000, 5), xattrs: Xattrs::from_pairs(xattrs) }
+    }
 
     /// A small manifest with every entry type, used by the golden and by the
     /// independent Python encoder (reviews).
     pub fn golden() -> Manifest {
         let file = |path: &[u8], data: &[u8], object, mode| Entry { path: path.to_vec(), body: Body::File {
-            meta: Meta { mode, uid: 1000, gid: 1000, mtime: (1_700_000_001, 999_999_999), xattrs: vec![] },
+            meta: Meta { mode, uid: 1000, gid: 1000, mtime: (1_700_000_001, 999_999_999), xattrs: Xattrs::new() },
             size: data.len() as u64, sha256: Sha256::digest(data), object } };
         Manifest {
             image_sha256: "ab".repeat(32),
@@ -450,15 +616,15 @@ pub(crate) mod tests {
         corrupt(&|m| if let Body::File { meta, .. } = &mut m.entries[4].body { meta.uid = 65536 }, "invalid metadata");
         corrupt(&|m| if let Body::File { meta, .. } = &mut m.entries[4].body { meta.mode = 0o10644 }, "invalid metadata");
         corrupt(&|m| if let Body::Dir { meta, .. } = &mut m.entries[3].body {
-            meta.xattrs = vec![(b"user.overlay.x".to_vec(), vec![])] }, "user namespace");
+            meta.xattrs = Xattrs::from_pairs(vec![(b"user.overlay.x".to_vec(), vec![])]) }, "user namespace");
         corrupt(&|m| if let Body::Dir { meta, .. } = &mut m.entries[3].body {
-            meta.xattrs = vec![(b"trusted.overlay.opaque".to_vec(), b"y".to_vec())] }, "user namespace");
+            meta.xattrs = Xattrs::from_pairs(vec![(b"trusted.overlay.opaque".to_vec(), b"y".to_vec())]) }, "user namespace");
         corrupt(&|m| if let Body::Dir { meta, .. } = &mut m.entries[3].body {
-            meta.xattrs = vec![(b"user.a".to_vec(), vec![0; 4091])] }, "4096 bytes");
+            meta.xattrs = Xattrs::from_pairs(vec![(b"user.a".to_vec(), vec![0u8; 4091])]) }, "4096 bytes");
         corrupt(&|m| if let Body::Dir { meta, .. } = &mut m.entries[3].body {
-            meta.xattrs = (0..33u8).map(|i| (format!("user.{i:02}").into_bytes(), vec![])).collect() }, "32 user");
+            meta.xattrs = Xattrs::from_pairs((0..33u8).map(|i| (format!("user.{i:02}").into_bytes(), vec![])).collect::<Vec<(Vec<u8>, Vec<u8>)>>()) }, "32 user");
         corrupt(&|m| if let Body::Dir { meta, .. } = &mut m.entries[3].body {
-            meta.xattrs = vec![(b"user.b".to_vec(), vec![]), (b"user.a".to_vec(), vec![])] }, "sorted");
+            meta.xattrs = Xattrs::from_pairs(vec![(b"user.b".to_vec(), vec![]), (b"user.a".to_vec(), vec![])]) }, "sorted");
         corrupt(&|m| if let Body::Symlink { target, .. } = &mut m.entries[7].body { *target = vec![b'a'; 1024] }, "target");
         corrupt(&|m| if let Body::Symlink { target, .. } = &mut m.entries[7].body { target.clear() }, "target");
         corrupt(&|m| m.writable_paths = vec!["/z".into(), "/a".into()], "sorted");
@@ -487,11 +653,19 @@ pub(crate) mod tests {
             text.replace("trusted.overlay.uuid", "trusted.overlay.upper"), text.replace("{\"entries\"", "{ \"entries\""),
             format!("{text}\n"), text.replace("\"read_only_root\":true", "\"read_only_root\":1"),
             text.replacen("\"mtime\":[1700000000,5]", "\"mtime\":[1700000000,1000000000]", 1),
-            text.replacen("\"path\":\"ZXRj\"", "\"path\":\"ZXRj=\"", 1)] {
+            text.replacen("\"path\":\"ZXRj\"", "\"path\":\"ZXRj=\"", 1),
+            // Entry-at-a-time decoding still requires one canonical document.
+            text.replacen("},{", "}, {", 1), text.replacen("}],\"excluded_paths\"", "},],\"excluded_paths\"", 1),
+            text.replacen("\"scope\"", "\"extra\":1,\"scope\"", 1), text.replacen("{\"entries\":[", "{\"entries\": [", 1),
+            text.replacen("\"writable_paths\":[\"/data\"]}", "\"writable_paths\":[\"/data\"]}}", 1),
+            text.replacen("\"type\":\"dir\",\"uid\":0", "\"uid\":0,\"type\":\"dir\"", 1)] {
             assert_ne!(bad, text);
             let e = Manifest::decode(bad.as_bytes()).unwrap_err();
             assert_eq!(super::super::reason_of(&e), Reason::Corrupt, "{bad}: {e:#}");
         }
         assert!(Manifest::decode(&vec![b' '; MAX_MANIFEST_BYTES + 1]).is_err());
+        // A tail far larger than any canonical one is refused before parsing.
+        let huge = format!("{}{}", &text[..text.len() - 1], ",\"z\":\"".to_owned() + &"a".repeat(600 * 1024) + "\"}");
+        assert!(Manifest::decode(huge.as_bytes()).is_err());
     }
 }

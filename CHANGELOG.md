@@ -82,6 +82,19 @@ before 1.0, any minor release may change the CLI or on-disk layout.
     the image or can't be read.
   - Every run records `<run>/policy` (root-write policy and writable paths); runs without it are not sources.
 
+- Close the checkpoint format gaps found by adversarial review:
+  - **Worker memory.** Xattrs are read through one reusable buffer, capped while they are read and packed per
+    entry (each value had kept a 64 KiB allocation). Retained metadata and directory listings share a 32 MiB
+    heap budget, the manifest codec streams instead of building a JSON tree, and restore verifies without a
+    second copy, so capture and restore stay inside 64 MiB at the caps' worst case.
+  - **Writable paths.** A sandbox restored from a checkpoint no longer creates missing writable directories.
+    Capture (under the lease) and the fork preflight refuse a read-only checkpoint whose writable path is absent
+    or not a plain directory, and the fork's init opens writable paths without creating them.
+  - **Publication.** Each capture stages in its own exclusively created directory (nonce-named) and keeps its
+    lock through the reply. The staged artifact is validated and its charge checked before the rename, which is
+    the last step, and the record comes from the locked artifact, never from reopening the name. A losing
+    concurrent capture is `checkpoint_busy` and removes only its own staging.
+
 - Fix image registration publishing a digest of a state that was never installed. Two matching walks of the live
   directory are not a snapshot: a writer coordinating with the walk could show both the same mixed state.
   `kiln image register` now copies the tree into a root-only stage under the exclusive image lock, hashes the copy,

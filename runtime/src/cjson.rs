@@ -29,13 +29,13 @@ pub enum Json {
     Obj(BTreeMap<String, Json>),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl Json {
     pub fn obj<const N: usize>(fields: [(&str, Json); N]) -> Self {
         Json::Obj(fields.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
     }
     pub fn str(s: impl Into<String>) -> Self { Json::Str(s.into()) }
     pub fn int(n: impl Into<i128>) -> Self { Json::Int(n.into()) }
-    pub fn b64(bytes: &[u8]) -> Self { Json::Str(base64(bytes)) }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -72,7 +72,7 @@ impl Json {
     }
 }
 
-fn string(out: &mut Vec<u8>, s: &str) {
+pub fn string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
     for c in s.chars() {
         match c {
@@ -95,12 +95,23 @@ fn string(out: &mut Vec<u8>, s: &str) {
 /// Parses one canonical JSON document. Anything that does not re-encode to the
 /// same bytes (whitespace, unsorted or duplicate keys, floats, exponents,
 /// leading zeros, `-0`, non-canonical escapes, trailing data) is refused.
+/// (The manifest decoder uses `parse_at` per value instead.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse(bytes: &[u8]) -> Result<Json> {
     let mut p = Parser { bytes, at: 0 };
     let value = p.value(0)?;
     ensure!(p.at == bytes.len(), "trailing data after JSON value");
     ensure!(value.encode() == bytes, "JSON is not in canonical form");
     Ok(value)
+}
+
+/// Parses one JSON value starting at `at` and returns it with the offset just
+/// past it. The caller checks canonical form (by re-encoding the span), which
+/// lets a large document be decoded one bounded value at a time.
+pub fn parse_at(bytes: &[u8], at: usize) -> Result<(Json, usize)> {
+    let mut p = Parser { bytes, at };
+    let value = p.value(0)?;
+    Ok((value, p.at))
 }
 
 struct Parser<'a> { bytes: &'a [u8], at: usize }
@@ -221,14 +232,19 @@ impl Parser<'_> {
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    base64_into(&mut out, bytes);
+    String::from_utf8(out).expect("base64 is ASCII")
+}
+
+/// Appends the base64 of `bytes` (no quotes) to `out`.
+pub fn base64_into(out: &mut Vec<u8>, bytes: &[u8]) {
     for chunk in bytes.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
         for i in 0..4 {
-            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i)) as usize & 63] } else { b'=' });
         }
     }
-    out
 }
 
 /// Strict decoding: the standard alphabet with padding, length a multiple of

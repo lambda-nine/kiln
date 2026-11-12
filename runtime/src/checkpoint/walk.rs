@@ -19,8 +19,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use anyhow::{Context, Result, ensure};
 use nix::errno::Errno;
 
-use super::manifest::{Body, Entry, Meta, Xattrs};
-use super::{ENTRY_ALLOWANCE, MAX_DEPTH, MAX_ENTRIES, MAX_LINK_TARGET, MAX_MANIFEST_BYTES, MAX_PATH_BYTES,
+use super::manifest::{Body, Entry, Meta, Xattrs, entry_heap};
+use super::{ENTRY_ALLOWANCE, HEAP_BUDGET, MAX_DEPTH, MAX_ENTRIES, MAX_LINK_TARGET, MAX_MANIFEST_BYTES, MAX_PATH_BYTES,
     MAX_USER_XATTRS, MAX_USER_XATTR_BYTES, Reason, refuse};
 use crate::protected::{self, Disposition, Kind as Contract};
 use crate::sha256::Sha256;
@@ -65,6 +65,8 @@ impl Sink for HashOnly {
 pub struct Walked {
     pub root: Meta,
     pub entries: Vec<Entry>,
+    /// Entries produced (retained in `entries` unless expecting).
+    pub count: usize,
     pub bookkeeping: Bookkeeping,
     /// Regular-file inodes seen, for independence checks.
     pub inodes: Vec<(u64, u64)>,
@@ -82,20 +84,34 @@ pub struct Options<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Node { Root, Dir, File, Symlink, Whiteout }
 
-/// Sorts one entry's xattrs into user xattrs to keep, the opaque flag and
-/// counted bookkeeping; everything else is refused. Kernel names appear in
-/// the refusal; user names and all values never do.
-pub fn classify(node: Node, xattrs: Xattrs, bk: &mut Bookkeeping, at: &str) -> Result<(Xattrs, bool)> {
-    let meta = |what: &str| refuse(Reason::MetadataUnsupported, format!("{at} has {what}"));
-    let mut user = Vec::new();
-    let mut opaque = false;
-    for (name, value) in xattrs {
-        let shown = String::from_utf8_lossy(&name).into_owned();
-        match (name.as_slice(), node) {
-            (b"trusted.overlay.origin", Node::Dir | Node::File | Node::Symlink) => bk.origin += 1,
-            (b"trusted.overlay.impure", Node::Root | Node::Dir) if value == b"y" => bk.impure += 1,
-            (b"trusted.overlay.uuid", Node::Root) if value.len() == 16 => bk.uuid += 1,
-            (b"trusted.overlay.opaque", Node::Root | Node::Dir) if value == b"y" => opaque = true,
+/// Sorts one entry's xattrs, as they are read, into user xattrs to keep,
+/// the opaque flag and counted bookkeeping; everything else is refused at the
+/// first offending name. The user caps (32 names, 4 KiB of names and values)
+/// are enforced before anything is retained. Kernel names appear in the
+/// refusal; user names and all values never do.
+pub struct Classifier<'a> {
+    node: Node,
+    bk: &'a mut Bookkeeping,
+    at: &'a str,
+    user: Vec<(Vec<u8>, Vec<u8>)>,
+    user_bytes: usize,
+    opaque: bool,
+}
+
+impl<'a> Classifier<'a> {
+    pub fn new(node: Node, bk: &'a mut Bookkeeping, at: &'a str) -> Self {
+        Self { node, bk, at, user: Vec::new(), user_bytes: 0, opaque: false }
+    }
+
+    pub fn admit(&mut self, name: &[u8], value: &[u8]) -> Result<()> {
+        let at = self.at;
+        let meta = |what: &str| refuse(Reason::MetadataUnsupported, format!("{at} has {what}"));
+        let shown = String::from_utf8_lossy(name).into_owned();
+        match (name, self.node) {
+            (b"trusted.overlay.origin", Node::Dir | Node::File | Node::Symlink) => self.bk.origin += 1,
+            (b"trusted.overlay.impure", Node::Root | Node::Dir) if value == b"y" => self.bk.impure += 1,
+            (b"trusted.overlay.uuid", Node::Root) if value.len() == 16 => self.bk.uuid += 1,
+            (b"trusted.overlay.opaque", Node::Root | Node::Dir) if value == b"y" => self.opaque = true,
             (b"trusted.overlay.opaque", _) if value == b"x" =>
                 return Err(meta("an overlay xattr-whiteout marker (trusted.overlay.opaque=x)")),
             (n, _) if n.starts_with(b"trusted.overlay.overlay.") => return Err(meta(&format!("an escaped overlay xattr ({shown})"))),
@@ -105,7 +121,17 @@ pub fn classify(node: Node, xattrs: Xattrs, bk: &mut Bookkeeping, at: &str) -> R
             (b"trusted.overlay.whiteout" | b"trusted.overlay.whiteouts", _) => return Err(meta("an overlay xattr whiteout")),
             (n, _) if n.starts_with(b"trusted.overlay.") => return Err(meta(&format!("an unrecognized overlay xattr form ({shown})"))),
             (n, _) if n.starts_with(b"user.overlay.") => return Err(meta("a reserved user.overlay.* xattr")),
-            (n, Node::Root | Node::Dir | Node::File) if n.starts_with(b"user.") && n.len() > 5 => user.push((name, value)),
+            (n, Node::Root | Node::Dir | Node::File) if n.starts_with(b"user.") && n.len() > 5 => {
+                if self.user.len() >= MAX_USER_XATTRS {
+                    return Err(meta(&format!("more than {MAX_USER_XATTRS} user xattrs")));
+                }
+                self.user_bytes += name.len() + value.len();
+                if self.user_bytes > MAX_USER_XATTR_BYTES {
+                    return Err(meta(&format!("user xattrs over {MAX_USER_XATTR_BYTES} bytes")));
+                }
+                // Exact-size copies of only the returned bytes.
+                self.user.push((name.to_vec(), value.to_vec()));
+            }
             (n, _) if n.starts_with(b"user.") => return Err(meta("a user xattr where the format has none")),
             (b"system.posix_acl_access" | b"system.posix_acl_default", _) => return Err(meta(&format!("a POSIX ACL ({shown})"))),
             (b"security.capability", _) => return Err(meta("a file capability (security.capability)")),
@@ -118,13 +144,60 @@ pub fn classify(node: Node, xattrs: Xattrs, bk: &mut Bookkeeping, at: &str) -> R
             (n, _) if n.starts_with(b"system.") => return Err(meta("a system xattr")),
             _ => return Err(meta("an xattr in an unknown namespace")),
         }
+        Ok(())
     }
-    user.sort();
-    if user.len() > MAX_USER_XATTRS { return Err(meta(&format!("more than {MAX_USER_XATTRS} user xattrs"))); }
-    if user.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>() > MAX_USER_XATTR_BYTES {
-        return Err(meta(&format!("user xattrs over {MAX_USER_XATTR_BYTES} bytes")));
+
+    /// The kept user xattrs (sorted, packed) and the opaque flag.
+    pub fn finish(mut self) -> (Xattrs, bool) {
+        self.user.sort();
+        (Xattrs::from_pairs(self.user), self.opaque)
     }
-    Ok((user, opaque))
+}
+
+/// `Classifier` over an already-collected list.
+#[cfg(test)]
+pub fn classify(node: Node, xattrs: Vec<(Vec<u8>, Vec<u8>)>, bk: &mut Bookkeeping, at: &str) -> Result<(Xattrs, bool)> {
+    let mut c = Classifier::new(node, bk, at);
+    for (n, v) in &xattrs { c.admit(n, v)?; }
+    Ok(c.finish())
+}
+
+/// Reusable buffers for xattr listing and values: allocated once per walk, so
+/// a value costs only its own bytes when it is kept.
+pub struct Scratch { names: Vec<u8>, value: Vec<u8>, encoded: Vec<u8> }
+
+impl Default for Scratch {
+    fn default() -> Self { Self { names: vec![0; XATTR_MAX], value: vec![0; XATTR_MAX], encoded: Vec::new() } }
+}
+
+/// Where one entry's xattrs are read from: its open descriptor, or (for
+/// entries that can't be opened) its name under the held parent.
+pub enum XattrSource<'a> { Fd(RawFd), Path(&'a CString) }
+
+/// Lists and reads every xattr of one entry through `scratch`, feeding each
+/// to `c` as it is read.
+pub fn read_xattrs(src: XattrSource<'_>, scratch: &mut Scratch, c: &mut Classifier<'_>) -> Result<()> {
+    let Scratch { names, value, .. } = scratch;
+    // SAFETY: fd or NUL-terminated path; buffers are owned and sized.
+    let n = match src {
+        XattrSource::Fd(fd) => unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len()) },
+        XattrSource::Path(p) => unsafe { libc::llistxattr(p.as_ptr(), names.as_mut_ptr().cast(), names.len()) },
+    };
+    if n < 0 {
+        return match Errno::last() { Errno::ENOTSUP => Ok(()), e => Err(e).context("list xattrs") };
+    }
+    for name in names[..n as usize].split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let cname = CString::new(name)?;
+        // SAFETY: as above.
+        let m = match src {
+            XattrSource::Fd(fd) => unsafe { libc::fgetxattr(fd, cname.as_ptr(), value.as_mut_ptr().cast(), value.len()) },
+            XattrSource::Path(p) => unsafe { libc::lgetxattr(p.as_ptr(), cname.as_ptr(), value.as_mut_ptr().cast(),
+                value.len()) },
+        };
+        let m = Errno::result(m).context("read xattr")? as usize;
+        c.admit(name, &value[..m])?;
+    }
+    Ok(())
 }
 
 struct Group { index: u32, nlink: u64, seen: u64 }
@@ -142,6 +215,14 @@ struct Walker<'a> {
     manifest_bytes: usize,
     bookkeeping: Bookkeeping,
     inodes: Vec<(u64, u64)>,
+    scratch: Scratch,
+    /// Heap held for retained entries, inode and link tables, and the
+    /// directory listings in progress (`HEAP_BUDGET`).
+    heap: usize,
+    /// With `expect`, entries are compared with these as they are produced
+    /// and not retained (verifying a restored upper costs no second copy).
+    expect: Option<&'a [Entry]>,
+    count: usize,
 }
 
 /// Walks the upper at `upper` (a directory descriptor). `check` runs every
@@ -149,15 +230,32 @@ struct Walker<'a> {
 /// lost.
 pub fn walk(upper: &OwnedFd, opts: &Options<'_>, sink: &mut dyn Sink, check: &mut dyn FnMut() -> Result<()>)
     -> Result<Walked> {
+    walk_inner(upper, opts, sink, check, None)
+}
+
+/// Walks `upper` and requires exactly `expected`, entry by entry, without
+/// retaining what it reads. The returned `Walked` has the root and no
+/// entries; any difference is an error naming the first differing ordinal.
+pub fn walk_expect(upper: &OwnedFd, opts: &Options<'_>, expected: &[Entry], sink: &mut dyn Sink) -> Result<Walked> {
+    let walked = walk_inner(upper, opts, sink, &mut || Ok(()), Some(expected))?;
+    ensure!(walked.count == expected.len(), "the tree has {} entries, not {}", walked.count, expected.len());
+    Ok(walked)
+}
+
+fn walk_inner(upper: &OwnedFd, opts: &Options<'_>, sink: &mut dyn Sink, check: &mut dyn FnMut() -> Result<()>,
+    expect: Option<&[Entry]>) -> Result<Walked> {
     let st = fstat(upper.as_raw_fd())?;
     ensure!(st.st_mode & libc::S_IFMT == libc::S_IFDIR, "upper is not a directory");
     let mut bookkeeping = Bookkeeping::default();
-    let (xattrs, opaque) = classify(Node::Root, fd_xattrs(upper.as_raw_fd())?, &mut bookkeeping, "the upper root")?;
+    let mut scratch = Scratch::default();
+    let mut c = Classifier::new(Node::Root, &mut bookkeeping, "the upper root");
+    read_xattrs(XattrSource::Fd(upper.as_raw_fd()), &mut scratch, &mut c)?;
+    let (xattrs, opaque) = c.finish();
     protected::check(b"/", Contract::Directory { opaque }, opts.generated)?;
     let root = meta_of(&st, xattrs, opts.ids, "the upper root")?;
     let mut w = Walker { opts, sink, check, dev: st.st_dev, mnt: mount_id(upper.as_raw_fd(), None)?,
         entries: Vec::new(), groups: HashMap::new(), objects: 0, logical_blocks: 0, manifest_bytes: 0,
-        bookkeeping, inodes: Vec::new() };
+        bookkeeping, inodes: Vec::new(), scratch, heap: 0, expect, count: 0 };
     w.directory(upper, &st, &mut Vec::new(), 0)?;
     for group in w.groups.values() {
         if group.seen != group.nlink {
@@ -166,7 +264,7 @@ pub fn walk(upper: &OwnedFd, opts: &Options<'_>, sink: &mut dyn Sink, check: &mu
         }
     }
     (w.check)()?;
-    Ok(Walked { root, entries: w.entries, bookkeeping: w.bookkeeping, inodes: w.inodes })
+    Ok(Walked { root, entries: w.entries, bookkeeping: w.bookkeeping, inodes: w.inodes, count: w.count })
 }
 
 impl Walker<'_> {
@@ -174,7 +272,7 @@ impl Walker<'_> {
     /// entry cap and the reservation (L + 16 KiB per entry, root included).
     fn charge(&mut self, bytes: u64) -> Result<()> {
         // The root, the entries so far and this one.
-        let n = self.entries.len() as u64 + 2;
+        let n = self.count as u64 + 2;
         ensure!(n as usize <= MAX_ENTRIES, refuse(Reason::SizeLimit, format!("more than {MAX_ENTRIES} entries")));
         let blocks = self.logical_blocks.checked_add(bytes.div_ceil(4096).saturating_mul(4096));
         let need = blocks.and_then(|b| b.checked_add(ENTRY_ALLOWANCE.checked_mul(n)?));
@@ -186,16 +284,45 @@ impl Walker<'_> {
     }
 
     fn push(&mut self, entry: Entry) -> Result<()> {
-        self.manifest_bytes = self.manifest_bytes.saturating_add(entry.to_json().encode().len() + 1);
+        self.scratch.encoded.clear();
+        entry.encode_into(&mut self.scratch.encoded);
+        self.manifest_bytes = self.manifest_bytes.saturating_add(self.scratch.encoded.len() + 1);
         ensure!(self.manifest_bytes <= MAX_MANIFEST_BYTES,
             refuse(Reason::SizeLimit, format!("manifest larger than {MAX_MANIFEST_BYTES} bytes")));
-        self.entries.push(entry);
-        if self.entries.len().is_multiple_of(256) { (self.check)()?; }
+        if let Some(expected) = self.expect {
+            ensure!(expected.get(self.count) == Some(&entry), "entry {} differs from the expected tree", self.count);
+        } else {
+            self.spend(entry_heap(&entry))?;
+            self.entries.push(entry);
+        }
+        self.count += 1;
+        if self.count.is_multiple_of(256) { (self.check)()?; }
+        Ok(())
+    }
+
+    /// Charges `bytes` of retained heap against the worker budget.
+    fn spend(&mut self, bytes: usize) -> Result<()> {
+        self.heap = self.heap.saturating_add(bytes);
+        ensure!(self.heap <= HEAP_BUDGET, refuse(Reason::SizeLimit, format!("the workspace's metadata exceeds the \
+            checkpoint worker's {HEAP_BUDGET}-byte memory budget")));
         Ok(())
     }
 
     fn directory(&mut self, dir: &OwnedFd, st: &libc::stat, path: &mut Vec<u8>, depth: usize) -> Result<()> {
-        for name in list_dir(dir).context("read upper directory")? {
+        // The listing is held while the subtree is walked: it is charged
+        // as it is read and released afterwards.
+        let room = HEAP_BUDGET.saturating_sub(self.heap);
+        let names = list_dir_bounded(dir, MAX_ENTRIES, room).context("read upper directory")?;
+        let held: usize = names.iter().map(|n| listing_cost(n)).sum();
+        self.spend(held)?;
+        let result = self.directory_names(dir, st, path, depth, names);
+        self.heap -= held;
+        result
+    }
+
+    fn directory_names(&mut self, dir: &OwnedFd, st: &libc::stat, path: &mut Vec<u8>, depth: usize,
+        names: Vec<Vec<u8>>) -> Result<()> {
+        for name in names {
             let at = path.len();
             if !path.is_empty() { path.push(b'/'); }
             path.extend_from_slice(&name);
@@ -206,12 +333,12 @@ impl Walker<'_> {
             path.truncate(at);
         }
         ensure!(unchanged(st, &fstat(dir.as_raw_fd())?),
-            refuse(Reason::Io, format!("entry {} changed during capture", self.entries.len())));
+            refuse(Reason::Io, format!("entry {} changed during capture", self.count)));
         Ok(())
     }
 
     fn child(&mut self, dir: &OwnedFd, name: &[u8], path: &mut Vec<u8>, depth: usize) -> Result<()> {
-        let index = self.entries.len() as u32;
+        let index = self.count as u32;
         let at = format!("entry {index}");
         if depth > MAX_DEPTH {
             return Err(refuse(Reason::LayoutUnsupported, format!("{at} is deeper than {MAX_DEPTH} directories")));
@@ -232,7 +359,7 @@ impl Walker<'_> {
             libc::S_IFDIR => {
                 let fd = openat(dir, &cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOATIME)?;
                 self.same(&fd, &st, &at)?;
-                let (xattrs, opaque) = classify(Node::Dir, fd_xattrs(fd.as_raw_fd())?, &mut self.bookkeeping, &at)?;
+                let (xattrs, opaque) = self.xattrs(Node::Dir, XattrSource::Fd(fd.as_raw_fd()), &at)?;
                 if contract(Contract::Directory { opaque })? == Disposition::Exclude {
                     return Err(refuse(Reason::LayoutUnsupported, format!("{at} replaces a runtime-generated file \
                         with a directory")));
@@ -260,7 +387,7 @@ impl Walker<'_> {
                 self.charge(size)?;
                 let fd = openat(dir, &cname, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_NONBLOCK)?;
                 let opened = self.same(&fd, &st, &at)?;
-                let (xattrs, _) = classify(Node::File, fd_xattrs(fd.as_raw_fd())?, &mut self.bookkeeping, &at)?;
+                let (xattrs, _) = self.xattrs(Node::File, XattrSource::Fd(fd.as_raw_fd()), &at)?;
                 let meta = meta_of(&st, xattrs, self.opts.ids, &at)?;
                 let object = self.objects;
                 let sha256 = self.sink.file(&fd, size, object)?;
@@ -268,6 +395,7 @@ impl Walker<'_> {
                 ensure!(unchanged(&opened, &after) && after.st_size as u64 == size,
                     refuse(Reason::Io, format!("{at} changed during capture")));
                 self.objects += 1;
+                self.spend(16 + if linked { 64 } else { 0 })?;
                 self.inodes.push((st.st_dev, st.st_ino));
                 if linked { self.groups.insert((st.st_dev, st.st_ino), Group { index, nlink: st.st_nlink as u64, seen: 1 }); }
                 self.push(Entry { path: path.clone(), body: Body::File { meta, size, sha256, object } })
@@ -276,7 +404,7 @@ impl Walker<'_> {
                 if contract(Contract::Symlink)? == Disposition::Exclude && !linked { return Ok(()); }
                 ensure!(!linked, refuse(Reason::MetadataUnsupported, format!("{at} is a hardlinked symlink")));
                 let target = readlinkat(dir, &cname, &at)?;
-                classify(Node::Symlink, path_xattrs(dir, name)?, &mut self.bookkeeping, &at)?;
+                self.xattrs(Node::Symlink, XattrSource::Path(&proc_path(dir, name)?), &at)?;
                 let (uid, gid) = self.opts.ids.to_ns(st.st_uid, st.st_gid).ok_or_else(|| unmapped(&at))?;
                 self.charge(0)?;
                 self.push(Entry { path: path.clone(), body: Body::Symlink { uid, gid,
@@ -287,7 +415,7 @@ impl Walker<'_> {
                 // count carry no meaning (overlayfs shares one whiteout
                 // inode by hardlink, with other names in the work
                 // directory); restore creates a fresh fixed form.
-                classify(Node::Whiteout, path_xattrs(dir, name)?, &mut self.bookkeeping, &at)?;
+                self.xattrs(Node::Whiteout, XattrSource::Path(&proc_path(dir, name)?), &at)?;
                 if contract(Contract::Whiteout)? == Disposition::Exclude { return Ok(()); }
                 self.charge(0)?;
                 self.push(Entry { path: path.clone(), body: Body::Whiteout })
@@ -303,6 +431,12 @@ impl Walker<'_> {
                 Err(refuse(Reason::MetadataUnsupported, format!("{at} is {what}")))
             }
         }
+    }
+
+    fn xattrs(&mut self, node: Node, src: XattrSource<'_>, at: &str) -> Result<(Xattrs, bool)> {
+        let mut c = Classifier::new(node, &mut self.bookkeeping, at);
+        read_xattrs(src, &mut self.scratch, &mut c)?;
+        Ok(c.finish())
     }
 
     /// The opened descriptor is the inode that was looked up, on our mount.
@@ -470,46 +604,19 @@ fn readlinkat(dir: &OwnedFd, name: &CString, at: &str) -> Result<Vec<u8>> {
 
 const XATTR_MAX: usize = 64 * 1024;
 
-fn collect_xattrs(list: impl Fn(&mut [u8]) -> isize, get: impl Fn(&CString, &mut [u8]) -> isize) -> Result<Xattrs> {
-    let mut names = vec![0u8; XATTR_MAX];
-    let n = list(&mut names);
-    if n < 0 {
-        return match Errno::last() { Errno::ENOTSUP => Ok(Vec::new()), e => Err(e).context("list xattrs") };
-    }
-    names.truncate(n as usize);
-    let mut out = Vec::new();
-    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
-        let cname = CString::new(name)?;
-        let mut value = vec![0u8; XATTR_MAX];
-        let n = Errno::result(get(&cname, &mut value)).context("read xattr")? as usize;
-        value.truncate(n);
-        out.push((name.to_vec(), value));
-    }
-    out.sort();
-    Ok(out)
-}
-
-pub fn fd_xattrs(fd: RawFd) -> Result<Xattrs> {
-    collect_xattrs(
-        // SAFETY: fd is open; buffers are owned and sized.
-        |buf| unsafe { libc::flistxattr(fd, buf.as_mut_ptr().cast(), buf.len()) },
-        |name, buf| unsafe { libc::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) })
-}
-
-/// l*xattr through the held directory's /proc/self/fd path: only the final
-/// component is looked up, and it is not followed.
-pub fn path_xattrs(dir: &OwnedFd, name: &[u8]) -> Result<Xattrs> {
-    let path = proc_path(dir, name)?;
-    collect_xattrs(
-        // SAFETY: NUL-terminated path; buffers are owned and sized.
-        |buf| unsafe { libc::llistxattr(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) },
-        |name, buf| unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) })
-}
-
 /// The names in a directory, sorted by bytes, read through a duplicate of
 /// the held descriptor (so its `O_NOATIME` applies and nothing is looked up
 /// by path). `.` and `..` are left out.
-pub fn list_dir(dir: &OwnedFd) -> Result<Vec<Vec<u8>>> {
+pub fn list_dir(dir: &OwnedFd) -> Result<Vec<Vec<u8>>> { list_dir_bounded(dir, MAX_ENTRIES, HEAP_BUDGET) }
+
+/// What one listed name costs while held: its bytes, its vector and the
+/// allocator's overhead.
+fn listing_cost(name: &[u8]) -> usize { name.len() + 48 }
+
+/// `list_dir`, refusing (`checkpoint_size_limit`) a directory with more than
+/// `max_names` entries or whose names would cost more than `max_bytes`,
+/// before holding them.
+pub fn list_dir_bounded(dir: &OwnedFd, max_names: usize, max_bytes: usize) -> Result<Vec<Vec<u8>>> {
     // SAFETY: duplicates an open descriptor; fdopendir takes ownership of the
     // duplicate and closedir closes it.
     let dup = Errno::result(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) }).context("dup")?;
@@ -521,6 +628,7 @@ pub fn list_dir(dir: &OwnedFd) -> Result<Vec<Vec<u8>>> {
     }
     unsafe { libc::rewinddir(stream) };
     let mut names = Vec::new();
+    let mut held = 0usize;
     let result = loop {
         Errno::clear();
         // SAFETY: readdir on a live stream; the entry is copied before the
@@ -530,9 +638,17 @@ pub fn list_dir(dir: &OwnedFd) -> Result<Vec<Vec<u8>>> {
             break match Errno::last_raw() { 0 => Ok(()), e => Err(Errno::from_raw(e)) };
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." { names.push(name.to_vec()); }
+        if name == b"." || name == b".." { continue; }
+        held += listing_cost(name);
+        if names.len() >= max_names || held > max_bytes {
+            break Err(Errno::E2BIG);
+        }
+        names.push(name.to_vec());
     };
     unsafe { libc::closedir(stream) };
+    if result == Err(Errno::E2BIG) {
+        return Err(refuse(Reason::SizeLimit, "a directory has more entries than the checkpoint limits allow"));
+    }
     result.context("readdir")?;
     names.sort();
     Ok(names)
@@ -587,7 +703,7 @@ mod tests {
         let x = |n: &str, v: &[u8]| (n.as_bytes().to_vec(), v.to_vec());
         let (user, opaque) = classify(Node::Root, vec![x("trusted.overlay.uuid", &[7; 16]),
             x("trusted.overlay.impure", b"y"), x("user.b", b"2"), x("user.a", b"1")], &mut bk, "root").unwrap();
-        assert_eq!((user, opaque), (vec![x("user.a", b"1"), x("user.b", b"2")], false));
+        assert_eq!((user.to_pairs(), opaque), (vec![x("user.a", b"1"), x("user.b", b"2")], false));
         let (_, opaque) = classify(Node::Dir, vec![x("trusted.overlay.origin", b"\x00\xfb"),
             x("trusted.overlay.opaque", b"y"), x("trusted.overlay.impure", b"y")], &mut bk, "d").unwrap();
         assert!(opaque);
@@ -631,7 +747,7 @@ mod tests {
         refused(Node::File, "system.secret", b"secret", "system xattr");
         refused(Node::File, "btrfs.compression", b"secret", "unknown namespace");
         // Caps on what is kept: 32 user xattrs and 4 KiB of names and values.
-        let many: Xattrs = (0..33).map(|i| x(&format!("user.{i:02}"), b"")).collect();
+        let many: Vec<(Vec<u8>, Vec<u8>)> = (0..33).map(|i| x(&format!("user.{i:02}"), b"")).collect();
         assert!(classify(Node::File, many[..32].to_vec(), &mut bk, "f").is_ok());
         assert!(classify(Node::File, many, &mut bk, "f").unwrap_err().to_string().contains("more than 32"));
         assert!(classify(Node::File, vec![x("user.a", &[0; 4090])], &mut bk, "f").is_ok());
@@ -781,5 +897,69 @@ mod tests {
         assert!(copy_and_hash(&open(&src, false), (1 << 20) - 1, None).is_err());
         assert!(copy_and_hash(&open(&src, false), (1 << 20) + 1, None).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Break-it review H1: valid user xattrs (32 one-byte values on each of
+    /// 600 empty files) retained 64 KiB of heap per value. Each kept value
+    /// must cost only its bytes; the VM also runs this under a 64 MiB cgroup.
+    #[test]
+    fn bounded_user_xattrs_do_not_retain_gigabytes() {
+        let root = scratch("xattr-memory");
+        let u = root.join("upper");
+        fs::create_dir(&u).unwrap();
+        let count: usize = std::env::var("C2_XATTR_FILES").unwrap_or_else(|_| "600".into()).parse().unwrap();
+        for i in 0..count {
+            let path = u.join(format!("f{i:06}"));
+            fs::write(&path, b"").unwrap();
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            for j in 0..32 {
+                let name = CString::new(format!("user.x{j:02}")).unwrap();
+                let r = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) };
+                if r != 0 { eprintln!("skipped: no user xattrs here ({})", Errno::last()); fs::remove_dir_all(&root).unwrap(); return; }
+            }
+        }
+        let walked = run(&u, 1 << 30).unwrap();
+        let (mut retained, mut represented) = (0usize, 0usize);
+        for entry in &walked.entries {
+            if let Body::File { meta, .. } = &entry.body {
+                assert_eq!(meta.xattrs.to_pairs().len(), 32);
+                retained += meta.xattrs.heap();
+                represented += meta.xattrs.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>();
+            }
+        }
+        let heap: usize = walked.entries.iter().map(crate::checkpoint::manifest::entry_heap).sum();
+        eprintln!("files={count} xattr_bytes={represented} xattr_heap={retained} entries_heap={heap}");
+        drop(walked);
+        fs::remove_dir_all(&root).unwrap();
+        // Packed: the names and values plus 8 bytes of lengths per xattr.
+        assert_eq!(retained, represented + 8 * 32 * count, "kept xattrs hold more heap than their bytes");
+        assert!(heap < 1024 * count, "retained metadata of {heap} bytes for {count} small files");
+    }
+
+    #[test]
+    fn listings_over_the_bounds_are_size_refusals() {
+        let root = scratch("listing");
+        for i in 0..10 { fs::write(root.join(format!("n{i}")), b"").unwrap(); }
+        let dir = open_dir(&root);
+        assert_eq!(list_dir_bounded(&dir, 10, 1 << 20).unwrap().len(), 10);
+        for (names, bytes) in [(9, 1 << 20), (10, 10 * 50 - 1)] {
+            let e = list_dir_bounded(&dir, names, bytes).unwrap_err();
+            assert_eq!(super::super::reason_of(&e), Reason::SizeLimit, "{e:#}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The caps refuse at the first offending xattr, before anything later is
+    /// read or kept.
+    #[test]
+    fn classifier_refuses_while_collecting() {
+        let mut bk = Bookkeeping::default();
+        let mut c = Classifier::new(Node::File, &mut bk, "entry 0");
+        for i in 0..32 { c.admit(format!("user.{i:02}").as_bytes(), b"").unwrap(); }
+        assert!(c.admit(b"user.32", b"").unwrap_err().to_string().contains("more than 32"));
+        let mut bk = Bookkeeping::default();
+        let mut c = Classifier::new(Node::File, &mut bk, "entry 0");
+        c.admit(b"user.a", &[0; 4000]).unwrap();
+        assert!(c.admit(b"user.b", &[0; 91]).unwrap_err().to_string().contains("over 4096"));
     }
 }

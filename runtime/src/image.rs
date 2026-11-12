@@ -275,7 +275,7 @@ fn open_dir_nofollow(path: &Path) -> Result<File> {
 
 /// Opens an image directory without following a symlink at its final
 /// component and checks the sandbox-ID ownership `validate_image` requires.
-fn open_image(roots: &Roots, name: &str) -> Result<File> {
+pub(crate) fn open_image(roots: &Roots, name: &str) -> Result<File> {
     validate_image_name(name)?;
     let dir = open_dir_nofollow(&roots.images.join(name)).with_context(|| format!("image {name:?}"))?;
     ensure!(dir.metadata()?.uid() == crate::userns::ID_BASE || cfg!(test),
@@ -1092,14 +1092,15 @@ fn collect_xattrs(list: impl Fn(&mut [u8]) -> isize, get: impl Fn(&CString, &mut
     }
     names.truncate(n as usize);
     let mut out = Vec::new();
+    // One reusable value buffer; each kept value is an exact-size copy (a
+    // 64 KiB allocation per value would multiply the walk's memory).
+    let mut value = vec![0u8; MAX_XATTR_BYTES];
     for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
         ensure!(out.len() < MAX_XATTRS, "more than {MAX_XATTRS} xattrs");
         let cname = CString::new(name)?;
-        let mut value = vec![0u8; MAX_XATTR_BYTES];
         let n = get(&cname, &mut value);
         let n = Errno::result(n).context("read xattr")? as usize;
-        value.truncate(n);
-        out.push((name.to_vec(), value));
+        out.push((name.to_vec(), value[..n].to_vec()));
     }
     out.sort();
     Ok(out)

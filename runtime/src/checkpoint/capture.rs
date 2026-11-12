@@ -129,11 +129,16 @@ pub fn capture(store: &Store, roots: &Roots, req: &Request) -> Result<String> {
         read_only_root: policy.read_only_root, writable_paths: policy.writable.clone(),
         excluded_paths: protected::excluded_paths(&generated), root: walked.root, entries: walked.entries };
     let opts = Options { generated: &generated, budget: req.limit_bytes, ids: IdMap::SANDBOX };
+    let image_dir = OwnedFd::from(image::open_image(roots, &reference.name)
+        .map_err(|e| refuse(Reason::ImageUnavailable, format!("{e:#}")))?);
     let mut lease = Some(lease);
-    write_artifact(store, &header, &upper, &opts, &manifest, &mut |final_check| {
+    write_artifact(store, &header, &upper, &opts, &manifest, &mut |walked| {
         let held = lease.as_ref().context("lease already released")?;
         ensure!(!held.lost(), refuse(Reason::Io, "the sandbox ended the checkpoint lease during capture"));
-        if final_check {
+        if let Some(walked) = walked {
+            // Still under the lease: every writable path exists as a plain
+            // directory in what a fork will see (a fork never creates one).
+            check_writable(&walked.entries, policy.read_only_root, &policy.writable, &image_dir)?;
             ensure!(facts(&run)? == before, refuse(Reason::Io, "the source sandbox changed identity during capture"));
             lease.take().unwrap().release().map_err(|e| refuse(Reason::Io, format!("{e:#}")))?;
         }
@@ -141,32 +146,71 @@ pub fn capture(store: &Store, roots: &Roots, req: &Request) -> Result<String> {
     })
 }
 
-/// Stages, walks, finishes and publishes one artifact. `check(false)` runs
-/// during the walk; `check(true)` runs once after the last source read and
-/// before anything is published (capture releases its lease there).
+/// Stages, walks, finishes and publishes one artifact. `check(None)` runs
+/// during the walk; `check(Some(walked))` runs once after the last source
+/// read (capture checks writable paths and releases its lease there).
+///
+/// One staging directory, created exclusively and locked, is used from start
+/// to reply: the manifest and marker are written and synced, the staged
+/// directory is validated as any reader would through that same locked
+/// descriptor, its charge S is measured and checked against R, and only then
+/// is it renamed into place (never replacing). The record comes from that
+/// locked artifact and the original header, never from reopening the name.
 pub fn write_artifact(store: &Store, header: &Header, upper: &OwnedFd, opts: &Options<'_>,
-    manifest: &dyn Fn(walk::Walked) -> Manifest, check: &mut dyn FnMut(bool) -> Result<()>) -> Result<String> {
+    manifest: &dyn Fn(walk::Walked) -> Manifest, check: &mut dyn FnMut(Option<&walk::Walked>) -> Result<()>)
+    -> Result<String> {
     let mut staging = store.begin(header)?;
-    let walked = walk::walk(upper, opts, &mut staging, &mut || check(false))?;
-    check(true)?;
+    let walked = walk::walk(upper, opts, &mut staging, &mut || check(None))?;
+    check(Some(&walked))?;
     let bookkeeping = walked.bookkeeping;
     let manifest = manifest(walked);
-    let bytes = manifest.encode();
     // Our own output must pass the rules every reader applies.
-    let (_, stats) = Manifest::decode(&bytes).map_err(|e| refuse(super::reason_of(&e), format!("{e:#}")))?;
+    let stats = manifest.validate()?;
+    let bytes = manifest.encode();
+    drop(manifest);
     let content = super::manifest::content_sha256(&bytes);
     let marker = Marker { content, binding: binding_sha256(&staging.header_bytes, &content), entries: stats.entries,
         objects: stats.objects, logical: stats.logical, manifest_bytes: bytes.len() as u64, bookkeeping };
-    staging.publish(&bytes, &marker)?;
-    let artifact = store.open(&header.instance, &header.checkpoint, false)?;
-    let charge = artifact.charge(store.require_quota)?;
-    if charge.charge > header.limit_bytes {
-        drop(artifact);
-        store.remove(&header.instance, &header.checkpoint)?;
-        return Err(refuse(Reason::SizeLimit, format!("the checkpoint's charge {} exceeds its limit {}",
-            charge.charge, header.limit_bytes)));
-    }
+    let (artifact, charge) = staging.publish(bytes, &marker)?;
     Ok(artifact.record(&charge))
+}
+
+/// Whether every configured writable path (and, for a read-only root, the
+/// default scratch directories Landlock opens) resolves to a plain directory
+/// in the merged view: the captured upper `entries` over the verified image
+/// at `image`, with overlay semantics (an upper directory merges with a lower
+/// directory unless opaque; a whiteout or non-directory hides everything).
+/// Image components are opened without following. A fork never creates
+/// writable directories, so an absent one would make the fork differ from the
+/// checkpoint: refused instead.
+pub fn check_writable(entries: &[super::manifest::Entry], read_only_root: bool, writable: &[String], image: &OwnedFd)
+    -> Result<()> {
+    if !read_only_root { return Ok(()); }
+    let defaults = crate::landlock::DEFAULT_WRITABLE.iter().filter(|p| !p.starts_with(protected::DEV));
+    for path in defaults.map(|p| p.to_string()).chain(writable.iter().cloned()) {
+        let missing = || refuse(Reason::LayoutUnsupported, format!("writable path {path} is absent or not a plain \
+            directory in the checkpoint; a sandbox restored from it never creates one"));
+        let mut lower = Some(image.try_clone()?);
+        let mut prefix: Vec<u8> = Vec::new();
+        for part in path.as_bytes().split(|b| *b == b'/').filter(|p| !p.is_empty()) {
+            if !prefix.is_empty() { prefix.push(b'/'); }
+            prefix.extend_from_slice(part);
+            let name = CString::new(part)?;
+            let next = lower.as_ref().and_then(|l| openat(l, &name, libc::O_RDONLY | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW).ok());
+            let upper = entries.binary_search_by(|e| {
+                let a: Vec<&[u8]> = e.path.split(|b| *b == b'/').collect();
+                let b: Vec<&[u8]> = prefix.split(|b| *b == b'/').collect();
+                a.cmp(&b)
+            }).ok().map(|i| &entries[i].body);
+            lower = match upper {
+                Some(Body::Dir { opaque, .. }) => if *opaque { None } else { next },
+                Some(_) => return Err(missing()),
+                None => Some(next.ok_or_else(missing)?),
+            };
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +252,9 @@ pub fn preflight(store: &Store, roots: &Roots, source: &str, image_name: &str, p
         .map_err(|e| refuse(Reason::ImageUnavailable, format!("image {image_name:?}: {e:#}")))?;
     ensure!(entry.sha256 == m.image_sha256, refuse(Reason::ImageUnavailable,
         format!("image {image_name:?} no longer has the checkpoint's content")));
+    let image_dir = OwnedFd::from(image::open_image(roots, image_name)
+        .map_err(|e| refuse(Reason::ImageUnavailable, format!("{e:#}")))?);
+    check_writable(&m.entries, m.read_only_root, &m.writable_paths, &image_dir)?;
     let charge = artifact.charge(store.require_quota)?;
     if let Some(disk) = disk {
         ensure!(disk >= charge.charge, refuse(Reason::DiskTooSmall,
@@ -495,5 +542,215 @@ mod tests {
             trusted.overlay.uuid=1\n"));
         assert_eq!(Marker::parse(&m.text()).unwrap(), m);
         assert!(Marker::parse(&m.text().replace("origin=2", "origin=02")).is_err());
+    }
+
+    fn upper_entries(dirs: &[(&str, bool)], whiteouts: &[&str], files: &[&str]) -> Vec<super::super::manifest::Entry> {
+        use super::super::manifest::{Entry, Meta, Xattrs};
+        let meta = || Meta { mode: 0o755, uid: 0, gid: 0, mtime: (0, 0), xattrs: Xattrs::new() };
+        let mut e: Vec<Entry> = dirs.iter().map(|(p, opaque)| Entry { path: p.as_bytes().to_vec(),
+            body: Body::Dir { meta: meta(), opaque: *opaque } }).collect();
+        e.extend(whiteouts.iter().map(|p| Entry { path: p.as_bytes().to_vec(), body: Body::Whiteout }));
+        e.extend(files.iter().map(|p| Entry { path: p.as_bytes().to_vec(), body: Body::File { meta: meta(), size: 0,
+            sha256: [0; 32], object: 0 } }));
+        e.sort_by(|a, b| a.path.split(|c| *c == b'/').cmp(b.path.split(|c| *c == b'/')));
+        e
+    }
+
+    /// Break-it review H2: a fork recreated a writable directory the source
+    /// had removed. Every writable path (and the default scratch
+    /// directories, for a read-only root) must be a plain directory in the
+    /// merged view: upper over image, with whiteouts and opacity applied.
+    #[test]
+    fn writable_paths_must_exist_in_the_merged_view() {
+        let root = scratch("writable");
+        let image = root.join("image");
+        for d in ["tmp", "root", "workspace", "lower-only/deep", "data"] { fs::create_dir_all(image.join(d)).unwrap(); }
+        fs::write(image.join("file"), b"").unwrap();
+        symlink("/data", image.join("link")).unwrap();
+        let img = open_dir(&image).unwrap();
+        let ok = |entries: &[super::super::manifest::Entry], paths: &[&str]| {
+            check_writable(entries, true, &paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(), &img)
+        };
+        let none = upper_entries(&[], &[], &[]);
+        ok(&none, &["/data", "/lower-only/deep"]).unwrap();
+        // Upper-only directories count; so do merged ones.
+        ok(&upper_entries(&[("gone-parent", false), ("gone-parent/gone", false)], &[], &[]),
+            &["/gone-parent", "/gone-parent/gone"]).unwrap();
+        let refused = |entries: &[super::super::manifest::Entry], paths: &[&str]| {
+            let e = ok(entries, paths).unwrap_err();
+            assert_eq!(super::super::reason_of(&e), Reason::LayoutUnsupported, "{e:#}");
+        };
+        // The reviewer's case: the child was removed (absent from upper and image).
+        refused(&upper_entries(&[("gone-parent", false)], &[], &[]), &["/gone-parent", "/gone-parent/gone"]);
+        // Whited out, replaced by a file, hidden by an opaque parent, a file
+        // or symlink in the image, or a missing default scratch directory.
+        refused(&upper_entries(&[], &["data"], &[]), &["/data"]);
+        refused(&upper_entries(&[], &[], &["data"]), &["/data"]);
+        refused(&upper_entries(&[("lower-only", true)], &[], &[]), &["/lower-only/deep"]);
+        refused(&none, &["/file"]);
+        refused(&none, &["/link"]);
+        refused(&upper_entries(&[], &["workspace"], &[]), &[]);
+        // A read-write root opens no writable paths, so nothing is required.
+        check_writable(&upper_entries(&[], &["workspace"], &[]), false, &[], &img).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Break-it review M1: two captures of one checkpoint raced; the one that
+    /// lost the lock removed the winner's staging directory. Each staging
+    /// directory is now its own (exclusive, nonce-named), and exactly one
+    /// capture publishes.
+    #[test]
+    fn concurrent_captures_never_touch_each_others_staging() {
+        use std::sync::{Arc, Barrier, mpsc};
+        let root = scratch("lock-race");
+        let runs = root.join("runs");
+        fs::create_dir(&runs).unwrap();
+        let checkpoint = cp(401);
+        let start = Arc::new(Barrier::new(2));
+        let finish = Arc::new(Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (runs, checkpoint, start, finish, tx) = (runs.clone(), checkpoint.clone(), start.clone(), finish.clone(), tx.clone());
+            workers.push(std::thread::spawn(move || {
+                let store = Store::under(&runs, false);
+                start.wait();
+                let held = store.begin(&header(&checkpoint, 64 << 20));
+                tx.send(held.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"))).unwrap();
+                finish.wait();
+                drop(held);
+            }));
+        }
+        let results = [rx.recv().unwrap(), rx.recv().unwrap()];
+        let staged = |runs: &Path| fs::read_dir(runs.join(".checkpoints").join(INSTANCE)).map(|d| d.count()).unwrap_or(0);
+        let live = staged(&runs);
+        finish.wait();
+        for w in workers { w.join().unwrap(); }
+        // Whatever the pre-check let through, nobody's directory vanished
+        // while its owner held it, and every one is gone after.
+        assert_eq!(live, results.iter().filter(|r| r.is_ok()).count(), "{results:?}");
+        assert_eq!(staged(&runs), 0);
+        // Full captures racing: exactly one publishes, the other is busy.
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("f"), b"x").unwrap();
+        let go = Arc::new(Barrier::new(2));
+        let racers: Vec<_> = (0..2).map(|_| {
+            let (runs, src, checkpoint, go) = (runs.clone(), src.clone(), checkpoint.clone(), go.clone());
+            std::thread::spawn(move || { go.wait(); capture_dir(&Store::under(&runs, false), &src, &checkpoint, 64 << 20) })
+        }).collect();
+        let outcomes: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1, "{outcomes:?}");
+        for o in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+            assert_eq!(super::super::reason_of(o), Reason::Busy, "{o:#}");
+        }
+        let store = Store::under(&runs, false);
+        store.open(INSTANCE, &checkpoint, false).unwrap().verify_objects().unwrap();
+        assert_eq!(store.inventory().unwrap().len(), 1, "a losing capture left staging behind");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Break-it review H3: a capture reopened its checkpoint by name after
+    /// publishing and returned whatever was there. It now keeps its exclusive
+    /// lock through the reply: nobody can remove or replace the artifact
+    /// before the record (derived from the capture's own header) is returned.
+    #[test]
+    fn capture_never_returns_a_replacement_generation() {
+        let root = scratch("rebound");
+        let runs = root.join("runs");
+        fs::create_dir(&runs).unwrap();
+        let upper = root.join("src");
+        fs::create_dir(&upper).unwrap();
+        fs::write(upper.join("file"), b"generation one").unwrap();
+        let checkpoint = cp(402);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let (runs, checkpoint, seen) = (runs.clone(), checkpoint.clone(), seen.clone());
+            super::super::store::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if phase != "published" { return; }
+                let store = Store::under(&runs, false);
+                let removed = store.remove(INSTANCE, &checkpoint).map_err(|e| super::super::reason_of(&e));
+                let opened = store.open(INSTANCE, &checkpoint, false).map(|_| ()).map_err(|e| super::super::reason_of(&e));
+                seen.borrow_mut().push((removed, opened));
+            })));
+        }
+        let first = capture_dir(&Store::under(&runs, false), &upper, &checkpoint, 64 << 20);
+        super::super::store::HOOK.with(|h| *h.borrow_mut() = None);
+        assert_eq!(*seen.borrow(), [(Err(Reason::Busy), Err(Reason::Busy))], "the artifact was reachable before the reply");
+        let first = first.unwrap();
+        assert!(first.contains("\ngeneration 1\n") && first.contains("\nlogical-bytes 14\n"), "{first}");
+        let store = Store::under(&runs, false);
+        assert_eq!(store.open(INSTANCE, &checkpoint, false).unwrap().header.generation, 1);
+        store.remove(INSTANCE, &checkpoint).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Break-it review H4: an artifact with S > R was published (and opened
+    /// by readers) before capture refused it. The charge is now checked on
+    /// the staged directory; nothing is ever published.
+    #[test]
+    fn oversized_charge_is_never_published() {
+        let root = scratch("charge");
+        let runs = root.join("runs");
+        fs::create_dir(&runs).unwrap();
+        let upper = root.join("src");
+        fs::create_dir(&upper).unwrap();
+        // N=2 (root + file), L=32 KiB: L + 16 KiB*N = R exactly, before M.
+        fs::File::create(upper.join("file")).unwrap().set_len(32 << 10).unwrap();
+        let checkpoint = cp(403);
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let (runs, checkpoint, observed) = (runs.clone(), checkpoint.clone(), observed.clone());
+            super::super::store::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                let store = Store::under(&runs, false);
+                observed.borrow_mut().push((phase.to_owned(), store.open(INSTANCE, &checkpoint, false).is_ok()));
+            })));
+        }
+        let capture = capture_dir(&Store::under(&runs, false), &upper, &checkpoint, 64 << 10);
+        super::super::store::HOOK.with(|h| *h.borrow_mut() = None);
+        let e = capture.unwrap_err();
+        assert_eq!(super::super::reason_of(&e), Reason::SizeLimit, "{e:#}");
+        assert_eq!(*observed.borrow(), [("staged".to_owned(), false)], "an S > R artifact was readable");
+        let store = Store::under(&runs, false);
+        assert!(store.open(INSTANCE, &checkpoint, false).is_err());
+        assert_eq!(store.inventory().unwrap(), [], "a refused capture left state behind");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The worst cases the caps permit, run by the VM under a 64 MiB memory
+    /// cgroup, one operation per process as in production (the capture
+    /// worker; the create shim's restore). `KILN_CHECKPOINT_FIXTURE` names a
+    /// prepared upper built outside the cgroup, `KILN_CHECKPOINT_RUNS` a runs
+    /// directory kept between steps, `KILN_CHECKPOINT_STEP` `capture` or
+    /// `restore`. Skipped when unset.
+    #[test]
+    fn prepared_worst_case_within_the_worker_budget() {
+        let (Ok(fixture), Ok(runs), Ok(step)) = (std::env::var("KILN_CHECKPOINT_FIXTURE"),
+            std::env::var("KILN_CHECKPOINT_RUNS"), std::env::var("KILN_CHECKPOINT_STEP")) else {
+            eprintln!("skipped: no fixture"); return;
+        };
+        let hwm = || fs::read_to_string("/proc/self/status").unwrap().lines()
+            .find(|l| l.starts_with("VmHWM")).unwrap_or("VmHWM: ?").split_whitespace().nth(1).unwrap_or("?").to_owned();
+        let store = Store::under(Path::new(&runs), false);
+        let started = std::time::Instant::now();
+        match step.as_str() {
+            "capture" => {
+                let record = capture_dir(&store, Path::new(&fixture), &cp(404), 1 << 30).unwrap();
+                eprintln!("capture fixture={fixture} elapsed={:?} VmHWM={} kB", started.elapsed(), hwm());
+                eprint!("{record}");
+            }
+            "restore" => {
+                let artifact = store.open(INSTANCE, &cp(404), false).unwrap();
+                eprintln!("open VmHWM={} kB entries={}", hwm(), artifact.stats.entries);
+                let dest = Path::new(&runs).join("fork");
+                fs::create_dir(&dest).unwrap();
+                super::super::restore::restore(&artifact, &open_dir(&dest).unwrap(), me(), &[]).unwrap();
+                eprintln!("restore elapsed={:?} VmHWM={} kB", started.elapsed(), hwm());
+                drop(artifact);
+                fs::remove_dir_all(&dest).unwrap();
+                store.remove(INSTANCE, &cp(404)).unwrap();
+            }
+            other => panic!("unknown step {other}"),
+        }
     }
 }

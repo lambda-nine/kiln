@@ -61,7 +61,34 @@ impl Store {
     pub fn under(runs: &Path, require_quota: bool) -> Self { Self { root: runs.join(NAMESPACE), require_quota } }
 }
 
-pub fn staging_name(checkpoint: &str, generation: u64) -> String { format!(".staging-{checkpoint}-{generation}") }
+/// `.staging-<checkpoint>-<generation>-<nonce>`: the nonce makes every
+/// capture's staging directory its own, created exclusively, so no other
+/// operation ever opens, locks or removes it.
+pub fn staging_name(checkpoint: &str, generation: u64, nonce: u64) -> String {
+    format!(".staging-{checkpoint}-{generation}-{nonce:016x}")
+}
+
+fn nonce() -> Result<u64> {
+    let mut b = [0u8; 8];
+    // SAFETY: getrandom into an owned buffer.
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    ensure!(n == 8, "getrandom failed");
+    Ok(u64::from_le_bytes(b))
+}
+
+// Test hooks at the capture's transitions (`staged`: validated, before the
+// charge check; `published`: renamed, before the reply).
+#[cfg(test)]
+pub(crate) type Hook = Option<Box<dyn FnMut(&str)>>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HOOK: std::cell::RefCell<Hook> = const { std::cell::RefCell::new(None) };
+}
+
+fn hook(_phase: &str) {
+    #[cfg(test)]
+    HOOK.with(|h| if let Some(f) = h.borrow_mut().as_mut() { f(_phase) });
+}
 
 pub fn object_name(n: u32) -> String { format!("{n:08x}") }
 
@@ -300,8 +327,11 @@ pub struct Staging {
     dir: OwnedFd,
     objects: OwnedFd,
     name: String,
-    checkpoint: String,
+    header: Header,
     pub header_bytes: Vec<u8>,
+    require_quota: bool,
+    /// Set once the directory carries the published name; until then Drop
+    /// removes it (it is ours: created exclusively under a fresh nonce).
     published: bool,
 }
 
@@ -317,11 +347,27 @@ impl Store {
         let taken = names(&instance)?.into_iter().any(|n| n == header.checkpoint.as_bytes()
             || [".staging-", ".removing-"].iter().any(|p| n.starts_with(format!("{p}{}-", header.checkpoint).as_bytes())));
         ensure!(!taken, refuse(Reason::Busy, format!("checkpoint {} already exists or has an operation", header.checkpoint)));
-        let name = staging_name(&header.checkpoint, header.generation);
+        let name = staging_name(&header.checkpoint, header.generation, nonce()?);
         let path = ipath.join(&name);
-        let dir = open_private_dir(Some(&instance), &path, &name, true)?.context("staging vanished")?;
+        let cname = cstr(&name)?;
+        // Exclusive: an existing directory is never adopted.
+        // SAFETY: mkdirat relative to the held instance directory.
+        if unsafe { libc::mkdirat(instance.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            return Err(match Errno::last() {
+                Errno::EEXIST => refuse(Reason::Busy, "staging name collision"),
+                e => anyhow::Error::new(e).context(format!("create {}", path.display())),
+            });
+        }
+        // From here the directory is ours, and Drop removes it on failure.
+        let dir = match openat(&instance, &cname, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+            Ok(dir) => dir,
+            Err(e) => { let _ = fs::remove_dir(&path); return Err(e); }
+        };
         let mut staging = Staging { path: path.clone(), objects: dir.try_clone()?, instance, dir, name,
-            checkpoint: header.checkpoint.clone(), header_bytes: header.text().into_bytes(), published: false };
+            header: header.clone(), header_bytes: header.text().into_bytes(), require_quota: self.require_quota,
+            published: false };
+        let st = fstat(staging.dir.as_raw_fd())?;
+        ensure!(st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0, "staging directory is not private");
         flock(&staging.dir, true)?;
         // The quota goes on while the directory is empty, so everything
         // created inside inherits its project.
@@ -351,19 +397,40 @@ impl Sink for Staging {
 }
 
 impl Staging {
-    /// Writes the manifest and completion marker and publishes the artifact,
-    /// in the durable order: objects (already synced), manifest, `objects/`,
-    /// the marker, the directory, the rename, the instance directory.
-    pub fn publish(mut self, manifest: &[u8], marker: &Marker) -> Result<PathBuf> {
+    /// Finishes and publishes the artifact. In order: write and sync the
+    /// manifest, sync `objects/`, write and sync the marker, sync the
+    /// directory; validate the staged directory as a reader would, through
+    /// this operation's own locked descriptor, against the original header;
+    /// measure A and S and refuse S > R; and only then rename it into place
+    /// (never replacing) and sync the instance directory. A refusal at any
+    /// point leaves nothing published (Drop removes the staging directory).
+    /// The returned artifact still holds the exclusive lock.
+    pub fn publish(mut self, manifest: Vec<u8>, marker: &Marker) -> Result<(Artifact, Charge)> {
         ensure!(manifest.len() <= MAX_MANIFEST_BYTES, refuse(Reason::SizeLimit, "manifest too large"));
-        write_new(&self.dir, MANIFEST, manifest)?;
+        write_new(&self.dir, MANIFEST, &manifest)?;
+        drop(manifest);
         sync(&self.objects)?;
         write_new(&self.dir, COMPLETE, marker.text().as_bytes())?;
         sync(&self.dir)?;
-        rename(&self.instance, &self.name, &self.checkpoint, libc::RENAME_NOREPLACE)?;
+        let mut artifact = validate_dir(self.dir.try_clone()?, self.path.clone(), &self.header.instance,
+            &self.header.checkpoint)?;
+        ensure!(artifact.header == self.header && artifact.marker == *marker,
+            refuse(Reason::Corrupt, "the staged artifact is not the one this capture wrote"));
+        hook("staged");
+        let charge = artifact.charge(self.require_quota)?;
+        if charge.charge > self.header.limit_bytes {
+            return Err(refuse(Reason::SizeLimit, format!("the checkpoint's charge {} exceeds its limit {}",
+                charge.charge, self.header.limit_bytes)));
+        }
+        rename(&self.instance, &self.name, &self.header.checkpoint, libc::RENAME_NOREPLACE).map_err(|e|
+            if e.downcast_ref::<Errno>() == Some(&Errno::EEXIST) {
+                refuse(Reason::Busy, format!("checkpoint {} was published by another capture", self.header.checkpoint))
+            } else { e })?;
         self.published = true;
         sync(&self.instance)?;
-        Ok(self.path.with_file_name(&self.checkpoint))
+        artifact.path = self.path.with_file_name(&self.header.checkpoint);
+        hook("published");
+        Ok((artifact, charge))
     }
 }
 
@@ -383,7 +450,8 @@ pub struct Artifact {
     pub header: Header,
     pub header_bytes: Vec<u8>,
     pub manifest: Manifest,
-    pub manifest_bytes: Vec<u8>,
+    /// The manifest's length (its bytes are not kept once decoded).
+    pub manifest_len: usize,
     pub stats: Stats,
     pub marker: Marker,
 }
@@ -416,6 +484,16 @@ impl Store {
         let path = ipath.join(checkpoint);
         let dir = open_private_dir(Some(&ifd), &path, checkpoint, false)?.ok_or_else(missing)?;
         flock(&dir, exclusive)?;
+        validate_dir(dir, path, instance, checkpoint)
+    }
+}
+
+/// Validates an artifact directory through a descriptor the caller holds
+/// (and has locked): exact contents, private modes, the header's binding to
+/// the expected IDs, both digests, the full manifest rules and every object's
+/// presence, type, mode, links and length.
+fn validate_dir(dir: OwnedFd, path: PathBuf, instance: &str, checkpoint: &str) -> Result<Artifact> {
+    {
         let corrupt = |m: String| refuse(Reason::Corrupt, m);
         let listed = names(&dir)?;
         ensure!(listed == [COMPLETE.as_bytes(), HEADER.as_bytes(), MANIFEST.as_bytes(), OBJECTS.as_bytes()],
@@ -430,16 +508,18 @@ impl Store {
         ensure!(content_sha256(&manifest_bytes) == marker.content, corrupt("manifest digest mismatch".into()));
         ensure!(binding_sha256(&header_bytes, &marker.content) == marker.binding, corrupt("binding digest mismatch".into()));
         let (manifest, stats) = Manifest::decode(&manifest_bytes)?;
+        let manifest_len = manifest_bytes.len();
+        drop(manifest_bytes);
         ensure!(manifest.image_sha256 == header.image_sha256, corrupt("manifest and header images differ".into()));
         ensure!((marker.entries, marker.objects, marker.logical, marker.manifest_bytes)
-            == (stats.entries, stats.objects, stats.logical, manifest_bytes.len() as u64),
+            == (stats.entries, stats.objects, stats.logical, manifest_len as u64),
             corrupt("completion marker does not match the manifest".into()));
         let objects = openat(&dir, &cstr(OBJECTS)?, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
         let st = fstat(objects.as_raw_fd())?;
         ensure!(st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o7777 == 0o700, corrupt("objects directory mode".into()));
         let expected: Vec<Vec<u8>> = (0..stats.objects).map(|n| object_name(n).into_bytes()).collect();
         ensure!(names(&objects)? == expected, corrupt("missing or extra objects".into()));
-        let artifact = Artifact { path, dir, objects, header, header_bytes, manifest, manifest_bytes, stats, marker };
+        let artifact = Artifact { path, dir, objects, header, header_bytes, manifest, manifest_len, stats, marker };
         for e in &artifact.manifest.entries {
             if let Body::File { size, object, .. } = e.body { artifact.object(object, size)?; }
         }
@@ -478,7 +558,7 @@ impl Artifact {
             None => allocated_blocks(&self.dir)?,
         };
         let round = |n: u64| n.div_ceil(4096) * 4096;
-        let metadata = round(self.manifest_bytes.len() as u64) + round(self.header_bytes.len() as u64)
+        let metadata = round(self.manifest_len as u64) + round(self.header_bytes.len() as u64)
             + round(self.marker.text().len() as u64);
         let formula = self.stats.logical_blocks.checked_add(ENTRY_ALLOWANCE.checked_mul(self.stats.entries)
             .context("charge overflow")?).and_then(|n| n.checked_add(metadata)).context("charge overflow")?;

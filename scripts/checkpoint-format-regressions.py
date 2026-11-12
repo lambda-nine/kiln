@@ -377,6 +377,28 @@ def run_fork_refusals():
     print("ok: spec, read-only, disk, missing, DNS conflict, corrupt object, image reference")
 
 
+def run_writable_paths():
+    """Break-it review H2: a fork recreated a writable directory the source had
+    removed. Capture now refuses an absent writable path, and a read-only
+    fork round-trips exactly without creating anything."""
+    writable = ("--read-only", "--writable", "/gone-parent", "--writable", "/gone-parent/gone")
+    src = create(*writable)
+    sh(src, "test -d /gone-parent/gone && rmdir /gone-parent/gone && test ! -e /gone-parent/gone")
+    refused(capture(src, 7), "checkpoint_layout_unsupported", "/gone-parent/gone")
+    assert not [i for i in inventory() if cp(7) in i[2]], inventory()
+    sh(src, "mkdir /gone-parent/gone && echo kept > /gone-parent/gone/f")
+    rec = captured(src, 7)
+    fork = create(*writable, "--from-checkpoint", f"{INSTANCE}/{cp(7)}")
+    assert logical(fork) == logical(src), "a read-only fork differs from its source"
+    assert captured(fork, 8)["content-sha256"] == rec["content-sha256"]
+    assert sh(fork, "cat /gone-parent/gone/f; echo w > /gone-parent/gone/g && echo writable") == "kept\nwritable\n"
+    for s_ in (src, fork):
+        remove(s_)
+    rm_checkpoint(7)
+    rm_checkpoint(8)
+    print("ok: absent writable path refused; read-only fork round trip creates nothing")
+
+
 def run_dns_round_trip():
     try:
         src = create("--net", "full")
@@ -460,6 +482,7 @@ def main():
         run_round_trip()
         run_refusals()
         run_fork_refusals()
+        run_writable_paths()
         run_dns_round_trip()
         run_allowance()
         assert inventory() == [], inventory()

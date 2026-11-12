@@ -52,7 +52,7 @@ const CREATE_RULESET_VERSION: u32 = 1 << 0;
 const RULE_PATH_BENEATH: u32 = 1;
 
 /// Writable when `--read-only` is on, on top of any `--writable` paths.
-const DEFAULT_WRITABLE: [&str; 4] = ["/tmp", "/root", "/workspace", "/dev/shm"];
+pub(crate) const DEFAULT_WRITABLE: [&str; 4] = ["/tmp", "/root", "/workspace", "/dev/shm"];
 
 /// `struct landlock_ruleset_attr`. Only the filesystem field: network rules
 /// (ABI 4) aren't used.
@@ -74,7 +74,11 @@ const _: () = assert!(size_of::<PathBeneathAttr>() == 12);
 /// `DEFAULT_WRITABLE` and `writable`, plus the existing files in /dev.
 /// Reading and executing stay allowed everywhere. Missing writable
 /// directories are created first.
-pub fn restrict_writes(writable: &[PathBuf]) -> Result<()> {
+/// `create_missing`: create absent writable directories (ordinary creates).
+/// A sandbox restored from a checkpoint passes false: its tree must be
+/// exactly the checkpoint's, so an absent writable path is an error, never
+/// recreated.
+pub fn restrict_writes(writable: &[PathBuf], create_missing: bool) -> Result<()> {
     // SAFETY: a NULL attr with the VERSION flag just queries the ABI version.
     let abi = unsafe {
         libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<RulesetAttr>(), 0, CREATE_RULESET_VERSION)
@@ -102,7 +106,7 @@ pub fn restrict_writes(writable: &[PathBuf]) -> Result<()> {
     let dev = writable_dir(&root, Path::new("/dev"), false)?;
     allow(&ruleset, &dev, Path::new("/dev"), WRITE_FILE | TRUNCATE)?;
     for dir in DEFAULT_WRITABLE.iter().map(Path::new).chain(writable.iter().map(PathBuf::as_path)) {
-        let handle = writable_dir(&root, dir, true)?;
+        let handle = writable_dir(&root, dir, create_missing)?;
         allow(&ruleset, &handle, dir, all)?;
     }
 

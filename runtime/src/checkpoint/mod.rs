@@ -46,6 +46,11 @@ pub const MAX_USER_XATTRS: usize = 32;
 /// Names plus values of the user xattrs of one entry. The 16 KiB per-entry
 /// allowance was measured conservative only with this cap.
 pub const MAX_USER_XATTR_BYTES: usize = 4096;
+/// Heap a checkpoint worker may spend on retained metadata (manifest entries,
+/// directory listings in progress, decoded manifests). With the 16 MiB
+/// encoded manifest and buffers this keeps capture and restore inside the
+/// design's 64 MiB worker memory limit.
+pub const HEAP_BUDGET: usize = 32 * 1024 * 1024;
 /// The per-entry metadata allowance in the storage charge.
 pub const ENTRY_ALLOWANCE: u64 = 16 * 1024;
 /// Bounds on the reservation a capture may be given (`--max-bytes`).

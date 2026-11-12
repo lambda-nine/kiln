@@ -79,8 +79,8 @@ fn apply(fd: &OwnedFd, meta: &Meta, ids: IdMap, opaque: bool) -> Result<()> {
     let (uid, gid) = ids.to_host(meta.uid, meta.gid)?;
     // SAFETY: plain syscalls on an open descriptor this import created.
     check(unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) }, "chown")?;
-    for (name, value) in &meta.xattrs {
-        let name = CString::new(name.as_slice())?;
+    for (name, value) in meta.xattrs.iter() {
+        let name = CString::new(name)?;
         check(unsafe { libc::fsetxattr(fd.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(),
             libc::XATTR_CREATE) }, "set xattr")?;
     }
@@ -115,7 +115,19 @@ fn materialize(artifact: &Artifact, upper: &OwnedFd, ids: IdMap) -> Result<()> {
     // their subtree is complete.
     let mut stack: Vec<(OwnedFd, (i64, u32))> = vec![(dup(upper)?, m.root.mtime)];
     let mut files: Vec<Option<(u64, u64)>> = vec![None; m.entries.len()];
+    // Dirty page cache and filesystem metadata are charged to the writer's
+    // memory cgroup; flushing every 512 entries or 16 MiB keeps them bounded
+    // inside the worker's limit however many small, xattr-heavy files there
+    // are. (Nothing is published by this: the run isn't mounted yet.)
+    let mut since_sync = (0usize, 0u64);
     for (i, e) in m.entries.iter().enumerate() {
+        if since_sync.0 >= 512 || since_sync.1 >= 16 << 20 {
+            // SAFETY: syncfs on the new upper's open descriptor.
+            check(unsafe { libc::syncfs(upper.as_raw_fd()) }, "sync the new upper")?;
+            since_sync = (0, 0);
+        }
+        since_sync.0 += 1;
+        if let Body::File { size, .. } = e.body { since_sync.1 += size; }
         let parts = components(&e.path).map_err(|w| corrupt(i, &w))?;
         while stack.len() > parts.len() {
             let (fd, mtime) = stack.pop().unwrap();
@@ -184,16 +196,17 @@ fn materialize(artifact: &Artifact, upper: &OwnedFd, ids: IdMap) -> Result<()> {
 /// metadata, no kernel bookkeeping, and no inode shared with the artifact.
 pub fn verify(artifact: &Artifact, upper: &OwnedFd, ids: IdMap, generated: &[&str]) -> Result<()> {
     let opts = Options { generated, budget: u64::MAX, ids };
-    let walked = walk::walk(upper, &opts, &mut HashOnly, &mut || Ok(()))
-        .map_err(|e| refuse(Reason::Corrupt, format!("the restored upper does not validate: {e:#}")))?;
     let m = &artifact.manifest;
-    ensure!(walked.root == m.root && walked.entries == m.entries && walked.bookkeeping == Default::default(),
+    // Compared entry by entry as the walk produces them: no second copy.
+    let walked = walk::walk_expect(upper, &opts, &m.entries, &mut HashOnly)
+        .map_err(|e| refuse(Reason::Corrupt, format!("the restored upper does not validate: {e:#}")))?;
+    ensure!(walked.root == m.root && walked.bookkeeping == Default::default(),
         refuse(Reason::Corrupt, "the restored upper differs from the checkpoint"));
-    let mut objects = Vec::new();
+    let mut objects = std::collections::HashSet::new();
     for e in &m.entries {
         if let Body::File { size, object, .. } = e.body {
             let st = fstat(artifact.object(object, size)?.as_raw_fd())?;
-            objects.push((st.st_dev, st.st_ino));
+            objects.insert((st.st_dev, st.st_ino));
         }
     }
     ensure!(walked.inodes.iter().all(|i| !objects.contains(i)),
