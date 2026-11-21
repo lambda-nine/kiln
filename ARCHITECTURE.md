@@ -164,11 +164,12 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
    sandbox's PID 1 over a control socket, so every command inherits the same
    restrictions. Files survive between commands; background processes do not.
    The per-exec cgroup must drain before another exec starts.
-2. **A daemon (`kilnd`) will own sandbox state.** Until the API daemon is added,
-   the CLI provides the same lifecycle and `kiln gc` reconciliation: it scans
-   persistent run directories and removes cgroups and network state whose shim
-   has died. `kiln gc ID...` gives the daemon a scoped form that cannot remove
-   an unlisted operator-owned sandbox.
+2. **A daemon (`kilnd`) owns sandbox state.** kilnd, in its own repository,
+   keeps run records in SQLite and reconciles them at startup through
+   `kiln ls` and the scoped `kiln gc ID...`, which cannot remove an unlisted
+   operator-owned sandbox. Without kilnd, the CLI provides the same lifecycle
+   and `kiln gc` reconciliation: it scans persistent run directories and
+   removes cgroups and network state whose shim has died.
 3. **One shim process per sandbox.** `kiln create` detaches a small host shim
    that owns cgroup and network cleanup while PID 1 serves `kiln exec` requests
    through a root-only Unix socket. This also lets sandboxes survive the CLI
@@ -179,7 +180,8 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 5. **Network egress denied by default**, with a per-sandbox allowlist and an
    egress proxy that logs requests.
 6. **The overlay upper layer is the audit log.** It is an exact diff of what a
-   sandbox changed, and the basis for snapshots later.
+   sandbox changed, and the basis for workspace checkpoints
+   ([checkpoint source contract](#checkpoint-source-contract)).
 
 ## Failure modes
 
@@ -218,7 +220,7 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 ## Build order
 
 ~~kiln-init~~ → ~~disk quota~~ → ~~user namespaces~~ → ~~seccomp/Landlock~~ → ~~networking~~ →
-~~metrics~~ → kilnd with long-lived sandboxes and exec → harness (with memory)
+~~metrics~~ → ~~kilnd with long-lived sandboxes and exec~~ → harness (with memory)
 → ~~cold-start work~~ ([docs/benchmarks.md](docs/benchmarks.md);
 a pool of pre-created sandboxes in kilnd is the next step) → k3s operator.
 

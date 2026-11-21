@@ -56,32 +56,36 @@ ones. Read these before changing anything:
   reviewed adversarially by AI models, not audited. Don't describe it as a
   security boundary for hostile multi-tenant workloads.
 
-## Status (October 12, 2026)
+## Status (November 20, 2026)
 
 - **v0.1.0 is tagged and staged as a private draft release** in the original
-  private archive on GitHub. The active repository is also private. Publishing
-  a release or making the repository public needs Stephen's explicit approval
-  for that release (RELEASING.md).
+  private archive on GitHub. The active repository, `lambda-nine/kiln`, is
+  public, with private vulnerability reporting on. Publishing a release needs
+  Stephen's explicit approval for that release (RELEASING.md).
   Rootfs tarballs in the draft include GPL/LGPL Alpine packages and need a
   redistribution review before they're published.
 - **Done:** layers 1-11 in the README (namespaces through persistent
   sandboxes with `create`/`exec`/`ls`/`rm`/`gc`), metrics, two adversarial
   review rounds, cold-start work (`clone3(CLONE_INTO_CGROUP)`, netlink instead
   of `ip`/`nsenter`, batched nft), the v2 benchmark campaign, the design paper
-  (`docs/paper/`) and the performance white paper (`docs/whitepaper/`).
-- **The reusable harness/control daemon will live beside this repository** as
-  `~/Projects/lambda-nine/kilnd`. ARCHITECTURE.md's target diagram shows the
-  long-term shape; the daemon is not part of this repository.
+  (`docs/paper/`) and the performance white paper (`docs/whitepaper/`). Since
+  v0.1.0: persistent-exec protocol v1 and exec options
+  (docs/exec-protocol-v1.md), checkpoint leases and image identity
+  (docs/checkpoint-lease-v1.md, docs/image-identity-v1.md), and checkpoint
+  capture and fork (docs/checkpoint-format-v1.md).
+- **The control daemon and the agent harness live beside this repository** as
+  `~/Projects/lambda-nine/kilnd` (sandbox manager with startup reconciliation,
+  SQLite run records and a gRPC API over a Unix socket) and
+  `~/Projects/lambda-nine/kiln-harness`. Neither is part of this repository;
+  ARCHITECTURE.md's target diagram shows the long-term shape.
 
 ## Next, roughly in order
 
-1. **`kilnd`**, the per-node daemon in ARCHITECTURE.md: sandbox manager with
-   reconcile on startup, run records, and a gRPC API over a Unix socket.
-2. **A pool of pre-created sandboxes** in `kilnd`, the next startup win named
+1. **A pool of pre-created sandboxes** in `kilnd`, the next startup win named
    in both papers.
-3. **Rerun the benchmarks on bare Linux** (the Mac Mini, once it's set up)
+2. **Rerun the benchmarks on bare Linux** (the Mac Mini, once it's set up)
    instead of one Lima VM on a laptop.
-4. **The Go operator on k3s** with a Sandbox CRD, `kilnd` as a DaemonSet.
+3. **The Go operator on k3s** with a Sandbox CRD, `kilnd` as a DaemonSet.
 
 Open items from the failure-mode table: allowlist drift (the DNS forwarder
 should add resolved IPs to the sandbox's nft set), per-sandbox ID ranges
