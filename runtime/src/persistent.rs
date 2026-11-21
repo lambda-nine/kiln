@@ -237,8 +237,18 @@ pub fn before_allocation<T>(result: Result<T>) -> Result<T> {
 /// `fork` is a checkpoint that passed the preflight; its upper is restored
 /// by the shim before the sandbox mounts it.
 pub fn create(cfg: &Config, from_checkpoint: Option<crate::checkpoint::capture::Fork>) -> Result<String> {
+    create_with_id(cfg, from_checkpoint, container::new_id)
+}
+
+/// The ID generator is a parameter only so tests can prove that a refusal happens
+/// before an ID exists; production always passes `container::new_id`.
+pub(crate) fn create_with_id(
+    cfg: &Config,
+    from_checkpoint: Option<crate::checkpoint::capture::Fork>,
+    new_id: impl FnOnce() -> String,
+) -> Result<String> {
     before_allocation(container::preflight(cfg))?;
-    let id = container::new_id();
+    let id = new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     // SAFETY: the CLI is single-threaded here.
     match unsafe { fork() }.context("fork shim")? {

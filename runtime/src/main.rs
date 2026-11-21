@@ -538,6 +538,12 @@ mod tests {
 mod create_certainty_tests {
     use super::*;
 
+    // "Before ID" is observed, not inferred from the error type: these tests hand
+    // `persistent::create_with_id` an ID generator that panics, so a refusal that
+    // moved below ID creation fails the test instead of returning the same error.
+    // A config that gets past preflight needs a real image, which unit tests don't
+    // have; the converse (moving preflight below `new_id`) is checked by mutation.
+
     #[test]
     fn preflight_errors_are_typed_but_other_failures_are_not() {
         let error = persistent::before_allocation::<()>(Err(anyhow::anyhow!("invalid config"))).unwrap_err();
@@ -558,7 +564,7 @@ mod create_certainty_tests {
         for (bad, flag) in [(cfg(memory - 1, cpus, pids, disk), "--memory"), (cfg(memory, 0.0099, pids, disk), "--cpus"),
             (cfg(memory, f64::INFINITY, pids, disk), "--cpus"), (cfg(memory, cpus, pids - 1, disk), "--pids"),
             (cfg(memory, cpus, pids, disk - 1), "--disk"), (cfg(memory, cpus, pids, 0), "--disk")] {
-            let error = persistent::create(&bad, None).unwrap_err();
+            let error = persistent::create_with_id(&bad, None, || panic!("new_id reached before refusal")).unwrap_err();
             assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
             assert!(format!("{error:#}").contains(flag), "{flag}: {error:#}");
         }
@@ -573,7 +579,7 @@ mod create_certainty_tests {
             hostname: "kiln".into(), image: "round2-missing-image-unit-fixture".into(),
             keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,
         };
-        let error = persistent::create(&cfg, None).unwrap_err();
+        let error = persistent::create_with_id(&cfg, None, || panic!("new_id reached before refusal")).unwrap_err();
         assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
         assert!(format!("{error:#}").contains("image"));
     }

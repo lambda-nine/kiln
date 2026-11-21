@@ -5,6 +5,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Make the create-certainty unit tests observe ID creation (adversarial
+  review): the persistent create takes its ID generator as a parameter
+  internally, and the tests that claim a refusal comes before allocation pass
+  one that panics, so moving the preflight below `new_id` now fails them.
+
 - Keep the create-certainty regression honest: `--pids=0`, its deliberate
   post-preflight failure, is now a preflight refusal, so the script fails
   after allocation with an image that has no `/dev` (an empty scratch image;
