@@ -106,7 +106,11 @@ unregister it first.
 
 Every new run, persistent or one-shot, writes `/var/lib/kiln/runs/<id>/image`
 before its overlay is mounted. This happens after the run's quota is set,
-under the shared lock:
+under the shared lock. The reference opens the image directory without
+following a symlink at its name, and so does the create preflight, before
+anything is allocated: an alias such as `images/latest -> alpine` is refused
+up front (`kiln create` exits 124), never in the shim.
+
 
 ```text
 kiln-image-ref 1

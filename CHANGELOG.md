@@ -5,6 +5,12 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Resolve the image name without following a symlink in preflight (kiln
+  security review F1): `create` and `run` open the image the way the shim's
+  image reference does (`O_NOFOLLOW`, sandbox-range owner), so an alias such
+  as `images/latest -> alpine` is refused with exit 124 instead of failing in
+  the shim after its run directory existed.
+
 - Check limits before allocation (kiln security review F2 and F3): `create`
   and `run` refuse `--memory` below 32M, `--cpus` below 0.01, not finite or
   past the kernel's largest `cpu.max` quota, `--pids` below 16 or over

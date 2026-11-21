@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, chown, symlink};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, chown, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,7 +30,6 @@ use crate::storage;
 use crate::quota;
 use crate::trace;
 use crate::userns;
-use crate::validation;
 
 const KILN_ROOT: &str = "/var/lib/kiln";
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -153,27 +152,25 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
 
 /// Everything about the image that a create decides before it allocates
 /// (persistent create's preflight, and `kiln run` before its run directory):
-/// the image exists and belongs to the sandbox ID range, and with
-/// `--read-only` every writable path survives the shim's Landlock walk over
-/// it (`landlock::preflight`). The shim repeats this before its run
-/// directory, so an image changed in between fails before anything exists.
+/// the image opens the way the shim's image reference opens it
+/// (`image::open_image`: no symlink at the name, owned by the sandbox ID
+/// range), so an alias symlinked to another image is refused here rather
+/// than in the shim; and with `--read-only` every writable path survives the
+/// shim's Landlock walk over that directory (`landlock::preflight`). The
+/// shim repeats this before its run directory, so an image changed in
+/// between fails before anything exists.
 pub fn validate_image(cfg: &Config) -> Result<()> {
     validate_image_in(&image::Roots::system(), cfg)
 }
 
 fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
-    validation::validate_image_name(&cfg.image)?;
-    let lower = roots.images.join(&cfg.image);
-    // (Tests' scratch images belong to the test user, as in `image::open_image`.)
-    if !lower.is_dir() || (lower.metadata()?.uid() != userns::ID_BASE && !cfg!(test)) {
-        bail!("image {:?} is missing or isn't owned by the sandbox ID range (try: sudo scripts/fetch-alpine.sh)",
-            cfg.image);
-    }
+    let image = image::open_image(roots, &cfg.image).map_err(|e| {
+        let missing = e.root_cause().downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+        if missing { e.context("image is missing (try: sudo scripts/fetch-alpine.sh)") } else { e }
+    })?;
     if cfg.read_only {
-        // The directory the shim mounts, opened the way its image reference
-        // opens it (`image::open_image`, no symlink at the name).
-        let image = OwnedFd::from(image::open_image(roots, &cfg.image)?);
-        landlock::preflight(&image, &cfg.writable, &generated(cfg))?;
+        landlock::preflight(&OwnedFd::from(image), &cfg.writable, &generated(cfg))?;
     }
     Ok(())
 }
@@ -860,7 +857,28 @@ mod tests {
         assert!(validate_image_in(&roots, &config("img", true, &["/etc/resolv.conf/x"], "full")).is_err());
         // Without a read-only root there is no Landlock walk to fail.
         validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
-        assert!(validate_image_in(&roots, &config("missing", false, &[], "none")).is_err());
+        let missing = validate_image_in(&roots, &config("missing", false, &[], "none")).unwrap_err();
+        assert!(format!("{missing:#}").contains("fetch-alpine"), "{missing:#}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An image name that is a symlink (an alias of another image) is refused
+    /// by the preflight, with or without a read-only root, as the shim's
+    /// no-follow image reference would refuse it after allocation.
+    #[test]
+    fn preflight_refuses_a_symlinked_image_name() {
+        let (root, roots) = scratch_roots("alias");
+        symlink("img", roots.images.join("latest")).unwrap();
+        for read_only in [false, true] {
+            let error = validate_image_in(&roots, &config("latest", read_only, &[], "none")).unwrap_err();
+            assert!(format!("{error:#}").contains("latest"), "{error:#}");
+            // The shim's reference opens the image the same way.
+            assert!(image::open_image(&roots, "latest").is_err());
+        }
+        validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
+        for bad in ["../img", ".img", "-img", ""] {
+            assert!(validate_image_in(&roots, &config(bad, false, &[], "none")).is_err(), "{bad:?}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -293,9 +293,11 @@ kiln's floors, which are kilnd's (`--memory` 32 MiB, `--cpus` 0.01, `--pids`
 16, `--disk` 64 MiB, so `--disk 0` no longer means no block limit), or past
 what the cgroup files take (`--cpus` beyond the kernel's largest `cpu.max`
 quota or not finite, `--pids` over 4194304), and a hostname over 64 bytes,
-are refused. With `--read-only`
-it runs the shim's own writable-path walk (`landlock::walk`) over the image
-directory, opened without following its name: a symlinked or regular-file
+are refused. The image is opened as the shim's image reference opens it
+(`image::open_image`: no symlink at the name, owned by the sandbox ID
+range), so a symlinked alias is refused here too. With `--read-only`
+it runs the shim's own writable-path walk (`landlock::walk`) over that image
+directory: a symlinked or regular-file
 component, a path over kiln's own `/proc`, `/sys` or `/dev` mounts (all but
 `/dev` and `/dev/shm`), a path through a file kiln writes
 (`/etc/resolv.conf` with DNS) or a component over 255 bytes is refused.
