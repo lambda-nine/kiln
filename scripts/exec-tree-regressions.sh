@@ -185,8 +185,10 @@ echo "PASS: rm interrupts active exec"
 # Under pids.max 4, PID 1 and an exec holding three tasks fill the sandbox.
 # Killed tasks hold their slots until reaped, so an exec that starts right
 # after a disconnect would fail to fork, and take PID 1 down, unless the
-# previous exec was fully reaped first.
-create_sandbox 4
+# previous exec was fully reaped first. kiln refuses --pids below 16, so host
+# root lowers pids.max to 4 after the create.
+create_sandbox 16
+echo 4 | sudo tee "/sys/fs/cgroup/kiln/$sandbox/pids.max" >/dev/null
 sudo sh -eu -c '
     kiln=$1 sandbox=$2 fifo=$3 rounds=$4
     i=0
