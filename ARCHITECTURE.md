@@ -102,7 +102,10 @@ bytes are consumed. A partial competing body cannot delay queued removal.
 
 The shim atomically publishes `shim.start` followed by `shim.pid`, using a
 same-directory rename for each file; the PID file is the completed identity
-record. `kiln ls` and `kiln gc` call a shim live only when that PID's current
+record. It does so right after creating its run directory, before the quota,
+image reference or control socket, and any failure before readiness removes
+the directory again, so every run directory a create leaves has an identity
+that `kiln ls` lists and `kiln gc` collects once the shim is dead. `kiln ls` and `kiln gc` call a shim live only when that PID's current
 `/proc/<pid>/stat` start time still matches the record and the process is not a
 zombie. A different process reusing the PID during the same boot is stale.
 Once the PID marker exists, missing, malformed or unreadable identity metadata
@@ -200,7 +203,7 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 | Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
-| Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir). One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
+| Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir, also of a shim that died during setup). Only a crash between the run directory's `mkdir` and its identity files leaves a directory without `shim.pid` to remove by hand. One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Partial: `kiln gc` rejects same-boot PID reuse, but a coincidental PID/start-time match across boots is retained for manual review; boot identity and automatic daemon startup reconciliation remain open |

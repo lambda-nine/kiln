@@ -306,7 +306,10 @@ and prompt removal.
     kiln itself fails, for example because the sandbox is gone.
     `kiln ls` lists live and stale shims by matching both `shim.pid` and its
     recorded Linux process start time; same-boot PID reuse cannot make stale
-    state look live. `kiln rm` stops one and waits for its resources to be removed, and
+    state look live. A shim publishes that identity right after creating its
+    run directory and removes the directory if setup fails, so `ls` and `gc`
+    also see a shim that is still being set up or died during setup; `kiln rm`
+    of a dead one points at `kiln gc`. `kiln rm` stops one and waits for its resources to be removed, and
     `kiln gc` removes cgroups, network state and run directories left by
     crashed shims, removing child cgroup directories before their parent.
     Optional ID arguments restrict cleanup to those sandboxes, so a manager

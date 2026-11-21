@@ -874,7 +874,14 @@ fn validate_machine_stdio(status: RawFd, stdio: [RawFd; 3]) -> Result<()> {
 
 pub fn remove(id: &str) -> Result<()> {
     validate_id(id)?;
-    let mut stream = connect(id)?;
+    let mut stream = connect(id).map_err(|e| {
+        // A shim that died before or after binding its socket left state
+        // that only `kiln gc` removes; say so instead of just failing.
+        match read_shim(&container::run_dir(id)).and_then(|shim| shim.is_live()) {
+            Ok(false) => e.context(format!("sandbox {id}'s shim has exited; `kiln gc {id}` removes what it left")),
+            _ => e,
+        }
+    })?;
     send_header(&stream, 2, 0, &[])?;
     let mut status = [0u8; 4];
     stream
@@ -891,7 +898,23 @@ pub fn remove(id: &str) -> Result<()> {
 }
 
 pub fn list() -> Result<()> {
-    let root = Path::new(RUNS_ROOT);
+    let records = list_records(Path::new(RUNS_ROOT))?;
+    println!("ID\tSTATUS\tSHIM");
+    for (id, live, pid) in records {
+        println!(
+            "{id}\t{}\t{}",
+            if live { "running" } else { "stale" },
+            pid.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Every run directory with a shim identity, sorted: its ID, whether the
+/// shim is live, and the recorded PID. A shim publishes its identity right
+/// after creating its directory, so this includes one still being set up
+/// (live, no control socket yet) and one that died then (stale, for `gc`).
+fn list_records(root: &Path) -> Result<Vec<(String, bool, String)>> {
     let mut records = Vec::new();
     for entry in registry_entries(root)? {
         let id = entry
@@ -911,26 +934,10 @@ pub fn list() -> Result<()> {
         // never evidence that the shim is dead.
         let shim = read_shim(&dir)?;
         let live = shim.is_live()?;
-        if !dir
-            .join("control.sock")
-            .try_exists()
-            .with_context(|| format!("inspect sandbox registry entry {id}"))?
-        {
-            continue;
-        }
         records.push((id, live, shim.pid_text));
     }
     records.sort_by(|a, b| a.0.cmp(&b.0));
-
-    println!("ID\tSTATUS\tSHIM");
-    for (id, live, pid) in records {
-        println!(
-            "{id}\t{}\t{}",
-            if live { "running" } else { "stale" },
-            pid.trim()
-        );
-    }
-    Ok(())
+    Ok(records)
 }
 
 pub fn gc(ids: &[String]) -> Result<()> {
@@ -1982,6 +1989,33 @@ mod tests {
             "global GC must still fail closed on malformed registry identity"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `kiln ls` lists every directory with an identity, socket or not: a
+    /// shim that died before binding its control socket is stale, and the
+    /// same directory is a `gc` candidate.
+    #[test]
+    fn listing_includes_identities_without_a_control_socket() {
+        let root = std::env::temp_dir().join(format!("kiln-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let pid = std::process::id();
+        let (_, start) = process_state_and_start(pid).unwrap().unwrap();
+        for (id, pid, start, socket) in [("aaaa-1", pid, start, true), ("bbbb-2", pid, start, false),
+            ("cccc-3", i32::MAX as u32, 1, false)] {
+            let dir = root.join(id);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("shim.pid"), pid.to_string()).unwrap();
+            fs::write(dir.join("shim.start"), start.to_string()).unwrap();
+            if socket { fs::write(dir.join("control.sock"), "").unwrap(); }
+        }
+        // A one-shot run's directory has no identity and isn't listed.
+        fs::create_dir(root.join("dddd-4")).unwrap();
+        let listed: Vec<_> = list_records(&root).unwrap().into_iter().map(|(id, live, _)| (id, live)).collect();
+        assert_eq!(listed, [("aaaa-1".to_string(), true), ("bbbb-2".into(), true), ("cccc-3".into(), false)]);
+        let stale: Vec<_> = stale_gc_candidates(&root, &[]).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(stale, ["cccc-3"]);
         fs::remove_dir_all(root).unwrap();
     }
 

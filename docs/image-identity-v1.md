@@ -136,8 +136,13 @@ no-op), unregistering or removing a name is refused while any run directory
 under `/var/lib/kiln/runs` references it. It is also refused while any run's
 reference is missing or unreadable, because that run's image is unknown. Runs
 created by older kiln versions have no reference at all, so they block every
-image removal until they are gone. A crashed shim's run directory blocks until
-`kiln gc` removes it. The reference is published by rename without an fsync;
+image removal until they are gone. A create that fails before its sandbox
+starts removes its run directory. A crashed shim's run directory blocks until
+`kiln gc` removes it: the shim publishes its identity right after creating
+the directory, so `gc` can collect it from then on. Only a crash between the
+directory's `mkdir` and that identity (or a directory left by an older kiln)
+leaves one without `shim.pid`, which `gc` skips; remove it by hand once no
+create is running. The reference is published by rename without an fsync;
 after a crash a lost reference is an unknown reference, which still blocks
 (the check fails closed).
 

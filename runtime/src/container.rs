@@ -106,24 +106,37 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
         work: run_dir.join("work"),
         merged: run_dir.join("merged"),
     };
-    create_run_dir(&run_dir)?;
-    prepare(cfg, &run_dir, &layers)?;
-    if let Some(fork) = fork {
-        // The upper is rebuilt before anything mounts it; the artifact's
-        // shared lock is released when `fork` is consumed here. A failed
-        // restore removes the run: no sandbox starts on a partial upper.
-        if let Err(e) = checkpoint::capture::restore_into(fork, &run_dir, &generated(cfg)) {
-            let _ = fs::remove_dir_all(&run_dir);
-            return Err(e);
-        }
-    }
-    let socket = run_dir.join("control.sock");
-    let listener = bind_control_socket(&socket)?;
     let pid = std::process::id();
-    publish_shim_identity(&run_dir, pid, &process_start_time(pid)?)?;
+    let start = process_start_time(pid)?;
+    let listener = create_owned_run_dir(&run_dir, pid, &start, || {
+        prepare(cfg, &run_dir, &layers)?;
+        if let Some(fork) = fork {
+            // The upper is rebuilt before anything mounts it; the artifact's
+            // shared lock is released when `fork` is consumed here. A failed
+            // restore removes the run: no sandbox starts on a partial upper.
+            checkpoint::capture::restore_into(fork, &run_dir, &generated(cfg))?;
+        }
+        bind_control_socket(&run_dir.join("control.sock"))
+    })?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     let _ = fs::remove_dir_all(&run_dir);
     result.map(|_| ())
+}
+
+/// Creates a persistent run's directory and publishes this shim's identity
+/// in it at once, before its quota and everything else, then runs `setup`.
+/// From the identity on, `kiln ls` lists the directory and `kiln gc` removes
+/// it if this shim dies; and any error here removes it again, so a create
+/// that fails before its sandbox starts leaves nothing behind. Only a crash
+/// between the `mkdir` and the identity leaves a directory without
+/// `shim.pid`. A directory that already existed is never touched.
+fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, setup: impl FnOnce() -> Result<T>) -> Result<T> {
+    create_run_dir(run_dir)?;
+    let result = publish_shim_identity(run_dir, pid, start).and_then(|()| setup());
+    if result.is_err() {
+        let _ = fs::remove_dir_all(run_dir);
+    }
+    result
 }
 
 /// Linux's limit on a hostname (`HOST_NAME_MAX`); `sethostname` refuses longer.
@@ -284,8 +297,10 @@ where
 }
 
 fn prepare(cfg: &Config, run_dir: &Path, layers: &Layers) -> Result<()> {
-    // The quota goes on the run dir while it's still empty, so upper/ and
-    // work/ (and everything the sandbox writes) inherit its project.
+    // The quota goes on the run dir before anything of the sandbox's is in
+    // it, so upper/ and work/ (and everything the sandbox writes) inherit its
+    // project. A persistent shim's identity files are already there and stay
+    // outside it.
     quota::limit(run_dir, cfg.disk)?;
     trace::mark("host: disk quota");
     for dir in [&layers.upper, &layers.work, &layers.merged] {
@@ -900,6 +915,40 @@ mod tests {
         assert_eq!(socket.metadata().unwrap().permissions().mode() & 0o777, 0o600);
 
         drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("kiln-{tag}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// The identity is published before setup runs, and a failed setup (a
+    /// failed quota, image reference, policy record, restore or socket)
+    /// removes the run directory it created, never one that already existed.
+    #[test]
+    fn a_run_directory_has_its_identity_first_and_is_removed_on_failure() {
+        let root = scratch_dir("owned-run");
+        let run = root.join("run");
+        let error = create_owned_run_dir(&run, 1234, "5678", || -> Result<()> {
+            assert_eq!(fs::read_to_string(run.join("shim.pid")).unwrap(), "1234");
+            assert_eq!(fs::read_to_string(run.join("shim.start")).unwrap(), "5678");
+            fs::create_dir(run.join("upper")).unwrap();
+            bail!("prepare failed")
+        }).unwrap_err();
+        assert_eq!(error.to_string(), "prepare failed");
+        assert!(!run.exists(), "a failed setup left its run directory");
+
+        let value = create_owned_run_dir(&run, 1234, "5678", || Ok(7)).unwrap();
+        assert_eq!(value, 7);
+        assert!(run.join("shim.pid").exists());
+        // A collision fails before setup and leaves the other directory alone.
+        let ran = std::cell::Cell::new(false);
+        assert!(create_owned_run_dir(&run, 99, "1", || { ran.set(true); Ok(()) }).is_err());
+        assert!(!ran.get());
+        assert_eq!(fs::read_to_string(run.join("shim.pid")).unwrap(), "1234");
         fs::remove_dir_all(root).unwrap();
     }
 

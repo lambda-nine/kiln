@@ -5,6 +5,15 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Leave no run directory without an identity (kiln security review F1): a
+  persistent shim publishes `shim.start` and `shim.pid` right after creating
+  its run directory, before the quota, and removes the directory on every
+  failure before readiness, not only a failed restore. `kiln ls` lists every
+  directory with an identity, with or without a control socket yet, so a shim
+  that died during setup is listed stale and `kiln gc` removes it; `kiln rm`
+  of one names `kiln gc`. Such directories used to be invisible to `ls`, `gc`
+  and `rm` and blocked image management.
+
 - Resolve the image name without following a symlink in preflight (kiln
   security review F1): `create` and `run` open the image the way the shim's
   image reference does (`O_NOFOLLOW`, sandbox-range owner), so an alias such
