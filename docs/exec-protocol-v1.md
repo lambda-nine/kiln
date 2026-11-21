@@ -148,7 +148,10 @@ exec protocol v1 or older PID 1 compatibility. Machine managers that rely on
 create certainty must require this bit from the installed CLI before create.
 `kiln create` returns **124**, with empty stdout, only when validation, missing
 image or another preflight failure occurred before `container::new_id` and
-before any sandbox allocation. CLI syntax/configuration failures are included;
+before any sandbox allocation. The preflight covers every input a caller
+chooses: limits below kiln's floors or past the cgroup maxima, a symlinked
+image name, and, with `--read-only`, writable paths walked through the image
+as the shim will walk them (ARCHITECTURE.md, "Persistent-create certainty"). CLI syntax/configuration failures are included;
 help/version keep exit 0. Success still prints exactly the new sandbox ID.
 Every other nonzero exit, signal, timeout, missing result or malformed output
 is allocation-ambiguous. Human stderr text is never an absence signal. This

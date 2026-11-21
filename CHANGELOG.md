@@ -5,6 +5,15 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Keep the create-certainty regression honest: `--pids=0`, its deliberate
+  post-preflight failure, is now a preflight refusal, so the script fails
+  after allocation with an image that has no `/dev` (an empty scratch image;
+  kiln's `/dev` tmpfs mount is the first step that needs it), and checks
+  that the failure exits neither 0 nor 124 and leaves no run directory. It
+  also checks every new refusal (exit 124, nothing allocated), one past each
+  limit, and that creates at the floors and with `/dev/shm`, image and
+  not-yet-existing writable paths still work.
+
 - Name the recovery for a checkpoint that blocks images (kiln security
   review N1): when an artifact or staging directory's header can't be read,
   the `kiln image` refusal names the `kiln checkpoint rm --instance I
