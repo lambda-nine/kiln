@@ -323,7 +323,7 @@ def run():
     rejected = subprocess.run([KILN, "create", "--require-exec-protocol=2"], capture_output=True, timeout=5)
     assert rejected.returncode != 0 and rejected.stdout == b""
     identifier = subprocess.check_output([KILN, "create", "--require-exec-protocol=1", "--memory", "64M",
-                                          "--pids", "32", "--disk", "16M"], timeout=10).decode().strip()
+                                          "--pids", "32", "--disk", "64M"], timeout=10).decode().strip()
     try:
         caps(identifier)
         for code in (125, 126, 127, 143):
@@ -376,8 +376,12 @@ def run():
     finally:
         subprocess.run([KILN, "rm", identifier], check=True, timeout=15)
     limited = subprocess.check_output([KILN, "create", "--require-exec-protocol=1", "--memory", "64M",
-                                       "--pids", "1", "--disk", "16M"], timeout=10).decode().strip()
+                                       "--pids", "16", "--disk", "64M"], timeout=10).decode().strip()
     try:
+        # kiln refuses --pids below 16; host root lowers the limit to PID 1's
+        # one slot so the exec's fork fails with EAGAIN.
+        with open(f"/sys/fs/cgroup/kiln/{limited}/pids.max", "w") as limit:
+            limit.write("1")
         rc, status, out, err, diag = machine(limited, ["true"])
         assert outcome(status) == (2, 0, 1, 0, 0, 6, 5, errno.EAGAIN) and rc == 125
         assert out == err == b""

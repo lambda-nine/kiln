@@ -2,7 +2,7 @@
 # Preserve DNS for an already-live sandbox with an old root-only policy.
 set -eu
 KILN=${KILN:-/usr/local/bin/kiln}
-id=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 16M)
+id=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 64M)
 trap 'sudo "$KILN" rm "$id" >/dev/null' EXIT HUP INT TERM
 policy=$(sudo find /run/kiln/net/leases -maxdepth 1 -type f -exec awk -v id="$id" '$0 == id {sub(".*/", "", FILENAME); print FILENAME}' {} +)
 sudo chmod 0600 "/run/kiln/net/dns/$policy"

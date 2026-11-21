@@ -34,7 +34,7 @@ fail() {
 }
 
 create_sandbox() {
-    sandbox=$(sudo "$KILN" create --memory 64M --pids 32 --disk 16M)
+    sandbox=$(sudo "$KILN" create --memory 64M --pids 32 --disk 64M)
 }
 
 remove_sandbox() {
@@ -245,7 +245,7 @@ set -e
     fail "sandbox was not reusable after SIGPIPE"
 remove_sandbox
 set +e
-sudo "$KILN" run --memory 64M --pids 16 --disk 16M -- sh -c \
+sudo "$KILN" run --memory 64M --pids 16 --disk 64M -- sh -c \
     'set -o pipefail; yes | head -n 1 >/dev/null' \
     </dev/null >"$tmpdir/oneshot-sigpipe.out" 2>"$tmpdir/oneshot-sigpipe.err"
 code=$?

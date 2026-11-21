@@ -66,7 +66,7 @@ EOF
 }
 
 create_sandbox() {
-    sandbox=$(sudo "$KILN" create --memory 64M --pids "${1:-32}" --disk 16M)
+    sandbox=$(sudo "$KILN" create --memory 64M --pids "${1:-32}" --disk 64M)
     install_tree_helper
 }
 

@@ -288,7 +288,12 @@ remain ambiguous even if cleanup appears to have succeeded. A caller must
 negotiate the capability before trusting the direct child's exit 124. Other
 commands do not acquire this exit contract.
 
-The preflight decides every failure a caller can choose. With `--read-only`
+The preflight decides every failure a caller can choose. Limits below
+kiln's floors, which are kilnd's (`--memory` 32 MiB, `--cpus` 0.01, `--pids`
+16, `--disk` 64 MiB, so `--disk 0` no longer means no block limit), or past
+what the cgroup files take (`--cpus` beyond the kernel's largest `cpu.max`
+quota or not finite, `--pids` over 4194304), and a hostname over 64 bytes,
+are refused. With `--read-only`
 it runs the shim's own writable-path walk (`landlock::walk`) over the image
 directory, opened without following its name: a symlinked or regular-file
 component, a path over kiln's own `/proc`, `/sys` or `/dev` mounts (all but

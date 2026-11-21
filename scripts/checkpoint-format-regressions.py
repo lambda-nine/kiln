@@ -436,6 +436,9 @@ def run_allowance():
     count = 1000
     sh(src, f"mkdir /workspace/m && cd /workspace/m && i=0; while [ $i -lt {count} ]; do "
             f"printf x > \"$(printf '%0250d' $i)\"; i=$((i+1)); done")
+    # 64 MiB of data lifts S over kiln's --disk floor, so the fork can ask
+    # for exactly S.
+    sh(src, "dd if=/dev/zero of=/workspace/fill bs=1M count=64 2>/dev/null")
     base = f"{upper(src)}/workspace/m"
     for name in os.listdir(base):
         for k in range(32):

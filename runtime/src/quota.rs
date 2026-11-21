@@ -39,6 +39,10 @@ const FS_DQ_BHARD: u16 = 1 << 3;
 /// small block quota from consuming the host filesystem's entire inode pool.
 const BYTES_PER_INODE: u64 = 16 * 1024;
 const MIN_INODES: u64 = 128;
+/// The least `--disk` a sandbox may ask for, kilnd's floor exactly. A limit
+/// of 0 would mean no block limit at all to XFS, and a few blocks can't even
+/// hold the run's own metadata files.
+pub const MIN_DISK: u64 = 64 << 20;
 
 /// `struct fsxattr` from <linux/fs.h>.
 #[repr(C)]

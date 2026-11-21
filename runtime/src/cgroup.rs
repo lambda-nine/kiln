@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::errno::Errno;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -27,6 +27,43 @@ pub struct Limits {
     pub memory: Option<u64>,
     pub cpus: Option<f64>,
     pub pids: Option<u64>,
+}
+
+/// The least a sandbox may ask for, kilnd's floors exactly. cgroup v2
+/// refuses a `cpu.max` quota below 1 ms of each 100 ms period; the memory and
+/// PID floors leave room for a persistent sandbox's PID 1 and its execs.
+pub const MIN_CPUS: f64 = 0.01;
+pub const MIN_MEMORY: u64 = 32 << 20;
+pub const MIN_PIDS: u64 = 16;
+/// The largest `pids.max` the kernel takes (`PID_MAX_LIMIT` on 64-bit).
+pub const MAX_PIDS: u64 = 4 << 20;
+/// The largest `cpu.max` quota the kernel takes (`max_cfs_runtime`,
+/// 2^44 - 1 µs): about 1.76e8 CPUs at kiln's period.
+const MAX_CPU_QUOTA_US: u64 = (1 << 44) - 1;
+
+/// The `cpu.max` quota kiln writes for `cpus`, in microseconds per period.
+fn cpu_quota(cpus: f64) -> u64 {
+    (cpus * CPU_PERIOD_US as f64).round() as u64
+}
+
+impl Limits {
+    /// Refuses, before anything is allocated, a limit the sandbox's cgroup
+    /// writes would fail on or that is below kiln's floors.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(cpus) = self.cpus {
+            ensure!(cpus.is_finite() && cpus >= MIN_CPUS && cpu_quota(cpus) <= MAX_CPU_QUOTA_US,
+                "invalid --cpus {cpus}: expected at least {MIN_CPUS} and at most {:.0} CPUs, or \"max\"",
+                (MAX_CPU_QUOTA_US as f64 / CPU_PERIOD_US as f64).floor());
+        }
+        if let Some(bytes) = self.memory {
+            ensure!(bytes >= MIN_MEMORY, "invalid --memory {bytes}: expected at least {MIN_MEMORY} bytes (32M), or \"max\"");
+        }
+        if let Some(pids) = self.pids {
+            ensure!((MIN_PIDS..=MAX_PIDS).contains(&pids),
+                "invalid --pids {pids}: expected {MIN_PIDS} to {MAX_PIDS}, or \"max\"");
+        }
+        Ok(())
+    }
 }
 
 /// A cgroup v2 directory at /sys/fs/cgroup/kiln/<name>. Dropping it kills
@@ -68,7 +105,7 @@ impl Cgroup {
         if let Some(cpus) = limits.cpus {
             // cpu.max is "<quota> <period>": the group may run for `quota`
             // microseconds of CPU time in every `period`, summed across cores.
-            let quota = (cpus * CPU_PERIOD_US as f64).round() as u64;
+            let quota = cpu_quota(cpus);
             self.write("cpu.max", &format!("{quota} {CPU_PERIOD_US}"))?;
         }
         if let Some(pids) = limits.pids {
@@ -307,6 +344,36 @@ fn write(path: &Path, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits(memory: Option<u64>, cpus: Option<f64>, pids: Option<u64>) -> Limits { Limits { memory, cpus, pids } }
+
+    #[test]
+    fn limits_are_refused_just_past_each_bound() {
+        let max_cpus = MAX_CPU_QUOTA_US as f64 / CPU_PERIOD_US as f64;
+        for cpus in [MIN_CPUS, 0.5, 1.0, max_cpus] {
+            limits(None, Some(cpus), None).validate().unwrap_or_else(|e| panic!("{cpus}: {e:#}"));
+        }
+        assert_eq!(cpu_quota(MIN_CPUS), 1000);
+        assert_eq!(cpu_quota(max_cpus), MAX_CPU_QUOTA_US);
+        for cpus in [0.0099, 0.001, max_cpus + 0.00002, f64::INFINITY, f64::NAN, 0.0] {
+            let error = limits(None, Some(cpus), None).validate().unwrap_err();
+            assert!(error.to_string().contains("--cpus"), "{cpus}: {error:#}");
+        }
+        limits(Some(MIN_MEMORY), None, None).validate().unwrap();
+        limits(Some(u64::MAX), None, None).validate().unwrap();
+        for bytes in [MIN_MEMORY - 1, 1, 0] {
+            assert!(limits(Some(bytes), None, None).validate().unwrap_err().to_string().contains("--memory"));
+        }
+        for pids in [MIN_PIDS, 128, MAX_PIDS] {
+            limits(None, None, Some(pids)).validate().unwrap();
+        }
+        assert_eq!(MAX_PIDS, 4_194_304);
+        for pids in [MIN_PIDS - 1, 1, 0, MAX_PIDS + 1, u64::MAX] {
+            assert!(limits(None, None, Some(pids)).validate().unwrap_err().to_string().contains("--pids"), "{pids}");
+        }
+        // "max" everywhere is unlimited.
+        limits(None, None, None).validate().unwrap();
+    }
 
     #[test]
     fn parses_populated_from_cgroup_events() {

@@ -8,7 +8,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::errno::Errno;
@@ -65,7 +65,7 @@ struct Layers {
 pub fn run(cfg: &Config) -> Result<i32> {
     // A plain name, so `--image ../../somewhere` can't pick an arbitrary host
     // directory (or another run's upper layer) as the root filesystem.
-    validate_image(cfg)?;
+    preflight(cfg)?;
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
 
     let id = run_id();
@@ -98,7 +98,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
 /// by its detached host shim, which stays alive to own cleanup resources.
 pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Option<checkpoint::capture::Fork>)
     -> Result<()> {
-    validate_image(cfg)?;
+    preflight(cfg)?;
     storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
     let run_dir = run_dir(id);
     let layers = Layers {
@@ -125,6 +125,30 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     let _ = fs::remove_dir_all(&run_dir);
     result.map(|_| ())
+}
+
+/// Linux's limit on a hostname (`HOST_NAME_MAX`); `sethostname` refuses longer.
+const MAX_HOSTNAME_BYTES: usize = 64;
+
+/// The create preflight's checks of a config, before anything is allocated:
+/// its scalar settings (`validate_settings`), then its image
+/// (`validate_image`). The shim repeats them before its run directory.
+pub fn preflight(cfg: &Config) -> Result<()> {
+    validate_settings(cfg)?;
+    validate_image(cfg)
+}
+
+/// Limits, disk and hostname the sandbox's setup would refuse or that are
+/// below kiln's floors (`cgroup::Limits::validate`, `quota::MIN_DISK`).
+pub fn validate_settings(cfg: &Config) -> Result<()> {
+    cfg.limits.validate()?;
+    if let Some(bytes) = cfg.disk {
+        ensure!(bytes >= quota::MIN_DISK,
+            "invalid --disk {bytes}: expected at least {} bytes (64M), or \"max\"", quota::MIN_DISK);
+    }
+    ensure!(cfg.hostname.len() <= MAX_HOSTNAME_BYTES,
+        "invalid --hostname: at most {MAX_HOSTNAME_BYTES} bytes");
+    Ok(())
 }
 
 /// Everything about the image that a create decides before it allocates
@@ -796,6 +820,27 @@ mod tests {
         symlink("../run", roots.images.join("img/var/run")).unwrap();
         fs::write(roots.images.join("img/etc/passwd"), "").unwrap();
         (root, roots)
+    }
+
+    #[test]
+    fn settings_are_refused_just_past_each_floor() {
+        let mut cfg = config("img", false, &[], "none");
+        cfg.disk = Some(quota::MIN_DISK);
+        validate_settings(&cfg).unwrap();
+        cfg.disk = None;
+        validate_settings(&cfg).unwrap();
+        for disk in [quota::MIN_DISK - 1, 4096, 1, 0] {
+            cfg.disk = Some(disk);
+            assert!(validate_settings(&cfg).unwrap_err().to_string().contains("--disk"), "{disk}");
+        }
+        cfg.disk = Some(quota::MIN_DISK);
+        cfg.hostname = "h".repeat(MAX_HOSTNAME_BYTES);
+        validate_settings(&cfg).unwrap();
+        cfg.hostname.push('h');
+        assert!(validate_settings(&cfg).unwrap_err().to_string().contains("--hostname"));
+        cfg.hostname = "kiln".into();
+        cfg.limits.pids = Some(crate::cgroup::MIN_PIDS - 1);
+        assert!(validate_settings(&cfg).unwrap_err().to_string().contains("--pids"));
     }
 
     /// The image walk is part of the create preflight: an image's symlinked or

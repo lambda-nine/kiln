@@ -237,7 +237,7 @@ pub fn before_allocation<T>(result: Result<T>) -> Result<T> {
 /// `fork` is a checkpoint that passed the preflight; its upper is restored
 /// by the shim before the sandbox mounts it.
 pub fn create(cfg: &Config, from_checkpoint: Option<crate::checkpoint::capture::Fork>) -> Result<String> {
-    before_allocation(container::validate_image(cfg))?;
+    before_allocation(container::preflight(cfg))?;
     let id = container::new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     // SAFETY: the CLI is single-threaded here.

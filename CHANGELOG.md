@@ -5,6 +5,15 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Check limits before allocation (kiln security review F2 and F3): `create`
+  and `run` refuse `--memory` below 32M, `--cpus` below 0.01, not finite or
+  past the kernel's largest `cpu.max` quota, `--pids` below 16 or over
+  4194304, `--disk` below 64M and a `--hostname` over 64 bytes, the same
+  floors as kilnd. `create` exits 124 for them instead of failing in the
+  shim. `--disk 0` used to mean no block limit; it is now refused, and
+  `--disk max` stays the explicit no-limit. The regression scripts ask for
+  at least the floors.
+
 - Decide writable paths against the image before allocation (adversarial
   review of kilnd's ambiguous-create fix, HIGH 1 and MEDIUM 1): with
   `--read-only`, `create` and `run` walk every writable path and the default

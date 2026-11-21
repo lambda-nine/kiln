@@ -41,7 +41,7 @@ def query(ident):
 try:
     for _ in range(ATTACKERS + 1):
         identifier = subprocess.check_output(
-            [KILN, "create", "--allow=1.1.1.1:443", "--memory=32M", "--pids=8", "--disk=16M"],
+            [KILN, "create", "--allow=1.1.1.1:443", "--memory=32M", "--pids=16", "--disk=64M"],
             text=True,
         ).strip()
         ids.append(identifier)

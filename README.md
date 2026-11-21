@@ -164,6 +164,10 @@ and prompt removal.
    `memory.max` (default 512M, no swap, whole sandbox killed on OOM), `cpu.max`
    (default 1 core) and `pids.max` (default 128). The sandbox has its own cgroup
    namespace and a read-only view of its own limits at `/sys/fs/cgroup`.
+   Limits are checked before anything is allocated: `--memory` at least 32M,
+   `--cpus` at least 0.01 (cgroup v2's 1 ms quota per 100 ms period) and at
+   most the kernel's largest quota (about 1.76e8), `--pids` 16 to 4194304, and
+   `--hostname` at most 64 bytes; `max` is unlimited.
    `--stats` prints peak memory, CPU time, throttling and OOM kills on exit.
 4. **User namespaces** (done): root inside the sandbox is uid 2000000000 on
    the host. The sandbox maps IDs 0..65535 to 2000000000..2000065535, and image
@@ -238,8 +242,9 @@ and prompt removal.
 9. **Disk limits** (done): `/var/lib/kiln/runs` is an XFS filesystem (in a
    sparse file on a loop device) mounted with `prjquota`. Each run directory
    gets its own project ID with PROJINHERIT and hard block and inode limits
-   (`--disk`, default 1G; one inode per 16 KiB of it, at least 128). Done with raw `FS_IOC_FSSETXATTR` ioctls and
-   `quotactl_fd`.
+   (`--disk`, default 1G, at least 64M; one inode per 16 KiB of it). `--disk 0`
+   is refused (XFS would read a 0 limit as none); `--disk max` is the explicit
+   no-limit. Done with raw `FS_IOC_FSSETXATTR` ioctls and `quotactl_fd`.
 
 10. **Metrics** (done): `kiln metrics` serves every running sandbox's memory,
     CPU and throttling, PIDs, block I/O, pressure stalls, disk quota use,

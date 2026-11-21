@@ -31,7 +31,7 @@ for service, expected_caps in (("kiln-dns", 1 << 10), ("kiln-metrics", 0)):
 # umask, while control sockets/run directories stay private.
 old_mask = os.umask(0o077)
 try:
-    identifier = run(KILN, "create", "--net=full", "--memory=64M", "--pids=16", "--disk=16M")
+    identifier = run(KILN, "create", "--net=full", "--memory=64M", "--pids=16", "--disk=64M")
 finally:
     os.umask(old_mask)
 try:

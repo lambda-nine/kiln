@@ -44,7 +44,7 @@ fail() {
 }
 
 create_sandbox() {
-    sandbox=$(sudo "$KILN" create --memory 64M --pids 32 --disk 16M)
+    sandbox=$(sudo "$KILN" create --memory 64M --pids 32 --disk 64M)
 }
 
 remove_sandbox() {

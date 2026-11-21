@@ -194,7 +194,7 @@ enum ImageCommand {
 
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Hostname inside the sandbox (its own UTS namespace).
+    /// Hostname inside the sandbox (its own UTS namespace, at most 64 bytes).
     #[arg(long, default_value = "kiln")]
     hostname: String,
     /// Image to use as the read-only root filesystem.
@@ -203,16 +203,17 @@ struct RunArgs {
     /// Keep the run's directory afterwards, to inspect what it changed.
     #[arg(long)]
     keep: bool,
-    /// Memory limit, like 256M or 2G, or "max".
+    /// Memory limit, like 256M or 2G (at least 32M), or "max".
     #[arg(long, default_value = "512M")]
     memory: String,
-    /// CPU limit in cores, like 0.5 or 2, or "max".
+    /// CPU limit in cores, like 0.5 or 2 (at least 0.01), or "max".
     #[arg(long, default_value = "1")]
     cpus: String,
-    /// Maximum number of processes and threads, or "max".
+    /// Maximum number of processes and threads (16 to 4194304), or "max".
     #[arg(long, default_value = "128")]
     pids: String,
-    /// Disk limit for everything the sandbox writes, like 1G, or "max".
+    /// Disk limit for everything the sandbox writes, like 1G (at least 64M),
+    /// or "max".
     #[arg(long, default_value = "1G")]
     disk: String,
     /// Block writes to files and directories (even for root) except under
@@ -244,16 +245,23 @@ struct RunArgs {
 struct CreateArgs {
     #[arg(long)]
     require_exec_protocol: Option<u16>,
+    /// Hostname inside the sandbox (at most 64 bytes).
     #[arg(long, default_value = "kiln")]
     hostname: String,
+    /// Image to use as the read-only root filesystem.
     #[arg(long, default_value = "alpine")]
     image: String,
+    /// Memory limit, like 256M or 2G (at least 32M), or "max".
     #[arg(long, default_value = "512M")]
     memory: String,
+    /// CPU limit in cores, like 0.5 or 2 (at least 0.01), or "max".
     #[arg(long, default_value = "1")]
     cpus: String,
+    /// Maximum number of processes and threads (16 to 4194304), or "max".
     #[arg(long, default_value = "128")]
     pids: String,
+    /// Disk limit for everything the sandbox writes, like 1G (at least 64M),
+    /// or "max".
     #[arg(long, default_value = "1G")]
     disk: String,
     #[arg(long)]
@@ -319,7 +327,7 @@ fn run() -> Result<()> {
                     anyhow::ensure!(version == exec_protocol::VERSION, "unsupported persistent-exec protocol {version}");
                 }
                 validate_writable(&args.writable)?;
-                Ok(container::Config {
+                let cfg = container::Config {
                     limits: cgroup::Limits {
                         memory: parse_size(&args.memory)?,
                         cpus: parse_cpus(&args.cpus)?,
@@ -335,7 +343,8 @@ fn run() -> Result<()> {
                     stats: false,
                     cmd: Vec::new(),
                     fork: None,
-                })
+                };
+                Ok(cfg)
             })())?;
             // Every checkpoint refusal is before allocation, with its typed
             // reason leading the message.
@@ -537,10 +546,29 @@ mod create_certainty_tests {
     }
 
     #[test]
+    fn limits_below_the_floors_are_rejected_before_id_or_resource_creation() {
+        let cfg = |memory, cpus, pids, disk| container::Config {
+            limits: cgroup::Limits { memory: Some(memory), cpus: Some(cpus), pids: Some(pids) },
+            disk: Some(disk),
+            net: net::Plan::new("none", &[]).unwrap(),
+            hostname: "kiln".into(), image: "floors-missing-image-unit-fixture".into(),
+            keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,
+        };
+        let (memory, cpus, pids, disk) = (cgroup::MIN_MEMORY, cgroup::MIN_CPUS, cgroup::MIN_PIDS, quota::MIN_DISK);
+        for (bad, flag) in [(cfg(memory - 1, cpus, pids, disk), "--memory"), (cfg(memory, 0.0099, pids, disk), "--cpus"),
+            (cfg(memory, f64::INFINITY, pids, disk), "--cpus"), (cfg(memory, cpus, pids - 1, disk), "--pids"),
+            (cfg(memory, cpus, pids, disk - 1), "--disk"), (cfg(memory, cpus, pids, 0), "--disk")] {
+            let error = persistent::create(&bad, None).unwrap_err();
+            assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
+            assert!(format!("{error:#}").contains(flag), "{flag}: {error:#}");
+        }
+    }
+
+    #[test]
     fn missing_image_is_rejected_before_id_or_resource_creation() {
         let cfg = container::Config {
             limits: cgroup::Limits { memory: Some(64 * 1024 * 1024), cpus: Some(1.0), pids: Some(16) },
-            disk: Some(16 * 1024 * 1024),
+            disk: Some(64 * 1024 * 1024),
             net: net::Plan::new("none", &[]).unwrap(),
             hostname: "kiln".into(), image: "round2-missing-image-unit-fixture".into(),
             keep: true, read_only: false, writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,

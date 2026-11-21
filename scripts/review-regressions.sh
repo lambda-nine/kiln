@@ -22,7 +22,7 @@ sh scripts/create-certainty-regressions.sh
 sh scripts/gc-regressions.sh
 
 echo "1. Firewall boundary"
-sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c '
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sh -c '
     for p in 22 3000 9090 9840 9841; do
         if nc -z -w 1 10.88.0.1 "$p" >/dev/null 2>&1; then
             echo "FAIL: host port $p reachable"
@@ -36,7 +36,7 @@ echo "PASS"
 echo "2. DNS worker bound"
 before=$(systemctl show kiln-dns -p TasksCurrent --value)
 (
-    sudo "$KILN" run --net full --memory 64M --pids 64 --disk 16M -- sh -c '
+    sudo "$KILN" run --net full --memory 64M --pids 64 --disk 64M -- sh -c '
         i=0
         while [ "$i" -lt 20 ]; do
             (sleep 3 | nc 10.88.0.1 53 >/dev/null 2>&1) &
@@ -62,7 +62,7 @@ sudo python3 -I scripts/dns-reserve-regressions.py "$KILN"
 
 echo "3. Inode quota"
 created=$(
-    sudo "$KILN" run --disk 1M --memory 64M --pids 16 -- sh -c '
+    sudo "$KILN" run --disk 64M --memory 64M --pids 16 -- sh -c '
         mkdir /tmp/inodes
         i=0
         while [ "$i" -lt 5000 ]; do
@@ -72,7 +72,7 @@ created=$(
         echo "$i"
     '
 )
-echo "Created under 1 MiB quota: $created"
+echo "Created under 64 MiB quota (4096 inodes): $created"
 [ "$created" -lt 5000 ] || { echo "FAIL: no effective inode limit"; exit 1; }
 
 echo "4. Stale lease reconciliation"
@@ -80,7 +80,7 @@ stale=10.88.0.2
 sudo install -d /run/kiln/net/leases /run/kiln/net/dns
 printf '%s' '0-4294967295' | sudo tee "/run/kiln/net/leases/$stale" >/dev/null
 printf '%s\n' '*' | sudo tee "/run/kiln/net/dns/$stale" >/dev/null
-assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c \
+assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sh -c \
     'ip -4 -o addr show dev eth0 | sed "s/.* inet //; s/ .*//"')
 echo "Address after stale lease: $assigned"
 [ "$assigned" = "$stale/16" ] || { echo "FAIL: stale lease was not reclaimed"; exit 1; }
@@ -88,14 +88,14 @@ echo "Address after stale lease: $assigned"
 echo "PASS"
 
 echo "5. Persistent shim protects an in-progress lease"
-persistent=$(sudo "$KILN" create --memory 64M --pids 16 --disk 16M)
+persistent=$(sudo "$KILN" create --memory 64M --pids 16 --disk 64M)
 create_pid=${persistent##*-}
 fake="review-shim-$create_pid"
 sudo install -d "/var/lib/kiln/runs/$fake"
 sudo cp "/var/lib/kiln/runs/$persistent/shim.pid" "/var/lib/kiln/runs/$fake/shim.pid"
 sudo cp "/var/lib/kiln/runs/$persistent/shim.start" "/var/lib/kiln/runs/$fake/shim.start"
 printf '%s' "$fake" | sudo tee "/run/kiln/net/leases/$stale" >/dev/null
-assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c \
+assigned=$(sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sh -c \
     'ip -4 -o addr show dev eth0 | sed "s/.* inet //; s/ .*//"')
 [ "$assigned" = "10.88.0.3/16" ] || { echo "FAIL: live persistent shim did not protect lease"; exit 1; }
 [ "$(cat "/run/kiln/net/leases/$stale")" = "$fake" ]
@@ -107,7 +107,7 @@ echo "PASS"
 echo "6. Base nftables reconciliation"
 sudo nft add rule inet kiln forward counter accept comment '"review stale rule"'
 sudo nft flush set inet kiln private
-sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- true
 if sudo nft -s list chain inet kiln forward | grep -q 'review stale rule'; then
     echo "FAIL: stale base rule survived reconciliation"
     exit 1
@@ -121,7 +121,7 @@ echo "PASS"
 
 echo "8. Per-sandbox conntrack limit"
 before=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
-sudo "$KILN" run --net full --memory 64M --pids 256 --disk 16M -- sh -c '
+sudo "$KILN" run --net full --memory 64M --pids 256 --disk 64M -- sh -c '
     i=0
     while [ "$i" -lt 320 ]; do
         (printf x | nc -u -w 1 1.1.1.1 "$((10000 + i))" >/dev/null 2>&1) &
@@ -135,7 +135,7 @@ echo "Conntrack-limit rejects: before=$before after=$after"
 [ "$after" -gt "$before" ] || { echo "FAIL: conntrack limit did not reject excess flows"; exit 1; }
 # The next sandbox usually reuses the same IP while the previous flows are
 # still in conntrack. It must start with a fresh count, not inherit the limit.
-sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c '
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sh -c '
     printf x | nc -u -w 1 1.1.1.1 53 >/dev/null 2>&1 || true
 '
 fresh=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {print $2}')
@@ -143,7 +143,7 @@ fresh=$(sudo nft list counter inet kiln conntrack_rejected | awk '/packets/ {pri
 echo "PASS"
 
 echo "9. Persistent sandbox lifecycle"
-persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 16M)
+persistent=$(sudo "$KILN" create --read-only --net full --memory 64M --pids 16 --disk 64M)
 sudo "$KILN" ls | grep -q "^$persistent[[:space:]]\+running"
 [ "$(sudo stat -c %a "/var/lib/kiln/runs/$persistent")" = 700 ]
 [ "$(sudo stat -c %a "/var/lib/kiln/runs/$persistent/control.sock")" = 600 ]
@@ -196,8 +196,8 @@ sudo "$KILN" rm "$persistent"
 # session/process group, daemonize, or keep the client's output pipes open.
 sh scripts/exec-tree-regressions.sh
 
-stale=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 16M)
-unrequested_stale=$(sudo "$KILN" create --memory 64M --pids 16 --disk 16M)
+stale=$(sudo "$KILN" create --net full --memory 64M --pids 16 --disk 64M)
+unrequested_stale=$(sudo "$KILN" create --memory 64M --pids 16 --disk 64M)
 shim=$(sudo cat "/var/lib/kiln/runs/$stale/shim.pid")
 unrequested_shim=$(sudo cat "/var/lib/kiln/runs/$unrequested_stale/shim.pid")
 ip=$(awk -v id="$stale" '$0 == id { sub(".*/", "", FILENAME); print FILENAME }' /run/kiln/net/leases/*)
@@ -219,16 +219,18 @@ sudo "$KILN" gc "$unrequested_stale"
 echo "PASS"
 
 echo "10. pids.max refuses exec without destroying a persistent sandbox"
-limited=$(sudo "$KILN" create --memory 64M --pids 1 --disk 16M)
+limited=$(sudo "$KILN" create --memory 64M --pids 16 --disk 64M)
 cleanup_limited() {
     if [ -n "${limited:-}" ] && sudo test -e "/var/lib/kiln/runs/$limited"; then
         sudo timeout 10 "$KILN" rm "$limited" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup_limited EXIT HUP INT TERM
-# PID 1 consumes the only slot, so the exec fork must fail with EAGAIN. This
+# kiln refuses --pids below 16, so host root lowers pids.max to 1 here. PID 1
+# consumes the only slot, so the exec fork must fail with EAGAIN. This
 # is compatible with Chapter 2's rule that background work cannot survive a
 # completed exec to fill the limit for a later request.
+echo 1 | sudo tee "/sys/fs/cgroup/kiln/$limited/pids.max" >/dev/null
 [ "$(sudo cat "/sys/fs/cgroup/kiln/$limited/pids.current")" = 1 ]
 init_pid=$(sudo cat "/var/lib/kiln/runs/$limited/init.pid")
 max_before=$(sudo awk '$1 == "max" { print $2 }' "/sys/fs/cgroup/kiln/$limited/pids.events")
@@ -267,14 +269,14 @@ echo "13d. Checkpoint format, capture, fork and refusals"
 sudo python3 -I scripts/checkpoint-format-regressions.py "$KILN"
 
 echo "14. Bridge ports isolated"
-sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sleep 5 &
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sleep 5 &
 first=$!
 i=0
 while [ -z "$(ls /run/kiln/net/leases 2>/dev/null)" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 peer=$(ls /run/kiln/net/leases)
 port=$(bridge -d link show master kiln0)
 echo "$port" | grep -q 'isolated on' || { echo "FAIL: sandbox bridge port is not isolated"; exit 1; }
-sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- sh -c "
+sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- sh -c "
     if ping -c 1 -W 1 $peer >/dev/null 2>&1; then echo 'FAIL: reached sandbox $peer'; exit 1; fi
 "
 wait "$first"
@@ -287,7 +289,7 @@ while [ "$wave" -lt 10 ]; do
     pids=
     i=0
     while [ "$i" -lt 16 ]; do
-        sudo "$KILN" run --net full --memory 64M --pids 16 --disk 16M -- true &
+        sudo "$KILN" run --net full --memory 64M --pids 16 --disk 64M -- true &
         pids="$pids $!"
         i=$((i + 1))
     done
