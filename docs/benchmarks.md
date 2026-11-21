@@ -325,7 +325,7 @@ done faster.
 
 **What they compare.** End-user stacks as configured, not components.
 Docker, bare runc/crun and kiln do different work and use different storage
-paths (see [what each one sets up](#method)): Docker goes through a CLI, two
+paths (see [what each one sets up](#method-1)): Docker goes through a CLI, two
 daemons, a shim and runc and starts from an overlay snapshot; bare runc and
 crun run one process on the unpacked tree with no overlay and no seccomp;
 kiln runs one process that also creates a user namespace, a seccomp filter
@@ -432,7 +432,7 @@ sudo bench/compare.sh mylabel kiln-a kiln-b # kiln builds against each other
 sudo bench/warm.sh warm                     # exec into running sandboxes
 sudo bench/idle.sh idle                     # memory of idle sandboxes, daemons
 sudo bench/steady.sh steady                 # CPU- and I/O-bound workloads
-python3 -I bench/chart.py results/final results/final-session-baseline ../docs/coldstart.svg  # from bench/
+(cd bench && python3 -I chart.py results/final results/final-session-baseline ../docs/coldstart.svg)
 ```
 
 Results are in `bench/results/<label>/` (raw hyperfine JSON plus

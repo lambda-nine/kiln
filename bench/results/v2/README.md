@@ -16,8 +16,9 @@ The recorded `lima_config` SHA-256 identifies the repository's historical
 VM. The campaign VM came from an earlier template: its Lima backend, image,
 architecture, CPU, memory, disk and mount settings matched, but its provisioning
 package list differed. The current `lima.yaml` also replaces the recorded
-file's author-specific mount source with `{{.Home}}/Projects/kiln`, so it
-intentionally has a different hash; do not rewrite the manifests to match it.
+file's author-specific mount source with `{{.Home}}/Projects/lambda-nine/kiln`
+(and adds the sibling kilnd mount), so it intentionally has a different hash;
+do not rewrite the manifests to match it.
 
 ## Layout
 

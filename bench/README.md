@@ -73,7 +73,8 @@ concurrency and memory. It intentionally selects only `kiln-net` and
 `podman-crun-net`; the all-runtime campaign remains valid for the other cases.
 
 `--case REGEX` selects cases by `re.search` on their names. `--var NAME=VALUE`
-overrides a config variable (`kiln`, `bundle`, `idle_bundle`, `image`).
+overrides a config variable (`kiln`, `bundle`, `idle_bundle`, `image`,
+`podman_image`, `nerdctl_image`).
 Failed invocations never stop a run: each one is recorded with its exit code,
 signal, timeout or spawn error, and the run goes on.
 
