@@ -765,13 +765,19 @@ impl Store {
     }
 
     /// The image each artifact or staging directory references, for image
-    /// removal: `(label, Some(image))`, or `None` when the reference can't be
-    /// read (an interrupted capture before its header, or anything unknown),
-    /// which blocks removal of every image.
-    pub fn image_references(&self) -> Result<Vec<(String, Option<String>)>> {
+    /// removal: `(label, Ok(image))`, or `Err(why)` when the reference can't
+    /// be read (an interrupted capture before its header, or anything
+    /// unknown), which blocks removal of every image; `why` names the
+    /// command that clears it. A `.removing-*` directory is skipped: only a
+    /// removal renames a directory to that name, nothing renames it back or
+    /// opens it as an artifact (`open` takes only a checkpoint ID), and
+    /// `kiln checkpoint rm` finishes deleting it, so it can never be forked
+    /// from its image again.
+    pub fn image_references(&self) -> Result<Vec<(String, std::result::Result<String, String>)>> {
         let mut out = Vec::new();
         let Some(root) = open_private_dir(None, &self.root, NAMESPACE, false)? else { return Ok(out) };
         for (instance, name, item) in self.inventory()? {
+            if item == Item::Removing { continue; }
             let label = format!("checkpoint {}/{name}", if instance.is_empty() { "-" } else { &instance });
             let image = (|| -> Option<String> {
                 if item == Item::Unknown { return None; }
@@ -780,7 +786,17 @@ impl Store {
                 let bytes = read_private(&dir, HEADER, MAX_RECORD).ok()?;
                 Header::parse(std::str::from_utf8(&bytes).ok()?).ok().map(|h| h.image)
             })();
-            out.push((label, image));
+            let why = || match item {
+                // A published name is the checkpoint ID; a staging name starts with it.
+                Item::Published | Item::Staging => {
+                    let checkpoint = if item == Item::Published { &name[..] } else { &name[".staging-".len()..][..35] };
+                    format!("unreadable checkpoint header; `kiln checkpoint rm --instance {instance} --checkpoint \
+                        {checkpoint}` removes it")
+                }
+                _ => "unknown entry in the checkpoint store; `kiln checkpoint ls` lists it, and kiln never \
+                    removes it".to_owned(),
+            };
+            out.push((label, image.ok_or_else(why)));
         }
         Ok(out)
     }

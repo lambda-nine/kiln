@@ -5,6 +5,14 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Name the recovery for a checkpoint that blocks images (kiln security
+  review N1): when an artifact or staging directory's header can't be read,
+  the `kiln image` refusal names the `kiln checkpoint rm --instance I
+  --checkpoint C` that removes it, and an unknown entry says kiln never
+  removes it. An interrupted removal (`.removing-*`) no longer blocks image
+  management: only a removal makes that name, nothing renames it back or
+  opens it as an artifact, and `kiln checkpoint rm` finishes it.
+
 - Leave no run directory without an identity (kiln security review F1): a
   persistent shim publishes `shim.start` and `shim.pid` right after creating
   its run directory, before the quota, and removes the directory on every

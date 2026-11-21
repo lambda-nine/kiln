@@ -522,7 +522,10 @@ and removes the run; a sandbox never starts on a partial or empty upper.
   leaves its forks running.
 - Artifact headers are image references: `kiln image rm`, `unregister` and
   replacement are refused while an artifact or staging directory names the
-  image or can't be read.
+  image or can't be read. The refusal for an unreadable header names the
+  `kiln checkpoint rm --instance I --checkpoint C` that clears it. An
+  interrupted removal (`.removing-*`) is not a reference: nothing renames
+  it back or opens it as an artifact, so it can't be forked again.
 
 ## Not in v1
 

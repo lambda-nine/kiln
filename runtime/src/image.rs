@@ -323,9 +323,9 @@ pub fn blocking_references(roots: &Roots, name: &str) -> Result<Vec<String>> {
             match store.image_references() {
                 Ok(references) => for (label, image) in references {
                     match image {
-                        Some(image) if image != name => {}
-                        Some(_) => blocking.push(label),
-                        None => blocking.push(format!("{label} (unreadable checkpoint header)")),
+                        Ok(image) if image != name => {}
+                        Ok(_) => blocking.push(label),
+                        Err(why) => blocking.push(format!("{label} ({why})")),
                     }
                 },
                 Err(e) => blocking.push(format!("checkpoints (unreadable: {e:#})")),
@@ -1698,6 +1698,26 @@ mod tests {
         let blocked = blocking_references(&roots, "img").unwrap();
         assert_eq!(blocked.len(), 1);
         assert!(blocked[0].contains("unreadable checkpoint header"), "{blocked:?}");
+        let recovery = format!("`kiln checkpoint rm --instance 0123456789abcdef0123456789abcdef --checkpoint cp-{}`",
+            "1".repeat(32));
+        assert!(blocked[0].contains(&recovery), "{blocked:?}");
+        // An interrupted capture's staging directory names the same command.
+        let staging = instance.join(format!(".staging-cp-{}-1-abcd", "2".repeat(32)));
+        private(&staging);
+        let blocked = blocking_references(&roots, "img").unwrap();
+        assert!(blocked.iter().any(|b| b.contains(&format!("--checkpoint cp-{}`", "2".repeat(32)))), "{blocked:?}");
+        fs::remove_dir(&staging).unwrap();
+        // An interrupted removal blocks nothing: it can never be forked again.
+        let removing = instance.join(format!(".removing-cp-{}-1-42-0", "3".repeat(32)));
+        private(&removing);
+        assert_eq!(blocking_references(&roots, "img").unwrap().len(), 1);
+        fs::remove_dir(&removing).unwrap();
+        // An unknown entry still blocks, and says kiln won't remove it.
+        let unknown = instance.join("stray");
+        private(&unknown);
+        let blocked = blocking_references(&roots, "img").unwrap();
+        assert!(blocked.iter().any(|b| b.contains("stray (unknown entry")), "{blocked:?}");
+        fs::remove_dir(&unknown).unwrap();
         let header = crate::checkpoint::store::Header { instance: "0123456789abcdef0123456789abcdef".into(),
             checkpoint: format!("cp-{}", "1".repeat(32)), generation: 1, source: "18e0-42".into(), source_lease: 1,
             image: "img".into(), image_generation: 1, image_sha256: "ab".repeat(32),
