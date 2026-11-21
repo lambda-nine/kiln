@@ -65,23 +65,8 @@ struct Layers {
 pub fn run(cfg: &Config) -> Result<i32> {
     // A plain name, so `--image ../../somewhere` can't pick an arbitrary host
     // directory (or another run's upper layer) as the root filesystem.
-    validation::validate_image_name(&cfg.image)?;
+    validate_image(cfg)?;
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
-    if !lower.is_dir() {
-        bail!(
-            "image {:?} not found at {} (try: sudo scripts/fetch-alpine.sh)",
-            cfg.image,
-            lower.display()
-        );
-    }
-    // The image's files must belong to the sandbox's ID range, or sandbox
-    // root would see them all as owned by "nobody" and couldn't change them.
-    if lower.metadata()?.uid() != userns::ID_BASE {
-        bail!(
-            "image {:?} isn't owned by the sandbox ID range (re-run: sudo scripts/fetch-alpine.sh)",
-            cfg.image
-        );
-    }
 
     let id = run_id();
     trace::mark("host: check image");
@@ -142,11 +127,29 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     result.map(|_| ())
 }
 
+/// Everything about the image that a create decides before it allocates
+/// (persistent create's preflight, and `kiln run` before its run directory):
+/// the image exists and belongs to the sandbox ID range, and with
+/// `--read-only` every writable path survives the shim's Landlock walk over
+/// it (`landlock::preflight`). The shim repeats this before its run
+/// directory, so an image changed in between fails before anything exists.
 pub fn validate_image(cfg: &Config) -> Result<()> {
+    validate_image_in(&image::Roots::system(), cfg)
+}
+
+fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
     validation::validate_image_name(&cfg.image)?;
-    let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
-    if !lower.is_dir() || lower.metadata()?.uid() != userns::ID_BASE {
-        bail!("image {:?} is missing or isn't owned by the sandbox ID range", cfg.image);
+    let lower = roots.images.join(&cfg.image);
+    // (Tests' scratch images belong to the test user, as in `image::open_image`.)
+    if !lower.is_dir() || (lower.metadata()?.uid() != userns::ID_BASE && !cfg!(test)) {
+        bail!("image {:?} is missing or isn't owned by the sandbox ID range (try: sudo scripts/fetch-alpine.sh)",
+            cfg.image);
+    }
+    if cfg.read_only {
+        // The directory the shim mounts, opened the way its image reference
+        // opens it (`image::open_image`, no symlink at the name).
+        let image = OwnedFd::from(image::open_image(roots, &cfg.image)?);
+        landlock::preflight(&image, &cfg.writable, &generated(cfg))?;
     }
     Ok(())
 }
@@ -609,7 +612,7 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
         // A restored tree is never extended: an absent writable path fails
         // the create (preflight already refused it; this is the no-follow
         // recheck in the merged view).
-        landlock::restrict_writes(&cfg.writable, cfg.fork.is_none()).map_err(|e| if cfg.fork.is_some() {
+        landlock::restrict_writes(&cfg.writable, cfg.fork.is_none(), &generated).map_err(|e| if cfg.fork.is_some() {
             checkpoint::refuse(checkpoint::Reason::LayoutUnsupported, format!("{e:#}"))
         } else { e })?;
     }
@@ -772,6 +775,49 @@ pub fn run_dir(id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config(image: &str, read_only: bool, writable: &[&str], net: &str) -> Config {
+        Config {
+            limits: Limits { memory: Some(64 << 20), cpus: Some(1.0), pids: Some(16) },
+            disk: Some(64 << 20),
+            net: net::Plan::new(net, &[]).unwrap(),
+            hostname: "kiln".into(), image: image.into(), keep: true, read_only,
+            writable: writable.iter().map(PathBuf::from).collect(), stats: false, cmd: Vec::new(), fork: None,
+        }
+    }
+
+    fn scratch_roots(tag: &str) -> (PathBuf, image::Roots) {
+        let root = std::env::temp_dir().join(format!("kiln-container-{tag}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let roots = image::Roots { images: root.join("images"), registry: root.join("registry"), runs: root.join("runs") };
+        fs::create_dir_all(roots.images.join("img/var")).unwrap();
+        fs::create_dir_all(roots.images.join("img/etc")).unwrap();
+        fs::create_dir_all(roots.images.join("img/run")).unwrap();
+        symlink("../run", roots.images.join("img/var/run")).unwrap();
+        fs::write(roots.images.join("img/etc/passwd"), "").unwrap();
+        (root, roots)
+    }
+
+    /// The image walk is part of the create preflight: an image's symlinked or
+    /// regular-file parent refuses the create before anything is allocated.
+    #[test]
+    fn preflight_walks_writable_paths_in_the_image() {
+        let (root, roots) = scratch_roots("walk");
+        for path in ["/var/run/x", "/etc/passwd/x", "/proc/x", "/dev/x"] {
+            let error = validate_image_in(&roots, &config("img", true, &[path], "none")).expect_err(path);
+            assert!(format!("{error:#}").contains(path), "{path}: {error:#}");
+        }
+        for path in ["/tmp/x", "/dev/shm/x", "/var", "/var/new/deep"] {
+            validate_image_in(&roots, &config("img", true, &[path], "none")).unwrap_or_else(|e| panic!("{path}: {e:#}"));
+        }
+        // With DNS kiln writes /etc/resolv.conf as a file.
+        validate_image_in(&roots, &config("img", true, &["/etc/resolv.conf/x"], "none")).unwrap();
+        assert!(validate_image_in(&roots, &config("img", true, &["/etc/resolv.conf/x"], "full")).is_err());
+        // Without a read-only root there is no Landlock walk to fail.
+        validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
+        assert!(validate_image_in(&roots, &config("missing", false, &[], "none")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn run_directory_and_control_socket_are_root_only() {

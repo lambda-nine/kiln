@@ -5,6 +5,16 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Decide writable paths against the image before allocation (adversarial
+  review of kilnd's ambiguous-create fix, HIGH 1 and MEDIUM 1): with
+  `--read-only`, `create` and `run` walk every writable path and the default
+  scratch directories through the image with the shim's own no-follow walk,
+  so `/var/run/x` on the default Alpine image (`/var/run -> ../run`),
+  `/etc/passwd/x`, paths over kiln's `/proc`, `/sys` and `/dev` mounts (but
+  `/dev` and `/dev/shm`), paths through `/etc/resolv.conf` when kiln writes
+  it, and components over 255 bytes are refused with exit 124 instead of
+  failing in the shim after allocation. The shim refuses the same paths.
+
 - Bring the docs in step with the code: CLAUDE.md's status names the public
   repository, the work since v0.1.0 and kilnd as built; ARCHITECTURE.md's
   daemon decision and build order reflect kilnd; and the benchmark docs fix

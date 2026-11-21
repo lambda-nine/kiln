@@ -201,7 +201,14 @@ and prompt removal.
    bytes, each absolute and canonical; `/`, control characters, and empty,
    `.` or `..` components are rejected. Writable directories are opened from
    the sandbox root one component at a time without following symlinks or
-   procfs magic links, including image-controlled parent components.
+   procfs magic links, including image-controlled parent components. `create`
+   and `run` walk the same paths through the image with the same code before
+   anything is allocated, so a symlinked or regular-file component (Alpine's
+   `/var/run -> ../run`, `/etc/passwd/x`), a path under `/proc`, `/sys` or
+   `/dev` other than `/dev` itself and `/dev/shm`, a path through
+   `/etc/resolv.conf` when kiln writes it, or a component longer than 255
+   bytes is refused up front (`create` exits 124). Components the image
+   doesn't have are created by the sandbox's setup, as before.
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous

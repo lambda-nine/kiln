@@ -288,6 +288,16 @@ remain ambiguous even if cleanup appears to have succeeded. A caller must
 negotiate the capability before trusting the direct child's exit 124. Other
 commands do not acquire this exit contract.
 
+The preflight decides every failure a caller can choose. With `--read-only`
+it runs the shim's own writable-path walk (`landlock::walk`) over the image
+directory, opened without following its name: a symlinked or regular-file
+component, a path over kiln's own `/proc`, `/sys` or `/dev` mounts (all but
+`/dev` and `/dev/shm`), a path through a file kiln writes
+(`/etc/resolv.conf` with DNS) or a component over 255 bytes is refused.
+Where the image lacks a component the preflight stops and accepts, because
+an ordinary create's shim makes it; a fork's absent paths are refused by its
+own preflight over the image and the checkpoint together.
+
 ### Exec options
 
 kilnd's `ExecRequest.cwd` and `env` reach kiln as data, never as host argv or
