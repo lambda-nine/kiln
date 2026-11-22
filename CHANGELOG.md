@@ -18,6 +18,11 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   120 seconds; past that the command refuses `checkpoint_busy`, naming the
   image and the deadline. `kiln image verify` itself is unchanged.
 
+- Correct the failure-mode table's host reboot row: it said automatic
+  daemon startup reconciliation was still open. kiln itself still records
+  no boot identity, but kilnd's startup reconciliation covers the sandboxes
+  kilnd created. A run created with kiln alone still needs `kiln gc`.
+
 - Make a persistent create's shim die with `kiln create` until the run has
   its identity: a CLI killed between the shim's fork and the run directory
   left a shim that went on to start a sandbox nothing listed or waited for.
