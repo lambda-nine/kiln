@@ -108,8 +108,12 @@ the directory again, so every run directory a create leaves has an identity
 that `kiln ls` lists and `kiln gc` collects once the shim is dead. Removing a
 run directory (on a failed setup, at teardown and in `kiln gc`) keeps that
 identity to the end: everything else goes first, then the image reference,
-`shim.pid` and `shim.start`, so a removal that fails leaves a stale run to
-retry, never an unlisted one. The removal holds a fixed number of directory
+`shim.pid` and `shim.start`, so a removal that fails before the identity
+files go leaves a stale run to retry, never an unlisted one. After them only
+the empty directory's `rmdir` is left: an entry a host root writer adds then is
+removed and the `rmdir` retried 3 times, and if that still fails the
+directory, without its identity, is left for node root and logged by path.
+The removal holds a fixed number of directory
 descriptors at any depth, follows no symlink and refuses to cross a mount; a
 shim logs a teardown it couldn't finish to the system log. `kiln ls` and `kiln gc` call a shim live only when that PID's current
 `/proc/<pid>/stat` start time still matches the record and the process is not a
@@ -209,7 +213,7 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 | Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run; the writable directories a create makes are counted against the inode quota before allocation; teardown and `kiln gc` remove a run directory of any depth the quota allows with a bounded number of descriptors |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
-| Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir, also of a shim that died during setup). Every removal of a run directory (a failed setup, teardown, `kiln gc`) takes `shim.pid` and `shim.start` last, so one that fails leaves a stale run that `kiln ls` lists and `kiln gc` retries; only a crash between the run directory's `mkdir` and its identity files leaves a directory without `shim.pid` to remove by hand. One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
+| Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir, also of a shim that died during setup). Every removal of a run directory (a failed setup, teardown, `kiln gc`) takes `shim.pid` and `shim.start` last, so one that fails before them leaves a stale run that `kiln ls` lists and `kiln gc` retries (a root writer racing the final `rmdir` is retried, then logged and left for node root); only a crash between the run directory's `mkdir` and its identity files leaves a directory without `shim.pid` to remove by hand. One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
 | Shared System V IPC              | Handled: IPC namespace per sandbox      |
 | Descriptors inherited from caller| Handled: closed before setup            |
 | Host reboot leaves run dirs      | Partial: `kiln gc` rejects same-boot PID reuse, but a coincidental PID/start-time match across boots is retained for manual review; boot identity and automatic daemon startup reconciliation remain open |
@@ -315,10 +319,18 @@ ordinary create's shim makes it, and counts what the walk will leave in the
 sandbox's upper: every component of such a path (the shim makes the missing
 ones and overlayfs copies up the image's directories above them), once
 across the set, and the generated `/etc/resolv.conf` with `/etc`. They come
-out of the run's inode quota (one inode per 16 KiB of `--disk`), so a set
-that needs more than the quota leaves after 32 inodes for the run's own
-files is refused here instead of failing in the shim with ENOSPC; at the
-64 MiB floor that is about 4000 directories, and `--disk max` has no limit.
+out of the run's inode quota (one inode per started 16 KiB of `--disk`), so
+a set that needs more than the quota leaves after the run's own files is
+refused here instead of failing in the shim with ENOSPC. The allowance for
+those files is exactly their measured peak, with no margin: 10 inodes for a
+persistent run, 8 for a one-shot run (the run directory, the overlay's
+`upper`, `work`, `work/work` and `merged`, the `image`, `policy` and `layout`
+records, and a persistent run's `control.sock` and `init.pid`). At the
+64 MiB floor that is 4086 directories for `create` and 4088 for `run`, and
+`--disk max` has no limit. The resolver file is written without following a
+symlink (an image's symlinked `/etc/resolv.conf` is replaced by a regular
+file), so its 2 entries are what the count says; an image whose `/etc` isn't
+a real directory is refused with DNS.
 A fork's absent paths are refused by its own preflight over the image and
 the checkpoint together, and its walk makes nothing.
 

@@ -574,14 +574,16 @@ mod create_certainty_tests {
     /// With `--read-only`, writable directories that need more inodes than
     /// `--disk` leaves the sandbox are refused before ID creation (the
     /// 2026-11-22 review's finding A), and the set that fits exactly gets past
-    /// the preflight to ID creation.
+    /// the preflight to ID creation: at the 64M floor, 4096 inodes less the
+    /// persistent run's own 10 (a literal, the adversarial review's H1).
     #[test]
     fn writable_directories_past_the_inode_quota_are_rejected_before_id_creation() {
         let root = std::env::temp_dir().join(format!("kiln-create-inodes-{}", std::process::id()));
         let roots = image::Roots { images: root.join("images"), registry: root.join("registry"), runs: root.join("runs") };
         for dir in ["tmp", "root", "etc"] { std::fs::create_dir_all(roots.images.join("img").join(dir)).unwrap(); }
         // The image lacks /workspace, which the shim makes too.
-        let room = quota::inode_limit(Some(quota::MIN_DISK)).unwrap() - container::RUN_INODES - 1;
+        assert_eq!(quota::inode_limit(Some(quota::MIN_DISK)), Some(4096));
+        let room = 4096 - 10 - 1;
         let deep = |top: char, components: u64| PathBuf::from(format!("/{top}{}", "/a".repeat(components as usize - 1)));
         let mut writable: Vec<PathBuf> = ('b'..='h').map(|top| deep(top, 512)).collect();
         writable.push(deep('i', room - 7 * 512));

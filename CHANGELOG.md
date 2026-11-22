@@ -5,6 +5,33 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Allow exactly what a run's own files use under its inode quota, no margin
+  (adversarial review H1): the create preflight kept 32 inodes for them, 22
+  more than a persistent run uses, so it refused sandboxes that fit. It now
+  keeps 10 for `create` and 8 for `run`, the measured peaks, and at the 64M
+  floor accepts 4086 and 4088 writable directories. A compile-time check and
+  a unit test tie the allowances to the run's list of files, and the VM
+  regression pins both boundaries with literal numbers.
+
+- Write a sandbox's `/etc/resolv.conf` without following a symlink
+  (adversarial review M2): an image's symlinked or non-regular
+  `/etc/resolv.conf` is replaced by a regular file with the generated
+  content instead of being written through, so a symlink to `/dev/shm` or
+  `/tmp` can no longer move the file or make the inode count wrong. With DNS,
+  an image whose `/etc` is a symlink, a file or missing, or whose
+  `/etc/resolv.conf` is a directory, is refused before allocation (`create`
+  exits 124).
+
+- Retry the last step of a run directory's removal (adversarial review M1):
+  an entry a host root writer adds after the identity files are gone is
+  removed and the `rmdir` retried 3 times; if it still fails, the directory
+  is left for node root and logged by path, and `kiln rm` says so. Only a
+  failure before the identity files are removed keeps the run listed for
+  `kiln gc`.
+
+- Skip a run whose teardown removes it while `kiln ls` or `kiln gc` reads
+  it (adversarial review L4), instead of failing the whole listing.
+
 - Remove a run directory with its identity last and a bounded number of
   descriptors at any depth (kiln security review round 2, finding B): a
   sandbox that built a directory tree deeper than the shim's soft descriptor
@@ -15,17 +42,18 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   `kiln run` now share one removal that empties everything else first (at
   most 32 directories open below the top, never following a symlink or
   crossing a mount), then unlinks the image reference, `shim.pid` and
-  `shim.start`. A removal that fails keeps the run listed as stale for
-  `kiln gc ID` to retry, the shim logs it to the system log, and `kiln rm`
-  says the run directory is still present.
+  `shim.start`. A removal that fails before the identity files are removed
+  keeps the run listed as stale for `kiln gc ID` to retry, the shim logs it
+  to the system log, and `kiln rm` says the run directory is still present.
 
 - Count the writable directories a create makes against its inode quota
   before allocation (kiln security review round 2, finding A): with
   `--read-only`, `create` and `run` count every entry the shim's walk will
   leave in the sandbox's upper (each component of a path the image lacks
   part of, which the shim makes or overlayfs copies up, once across the set,
-  and the generated `/etc/resolv.conf`) and refuse a set that needs more
-  than `--disk`'s inode limit leaves after 32 for the run's own files;
+  and the generated `/etc/resolv.conf` with `/etc`, written without following
+  a symlink) and refuse a set that needs more than `--disk`'s inode limit
+  leaves after the run's own files;
   `create` exits 124. Sixteen 512-component paths at the 64M floor used to
   pass the preflight and fail in the shim with ENOSPC after allocation,
   which kilnd records as an ambiguous, charged create. `--disk max` and

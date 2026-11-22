@@ -215,8 +215,12 @@ and prompt removal.
    doesn't have are created by the sandbox's setup, and they count against
    `--disk`'s inode limit together with the image directories above them,
    which the overlay copies up: `create` and `run` count them first and refuse
-   a set that doesn't fit after 32 inodes for the run's own files (about 4000
-   directories at the 64M floor).
+   a set that doesn't fit after the run's own files, exactly the 10 inodes a
+   persistent run uses and the 8 of a one-shot run (at the 64M floor, 4096
+   inodes, that is 4086 directories for `create` and 4088 for `run`). With
+   DNS kiln writes `/etc/resolv.conf` without following a symlink: an image's
+   symlink there is replaced by a regular file, and an image whose `/etc`
+   isn't a real directory is refused up front.
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous
@@ -315,8 +319,12 @@ and prompt removal.
     also see a shim that is still being set up or died during setup; `kiln rm`
     of a dead one points at `kiln gc`. Every removal of a run directory takes
     that identity last and works at any depth with a bounded number of open
-    descriptors, so a teardown that fails (the shim logs why to the system
-    log) leaves a stale run that `kiln ls` lists and `kiln gc ID` retries. `kiln rm` stops one and waits for its resources to be removed, and
+    descriptors, so a teardown that fails before the identity files are
+    removed (the shim logs why to the system log) leaves a stale run that
+    `kiln ls` lists and `kiln gc ID` retries. An entry a root process adds to
+    the emptied directory after that is removed and the final `rmdir` retried
+    a few times; if it still fails, the directory, now without its identity,
+    is left for node root and logged by path. `kiln rm` stops one and waits for its resources to be removed, and
     `kiln gc` removes cgroups, network state and run directories left by
     crashed shims, removing child cgroup directories before their parent.
     Optional ID arguments restrict cleanup to those sandboxes, so a manager

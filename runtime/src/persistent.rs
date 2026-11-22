@@ -258,7 +258,7 @@ pub(crate) fn create_in(
     from_checkpoint: Option<crate::checkpoint::capture::Fork>,
     new_id: impl FnOnce() -> String,
 ) -> Result<String> {
-    before_allocation(container::preflight_in(roots, cfg))?;
+    before_allocation(container::preflight_in(roots, cfg, container::RunKind::Persistent))?;
     let id = new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     // SAFETY: the CLI is single-threaded here.
@@ -920,6 +920,10 @@ pub fn remove(id: &str) -> Result<()> {
     if read_shim(&dir).and_then(|shim| shim.is_live()).unwrap_or(false) {
         bail!("sandbox {id} did not finish cleanup: its shim is still removing {}", dir.display());
     }
+    if dir.exists() && !dir.join("shim.pid").exists() {
+        bail!("sandbox {id} did not finish cleanup: its run directory {} is still present without its identity \
+            (the shim's error is in the system log), so only node root can remove it", dir.display())
+    }
     bail!("sandbox {id} did not finish cleanup: its run directory {} is still present (the shim's error is in \
         the system log); `kiln gc {id}` retries the removal", dir.display())
 }
@@ -958,8 +962,9 @@ fn list_records(root: &Path) -> Result<Vec<(String, bool, String)>> {
         }
         // A present PID is the identity-complete marker. Once it exists,
         // missing, malformed or unreadable companion metadata is an error,
-        // never evidence that the shim is dead.
-        let shim = read_shim(&dir)?;
+        // never evidence that the shim is dead; a run whose teardown removed
+        // it meanwhile is skipped (`read_listed_shim`).
+        let Some(shim) = read_listed_shim(&dir)? else { continue };
         let live = shim.is_live()?;
         records.push((id, live, shim.pid_text));
     }
@@ -1034,7 +1039,7 @@ fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathB
         // Validate identity before considering cleanup, even if the control
         // socket is absent. A live shim can be between socket creation and
         // identity publication, or its socket may have been removed.
-        if !read_shim(&dir)?.is_live()? {
+        if let Some(shim) = read_listed_shim(&dir)? && !shim.is_live()? {
             stale.push((id, dir));
         }
     }
@@ -1068,11 +1073,32 @@ impl RecordedShim {
     }
 }
 
+/// `read_shim` for a scan of the registry (`kiln ls`, `kiln gc`), which can
+/// race a teardown that removes the identity between the scan's reads:
+/// `shim.pid` first, then `shim.start`. A read that fails with ENOENT once
+/// `shim.pid` is gone too (or the whole run directory) is a run that
+/// disappeared, and the scan skips it (`None`) instead of failing every
+/// other entry. `shim.pid` still there without `shim.start`, which no
+/// publication or removal order leaves, and every other error still fail.
+fn read_listed_shim(dir: &Path) -> Result<Option<RecordedShim>> {
+    match read_shim(dir) {
+        Ok(shim) => Ok(Some(shim)),
+        Err(e) if e.root_cause().downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            && !dir.join("shim.pid").try_exists()
+                .with_context(|| format!("inspect sandbox registry entry {}", dir.display()))? => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn read_shim(dir: &Path) -> Result<RecordedShim> {
     let pid_path = dir.join("shim.pid");
     let start_path = dir.join("shim.start");
+    #[cfg(test)]
+    tests::between_shim_reads(dir, "before shim.pid");
     let pid_text = fs::read_to_string(&pid_path)
         .with_context(|| format!("read sandbox registry file {}", pid_path.display()))?;
+    #[cfg(test)]
+    tests::between_shim_reads(dir, "before shim.start");
     let start_text = fs::read_to_string(&start_path)
         .with_context(|| format!("read sandbox registry file {}", start_path.display()))?;
     let pid = pid_text
@@ -2044,6 +2070,121 @@ mod tests {
         let stale: Vec<_> = stale_gc_candidates(&root, &[]).unwrap().into_iter().map(|(id, _)| id).collect();
         assert_eq!(stale, ["cccc-3"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    type ShimReadHook = Option<Box<dyn FnMut(&Path, &str)>>;
+
+    thread_local! {
+        /// What `between_shim_reads` runs on this test's thread.
+        static BETWEEN_SHIM_READS: std::cell::RefCell<ShimReadHook> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by `read_shim` before each of its two reads, so a test can
+    /// remove a run's identity there the way a concurrent teardown would.
+    pub(super) fn between_shim_reads(dir: &Path, stage: &str) {
+        BETWEEN_SHIM_READS.with(|hook| if let Some(hook) = hook.borrow_mut().as_mut() { hook(dir, stage) });
+    }
+
+    /// A run whose teardown removes its identity while `kiln ls` or an
+    /// unscoped `kiln gc` reads it (the adversarial review's L4) is skipped,
+    /// at either read, and the rest of the registry is still listed. A
+    /// `shim.pid` left without `shim.start`, and any other read error, still
+    /// fail the scan.
+    #[test]
+    fn a_scan_skips_a_run_whose_identity_disappears() {
+        let root = std::env::temp_dir().join(format!("kiln-list-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let pid = std::process::id();
+        let (_, start) = process_state_and_start(pid).unwrap().unwrap();
+        let make = |id: &str, pid: u32, start: u64| {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("shim.start"), start.to_string()).unwrap();
+            fs::write(dir.join("shim.pid"), pid.to_string()).unwrap();
+        };
+        let teardown = |dir: &Path| {
+            for name in ["shim.pid", "shim.start"] { fs::remove_file(dir.join(name)).unwrap(); }
+        };
+        let set = |victim: &'static str, at: &'static str, what: fn(&Path)| {
+            BETWEEN_SHIM_READS.with(|hook| *hook.borrow_mut() = Some(Box::new(move |dir: &Path, stage: &str| {
+                if stage == at && dir.file_name().is_some_and(|n| n == victim) && dir.join("shim.pid").exists() {
+                    what(dir);
+                }
+            })));
+        };
+        let gone = |dir: &Path| fs::remove_dir_all(dir).unwrap();
+        for (at, what) in [("before shim.pid", teardown as fn(&Path)), ("before shim.start", teardown),
+            ("before shim.pid", gone), ("before shim.start", gone)] {
+            make("aaaa-1", pid, start);
+            make("bbbb-2", pid, start);
+            make("cccc-3", i32::MAX as u32, 1);
+            set("bbbb-2", at, what);
+            let listed: Vec<_> = list_records(&root).unwrap_or_else(|e| panic!("{at}: {e:#}"))
+                .into_iter().map(|(id, live, _)| (id, live)).collect();
+            assert_eq!(listed, [("aaaa-1".to_string(), true), ("cccc-3".into(), false)], "{at}");
+            make("bbbb-2", pid, start);
+            make("dddd-4", i32::MAX as u32, 1);
+            set("cccc-3", at, what);
+            let stale: Vec<_> = stale_gc_candidates(&root, &[]).unwrap_or_else(|e| panic!("{at}: {e:#}"))
+                .into_iter().map(|(id, _)| id).collect();
+            assert_eq!(stale, ["dddd-4"], "{at}");
+            fs::remove_dir_all(&root).unwrap();
+            fs::create_dir(&root).unwrap();
+        }
+        // Only shim.start removed: not a teardown's order, still an error.
+        make("aaaa-1", pid, start);
+        set("aaaa-1", "before shim.start", |dir: &Path| fs::remove_file(dir.join("shim.start")).unwrap());
+        let error = list_records(&root).unwrap_err();
+        assert!(format!("{error:#}").contains("shim.start"), "{error:#}");
+        BETWEEN_SHIM_READS.with(|hook| *hook.borrow_mut() = None);
+        // Unreadable, not missing: still an error.
+        fs::remove_file(root.join("aaaa-1/shim.start")).unwrap();
+        fs::create_dir(root.join("aaaa-1/shim.start")).unwrap();
+        assert!(list_records(&root).is_err());
+        assert!(stale_gc_candidates(&root, &[]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The environment variable that hands `child_gc_removes_a_deep_tree_under_a_low_descriptor_limit`
+    /// its scratch directory.
+    const DEEP_GC_CHILD: &str = "KILN_TEST_DEEP_GC_DIR";
+
+    /// `kiln gc`'s removal of a stale run (`finish_gc`) takes the same
+    /// bounded-descriptor path as teardown (the adversarial review's L3): a
+    /// run directory 3000 levels deep is removed with the soft
+    /// `RLIMIT_NOFILE` at 64, in a child process (this test binary, running
+    /// only the test below).
+    #[test]
+    fn gc_removes_a_tree_deeper_than_the_descriptor_limit() {
+        let root = std::env::temp_dir().join(format!("kiln-gc-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let run = root.join("run");
+        fs::create_dir_all(run.join("upper/tmp")).unwrap();
+        for file in ["shim.start", "shim.pid", crate::image::REFERENCE_FILE] { fs::write(run.join(file), "1").unwrap(); }
+        crate::rmtree::tests::chain(&run.join("upper/tmp"), 3000, 499);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "persistent::tests::child_gc_removes_a_deep_tree_under_a_low_descriptor_limit",
+                "--ignored", "--nocapture", "--test-threads=1"])
+            .env(DEEP_GC_CHILD, &root)
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        let left = run.exists();
+        if left { crate::container::remove_run_dir(&run).unwrap(); }
+        fs::remove_dir(&root).unwrap();
+        assert!(output.status.success() && text.contains("1 passed"), "{text}");
+        assert!(!left, "gc left the deep run directory: {text}");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by gc_removes_a_tree_deeper_than_the_descriptor_limit"]
+    fn child_gc_removes_a_deep_tree_under_a_low_descriptor_limit() {
+        let Some(root) = std::env::var_os(DEEP_GC_CHILD).map(PathBuf::from) else { return };
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = 64;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        finish_gc(&root.join("run"), Ok(()), Ok(())).unwrap();
     }
 
     #[test]

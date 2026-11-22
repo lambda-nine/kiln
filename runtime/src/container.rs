@@ -65,7 +65,7 @@ struct Layers {
 pub fn run(cfg: &Config) -> Result<i32> {
     // A plain name, so `--image ../../somewhere` can't pick an arbitrary host
     // directory (or another run's upper layer) as the root filesystem.
-    preflight(cfg)?;
+    preflight(cfg, RunKind::OneShot)?;
     let lower = Path::new(KILN_ROOT).join("images").join(&cfg.image);
 
     let id = run_id();
@@ -98,7 +98,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
 /// by its detached host shim, which stays alive to own cleanup resources.
 pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Option<checkpoint::capture::Fork>)
     -> Result<()> {
-    preflight(cfg)?;
+    preflight(cfg, RunKind::Persistent)?;
     storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
     let run_dir = run_dir(id);
     let layers = Layers {
@@ -117,11 +117,12 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
             // restore removes the run: no sandbox starts on a partial upper.
             checkpoint::capture::restore_into(fork, &run_dir, &generated(cfg))?;
         }
-        bind_control_socket(&run_dir.join("control.sock"))
+        bind_control_socket(&run_dir.join(CONTROL_SOCKET))
     })?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     if let Err(e) = remove_run_dir(&run_dir) {
-        report(&format!("kiln: sandbox {id}: teardown left {}: {e}; `kiln gc {id}` retries it", run_dir.display()));
+        let retry = if run_dir.join(IDENTITY_PID).exists() { format!("; `kiln gc {id}` retries it") } else { String::new() };
+        report(&format!("kiln: sandbox {id}: teardown left {}: {e}{retry}", run_dir.display()));
     }
     result.map(|_| ())
 }
@@ -149,21 +150,35 @@ fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, setup: impl Fn
 /// `shim.pid` first, so a concurrent `kiln ls` never finds `shim.pid`
 /// without `shim.start`.
 const IDENTITY: [&CStr; 2] = [c"shim.pid", c"shim.start"];
+/// `IDENTITY[0]` as a path name.
+const IDENTITY_PID: &str = "shim.pid";
 
 /// Removes a run directory, for a one-shot run, a persistent shim's teardown
 /// and `kiln gc`. Everything but the image reference and the identity goes
 /// first, with a fixed number of descriptors at any depth and never across a
 /// symlink or a mount (`rmtree`); then the image reference, `shim.pid`,
-/// `shim.start` and the directory. Any error returns before the identity is
-/// touched: the run stays listed by `kiln ls` (stale once its shim is gone),
-/// `kiln gc` retries it, kilnd keeps it charged, and its image stays
-/// referenced.
+/// `shim.start` and the directory. Any error before the identity files are
+/// removed returns with them in place: the run stays listed by `kiln ls`
+/// (stale once its shim is gone), `kiln gc` retries it, kilnd keeps it
+/// charged, and its image stays referenced. After them only the empty
+/// directory is left to remove; nothing of the sandbox's can write there by
+/// then (teardown has waited for its init, gc has drained its cgroup), but a
+/// host root writer can, so an entry that appears is removed and the
+/// `rmdir` retried `FINAL_RMDIR_RETRIES` times. If that still fails, the
+/// directory, empty of identity, is left for node root and the error names
+/// it (the shim and `kiln gc` log it by path).
 pub(crate) fn remove_run_dir(run_dir: &Path) -> io::Result<()> {
     remove_run_dir_with(run_dir, &mut |_| Ok(()))
 }
 
+/// How many times `remove_run_dir` empties the run directory again and
+/// retries its `rmdir` when an entry appeared after the identity went.
+pub(crate) const FINAL_RMDIR_RETRIES: usize = 3;
+
 /// `remove_run_dir` with a hook called before each removal (tests inject
-/// failures with it; production passes one that does nothing).
+/// failures and late writers with it; production passes one that does
+/// nothing): with each entry's name, and with `"."` just before each `rmdir`
+/// of the run directory itself.
 pub(crate) fn remove_run_dir_with(run_dir: &Path, hook: rmtree::Hook) -> io::Result<()> {
     let dir: OwnedFd = fs::File::options().read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(run_dir)?.into();
@@ -180,8 +195,23 @@ pub(crate) fn remove_run_dir_with(run_dir: &Path, hook: rmtree::Hook) -> io::Res
             }
         }
     }
-    drop(dir);
-    fs::remove_dir(run_dir)
+    let mut retries = 0;
+    loop {
+        hook(c".")?;
+        let e = match fs::remove_dir(run_dir) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let late = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST));
+        if !late || retries == FINAL_RMDIR_RETRIES {
+            let after = if late { format!(" after {retries} retries") } else { String::new() };
+            return Err(io::Error::new(e.kind(), format!("remove the run directory{after}, its identity already \
+                removed, so it is left for node root: {e}")));
+        }
+        retries += 1;
+        // The identity is gone, so nothing in it is kept now.
+        rmtree::empty_dir(&dir, &[], &mut *hook)?;
+    }
 }
 
 /// A shim's failure that no caller is left to read: its stderr is /dev/null
@@ -206,14 +236,14 @@ const MAX_HOSTNAME_BYTES: usize = 64;
 /// The create preflight's checks of a config, before anything is allocated:
 /// its scalar settings (`validate_settings`), then its image
 /// (`validate_image_in`). The shim repeats them before its run directory.
-pub fn preflight(cfg: &Config) -> Result<()> {
-    preflight_in(&image::Roots::system(), cfg)
+pub fn preflight(cfg: &Config, kind: RunKind) -> Result<()> {
+    preflight_in(&image::Roots::system(), cfg, kind)
 }
 
 /// `preflight` over the images in `roots` (tests pass a scratch directory).
-pub(crate) fn preflight_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
+pub(crate) fn preflight_in(roots: &image::Roots, cfg: &Config, kind: RunKind) -> Result<()> {
     validate_settings(cfg)?;
-    validate_image_in(roots, cfg)
+    validate_image_in(roots, cfg, kind)
 }
 
 /// Limits, disk and hostname the sandbox's setup would refuse or that are
@@ -229,18 +259,78 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// What a run's own setup puts under its quota besides the sandbox's root,
-/// as the create preflight allows for it: the run directory itself, `upper`,
-/// `work` and overlayfs's `work/work`, `merged`, the `image`, `policy` and
-/// `layout` records, `control.sock` and `init.pid`. Measured on the VM
-/// (Linux 6.8, XFS, 2026-11-22): a persistent run holds 10 at rest and a
-/// one-shot run 8 (no socket or `init.pid`), and the largest writable walk
-/// that still creates at `--disk=64M` (4096 inodes) makes 4086 directories,
-/// so the run's own files peak at 10 while the walk and what follows it run
-/// (a record's temporary and overlayfs's mount-time probes are gone by then).
-/// 32 leaves a margin of 22, so a new run file doesn't silently break the
-/// preflight's count.
-pub(crate) const RUN_INODES: u64 = 32;
+/// A persistent run's control socket and its PID 1's PID record: the run
+/// files only a persistent run has (`RUN_ENTRIES`).
+const CONTROL_SOCKET: &str = "control.sock";
+const INIT_PID: &str = "init.pid";
+
+/// Which kind of run a preflight decides for: the two leave different run
+/// files under the run's inode quota (`RUN_ENTRIES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+    /// `kiln run`.
+    OneShot,
+    /// `kiln create` and its shim.
+    Persistent,
+}
+
+/// Every entry a run's own setup leaves under its project's inode quota
+/// besides the run directory itself (which takes the project too) and the
+/// sandbox's root, and whether only a persistent run has it: the overlay's
+/// `upper`, `work`, overlayfs's own `work/work` (made at mount) and `merged`;
+/// the `image`, `policy` and `layout` records; a persistent run's control
+/// socket and `init.pid`. A persistent run's identity files are published
+/// before the quota is set and stay outside it. A new run file goes here and
+/// into the allowances below, or `run_inode_allowances_match_the_run_entries`
+/// fails.
+pub(crate) const RUN_ENTRIES: [(&str, bool); 9] = [
+    ("upper", false), ("work", false), ("work/work", false), ("merged", false),
+    (image::REFERENCE_FILE, false), (checkpoint::POLICY_FILE, false), (overlay::LAYOUT_FILE, false),
+    (CONTROL_SOCKET, true), (INIT_PID, true),
+];
+
+/// What the create preflight allows for a run's own files under its inode
+/// quota, exactly their measured peak and no margin (an allowance above it
+/// refuses sandboxes that fit, the adversarial review's H1): the run
+/// directory and `RUN_ENTRIES`. Measured on the VM (Linux 6.8, XFS,
+/// 2026-11-22): a persistent run holds 10 at rest and a one-shot run 8, and
+/// with a setup that doesn't count, the largest writable walk that still
+/// creates at `--disk=64M` (4096 inodes) makes 4086 directories for a
+/// persistent run and 4088 for a one-shot run: a record's temporary and
+/// overlayfs's mount-time probes are gone before the walk's last mkdir.
+/// `scripts/create-certainty-regressions.sh` pins both boundaries.
+pub(crate) const PERSISTENT_RUN_INODES: u64 = 10;
+pub(crate) const ONESHOT_RUN_INODES: u64 = 8;
+
+// The allowances are the run directory and its `RUN_ENTRIES`, or this
+// doesn't compile.
+const _: () = {
+    let (mut oneshot, mut i) = (0, 0);
+    while i < RUN_ENTRIES.len() {
+        if !RUN_ENTRIES[i].1 { oneshot += 1; }
+        i += 1;
+    }
+    assert!(1 + oneshot == ONESHOT_RUN_INODES && 1 + RUN_ENTRIES.len() as u64 == PERSISTENT_RUN_INODES,
+        "the run inode allowances must count the run directory and RUN_ENTRIES");
+};
+
+impl RunKind {
+    /// The inodes this kind of run's own files use (`PERSISTENT_RUN_INODES`,
+    /// `ONESHOT_RUN_INODES`).
+    pub(crate) const fn run_inodes(self) -> u64 {
+        match self {
+            RunKind::OneShot => ONESHOT_RUN_INODES,
+            RunKind::Persistent => PERSISTENT_RUN_INODES,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RunKind::OneShot => "one-shot",
+            RunKind::Persistent => "persistent",
+        }
+    }
+}
 
 /// Everything about the image that a create decides before it allocates
 /// (persistent create's preflight, and `kiln run` before its run directory):
@@ -249,29 +339,76 @@ pub(crate) const RUN_INODES: u64 = 32;
 /// range), so an alias symlinked to another image is refused here rather
 /// than in the shim; and with `--read-only` every writable path survives the
 /// shim's Landlock walk over that directory (`landlock::preflight`), and the
-/// directories that walk will make fit the run's inode quota. The shim
-/// repeats this before its run directory, so an image changed in between
-/// fails before anything exists.
-fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
-    let image = image::open_image(roots, &cfg.image).map_err(|e| {
+/// directories that walk will make fit the run's inode quota, less what
+/// `kind`'s own files use. With a generated resolver file, an ordinary
+/// create's image must have a real `/etc` directory to write it into
+/// (`check_resolver_parent`). The shim repeats this before its run
+/// directory, so an image changed in between fails before anything exists.
+fn validate_image_in(roots: &image::Roots, cfg: &Config, kind: RunKind) -> Result<()> {
+    let image = OwnedFd::from(image::open_image(roots, &cfg.image).map_err(|e| {
         let missing = e.root_cause().downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
         if missing { e.context("image is missing (try: sudo scripts/fetch-alpine.sh)") } else { e }
-    })?;
+    })?);
+    let generated = generated(cfg);
+    // A fork's upper is the checkpoint's, and its write refuses a symlink
+    // itself (`write_fork_resolv_conf`).
+    if cfg.fork.is_none() && !generated.is_empty() {
+        check_resolver_parent(&image)?;
+    }
     if cfg.read_only {
-        let made = landlock::preflight(&OwnedFd::from(image), &cfg.writable, &generated(cfg))?;
+        let made = landlock::preflight(&image, &cfg.writable, &generated)?;
         // An ordinary create's shim makes the writable directories the image
         // lacks in the upper, under the run's inode quota, which runs out with
-        // ENOSPC long after allocation. A fork's walk makes none: its absent
-        // paths are refused, and its upper is the checkpoint's.
+        // ENOSPC long after allocation. A fork isn't counted: its walk makes
+        // nothing (absent paths are refused) and its upper is the
+        // checkpoint's, though its resolver write can add up to 2 entries
+        // (`write_fork_resolv_conf`).
         if cfg.fork.is_none() && let Some(limit) = quota::inode_limit(cfg.disk) {
-            let room = limit.saturating_sub(RUN_INODES);
+            let own = kind.run_inodes();
+            let room = limit.saturating_sub(own);
             ensure!(made <= room, "invalid --writable paths: setting them up needs {made} new entries in the \
                 sandbox's root, more than the {room} that --disk leaves (its inode limit of {limit}, one per 16 KiB, \
-                less {RUN_INODES} for the run's own files); use a larger --disk or fewer, shallower paths");
+                less the {own} a {} run's own files use); use a larger --disk or fewer, shallower paths", kind.name());
         }
     }
     Ok(())
+}
+
+/// The image side of an ordinary create's resolver write
+/// (`write_resolv_conf`): `/etc` must be a directory, not a symlink, and
+/// `/etc/resolv.conf` must not be a directory (anything else there is
+/// replaced by a regular file). Absent `/etc` is refused too: the write
+/// doesn't make it.
+fn check_resolver_parent(image: &OwnedFd) -> Result<()> {
+    let etc = open_nofollow_at(image.as_raw_fd(), c"etc", libc::O_PATH | libc::O_DIRECTORY).with_context(|| format!(
+        "invalid image for a sandbox with DNS: its /etc must be a directory, not a symlink (kiln writes {} there)",
+        protected::RESOLV_CONF))?;
+    match resolver_entry(&etc)? {
+        Some(libc::S_IFDIR) => bail!("invalid image for a sandbox with DNS: its {} is a directory", protected::RESOLV_CONF),
+        _ => Ok(()),
+    }
+}
+
+/// The file type (`S_IFMT` bits) of `resolv.conf` in the open `etc`, not
+/// following a symlink; `None` if it's absent.
+fn resolver_entry(etc: &OwnedFd) -> Result<Option<libc::mode_t>> {
+    let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: fstatat of a name in an open directory into a valid buffer, not following.
+    if unsafe { libc::fstatat(etc.as_raw_fd(), c"resolv.conf".as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        let e = Errno::last();
+        if e == Errno::ENOENT { return Ok(None); }
+        return Err(e).context("inspect /etc/resolv.conf");
+    }
+    Ok(Some(st.st_mode & libc::S_IFMT))
+}
+
+/// `openat` of `name` in `dir` that never follows a symlink at `name`.
+fn open_nofollow_at(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
+    // SAFETY: openat relative to an open directory, not following.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644) };
+    // SAFETY: on success openat returns a new descriptor that we now own.
+    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(Errno::result(fd).context("open")?) })
 }
 
 pub fn new_id() -> String { run_id() }
@@ -521,7 +658,7 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
             return Ok(());
         }
         if let Some(ready) = ready {
-            fs::write(run_dir(id).join("init.pid"), pid.to_string())?;
+            fs::write(run_dir(id).join(INIT_PID), pid.to_string())?;
             write(ready, b"1").context("signal create")?;
         }
         Ok(())
@@ -686,7 +823,7 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     // readable, but sandbox root can't point DNS somewhere else.
     if let Some(conf) = cfg.net.resolv_conf() {
         match &cfg.fork {
-            None => fs::write(protected::RESOLV_CONF, conf).context("write /etc/resolv.conf")?,
+            None => write_resolv_conf(conf.as_bytes())?,
             Some(info) => write_fork_resolv_conf(conf.as_bytes(), info)?,
         }
     }
@@ -757,15 +894,42 @@ fn init(cfg: &Config, layers: &Layers, ip: Option<Ipv4Addr>, from_parent: &Owned
     init::run(&argv)
 }
 
+/// An ordinary create's DNS write, in the sandbox's root.
+fn write_resolv_conf(conf: &[u8]) -> Result<()> {
+    write_resolv_conf_under(&open_nofollow_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY)?, conf)
+}
+
+/// `write_resolv_conf` under `root` (tests pass a scratch directory). No
+/// symlink is followed: `/etc` opens without following (the preflight
+/// refused an image whose `/etc` isn't a directory), an image's regular
+/// `/etc/resolv.conf` is truncated and rewritten, and anything else there (a
+/// symlink to `/dev/shm`, `/tmp` or anywhere, a FIFO) is unlinked and replaced
+/// by a new regular file. The upper then holds exactly the 2 entries the
+/// preflight counts for it: `/etc` and `/etc/resolv.conf`.
+fn write_resolv_conf_under(root: &OwnedFd, conf: &[u8]) -> Result<()> {
+    let etc = open_nofollow_at(root.as_raw_fd(), c"etc", libc::O_RDONLY | libc::O_DIRECTORY)
+        .context("open /etc without symlinks")?;
+    let name = c"resolv.conf";
+    let file = match resolver_entry(&etc)? {
+        Some(libc::S_IFREG) => open_nofollow_at(etc.as_raw_fd(), name, libc::O_WRONLY | libc::O_TRUNC | libc::O_NONBLOCK),
+        kind => {
+            // SAFETY: unlinkat of a name in an open directory.
+            if kind.is_some() && unsafe { libc::unlinkat(etc.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(Errno::last()).context("replace /etc/resolv.conf");
+            }
+            open_nofollow_at(etc.as_raw_fd(), name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)
+        }
+    }.context("open /etc/resolv.conf without symlinks")?;
+    fs::File::from(file).write_all(conf).context("write /etc/resolv.conf")
+}
+
 /// The DNS write of a sandbox restored from a checkpoint: no component is
 /// followed, then the captured times of `/etc` and `/` (which the write may
-/// change by creating or copying up entries) are put back.
+/// change by creating or copying up entries) are put back. The preflight
+/// doesn't count a fork's setup against its inode quota, so this write's
+/// `/etc` copy-up and new `resolv.conf` (up to 2 entries) aren't counted.
 fn write_fork_resolv_conf(conf: &[u8], info: &checkpoint::capture::ForkInfo) -> Result<()> {
-    let open = |dir: RawFd, name: &std::ffi::CStr, flags: i32| -> Result<OwnedFd> {
-        // SAFETY: openat relative to an open directory, not following.
-        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644) };
-        Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(Errno::result(fd).context("open")?) })
-    };
+    let open = open_nofollow_at;
     let root = open(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY)?;
     let etc = open(root.as_raw_fd(), c"etc", libc::O_RDONLY | libc::O_DIRECTORY).context("open /etc without symlinks")?;
     let file = open(etc.as_raw_fd(), c"resolv.conf", libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
@@ -920,6 +1084,10 @@ mod tests {
         (root, roots)
     }
 
+    fn validate_image_in_persistent(roots: &image::Roots, cfg: &Config) -> Result<()> {
+        validate_image_in(roots, cfg, RunKind::Persistent)
+    }
+
     #[test]
     fn settings_are_refused_just_past_each_floor() {
         let mut cfg = config("img", false, &[], "none");
@@ -947,54 +1115,124 @@ mod tests {
     fn preflight_walks_writable_paths_in_the_image() {
         let (root, roots) = scratch_roots("walk");
         for path in ["/var/run/x", "/etc/passwd/x", "/proc/x", "/dev/x"] {
-            let error = validate_image_in(&roots, &config("img", true, &[path], "none")).expect_err(path);
+            let error = validate_image_in_persistent(&roots, &config("img", true, &[path], "none")).expect_err(path);
             assert!(format!("{error:#}").contains(path), "{path}: {error:#}");
         }
         for path in ["/tmp/x", "/dev/shm/x", "/var", "/var/new/deep"] {
-            validate_image_in(&roots, &config("img", true, &[path], "none")).unwrap_or_else(|e| panic!("{path}: {e:#}"));
+            validate_image_in_persistent(&roots, &config("img", true, &[path], "none")).unwrap_or_else(|e| panic!("{path}: {e:#}"));
         }
         // With DNS kiln writes /etc/resolv.conf as a file.
-        validate_image_in(&roots, &config("img", true, &["/etc/resolv.conf/x"], "none")).unwrap();
-        assert!(validate_image_in(&roots, &config("img", true, &["/etc/resolv.conf/x"], "full")).is_err());
+        validate_image_in_persistent(&roots, &config("img", true, &["/etc/resolv.conf/x"], "none")).unwrap();
+        assert!(validate_image_in_persistent(&roots, &config("img", true, &["/etc/resolv.conf/x"], "full")).is_err());
         // Without a read-only root there is no Landlock walk to fail.
-        validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
-        let missing = validate_image_in(&roots, &config("missing", false, &[], "none")).unwrap_err();
+        validate_image_in_persistent(&roots, &config("img", false, &[], "none")).unwrap();
+        let missing = validate_image_in_persistent(&roots, &config("missing", false, &[], "none")).unwrap_err();
         assert!(format!("{missing:#}").contains("fetch-alpine"), "{missing:#}");
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Writable paths whose walk makes `made` directories in total under top
+    /// names the scratch image lacks (512 components each at most).
+    fn deep_set(made: u64) -> Vec<PathBuf> {
+        let mut left = made;
+        ('b'..='q').map_while(|top| {
+            let components = left.min(512);
+            left -= components;
+            (components > 0).then(|| PathBuf::from(format!("/{top}{}", "/a".repeat(components as usize - 1))))
+        }).collect()
+    }
+
     /// With `--read-only`, what the shim's walk will make counts against the
-    /// run's inode quota in the preflight (the 2026-11-22 review's finding A):
-    /// a set that needs one inode more than `--disk` leaves is refused before
-    /// allocation, one that fits exactly is accepted, and neither `--disk max`
-    /// nor a fork, whose walk makes nothing, is counted.
+    /// run's inode quota in the preflight (the 2026-11-22 review's finding A),
+    /// less exactly what the run's own files use, 10 for a persistent run and
+    /// 8 for a one-shot run (the adversarial review's H1: no margin). At the
+    /// 64M floor (4096 inodes, the scratch image lacking /tmp, /root and
+    /// /workspace) a persistent create fits 4083 more directories and a
+    /// one-shot run 4085; one more is refused before allocation. The numbers
+    /// are literals, so an allowance that drifts from the measured one fails
+    /// here. Neither `--disk max` nor a fork, whose walk makes nothing, is
+    /// counted.
     #[test]
     fn preflight_refuses_writable_paths_past_the_inode_quota() {
         let (root, roots) = scratch_roots("inodes");
-        // The scratch image lacks /tmp, /root and /workspace: 3 of the room.
-        let room = quota::inode_limit(Some(quota::MIN_DISK)).unwrap() - RUN_INODES - 3;
-        let deep = |top: char, components: u64| format!("/{top}{}", "/a".repeat(components as usize - 1));
-        let mut paths: Vec<String> = ('b'..='h').map(|top| deep(top, 512)).collect();
-        paths.push(deep('i', room - 7 * 512));
-        let mut cfg = config("img", true, &paths.iter().map(String::as_str).collect::<Vec<_>>(), "none");
-        validate_image_in(&roots, &cfg).unwrap();
-        cfg.writable.push(PathBuf::from("/j"));
-        let error = validate_image_in(&roots, &cfg).unwrap_err();
-        assert!(format!("{error:#}").contains("--disk"), "{error:#}");
-        // Another 16 KiB of disk is another inode.
-        cfg.disk = Some(quota::MIN_DISK + 16 * 1024);
-        validate_image_in(&roots, &cfg).unwrap();
+        for (kind, fits, own) in [(RunKind::Persistent, 4083, 10), (RunKind::OneShot, 4085, 8)] {
+            let mut cfg = config("img", true, &[], "none");
+            cfg.writable = deep_set(fits);
+            validate_image_in(&roots, &cfg, kind).unwrap_or_else(|e| panic!("{kind:?} {fits}: {e:#}"));
+            cfg.writable = deep_set(fits + 1);
+            let error = format!("{:#}", validate_image_in(&roots, &cfg, kind).unwrap_err());
+            assert!(error.contains(&format!("needs {} new entries", fits + 4)), "{error}");
+            assert!(error.contains(&format!("more than the {} that --disk leaves", 4096 - own)), "{error}");
+            assert!(error.contains(&format!("less the {own} a {} run's own files use", kind.name())), "{error}");
+            // Another 16 KiB of disk is another inode.
+            cfg.disk = Some(quota::MIN_DISK + 16 * 1024);
+            validate_image_in(&roots, &cfg, kind).unwrap();
+        }
 
         // The review's set, 16 paths of 512 components, at the 64M floor.
-        let review: Vec<String> = ('b'..='q').map(|top| deep(top, 512)).collect();
-        let mut cfg = config("img", true, &review.iter().map(String::as_str).collect::<Vec<_>>(), "none");
-        assert!(validate_image_in(&roots, &cfg).is_err());
+        let mut cfg = config("img", true, &[], "none");
+        cfg.writable = deep_set(16 * 512);
+        assert!(validate_image_in_persistent(&roots, &cfg).is_err());
         cfg.disk = None;
-        validate_image_in(&roots, &cfg).unwrap();
+        validate_image_in_persistent(&roots, &cfg).unwrap();
         cfg.disk = Some(quota::MIN_DISK);
         cfg.fork = Some(checkpoint::capture::ForkInfo { root_mtime: (0, 0), etc_mtime: None });
-        validate_image_in(&roots, &cfg).unwrap();
+        validate_image_in_persistent(&roots, &cfg).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The quota's inode limit rounds up, one inode per started 16 KiB, and
+    /// the preflight's room uses the same limit (the adversarial review's
+    /// L1): 64 MiB is 4096 inodes, one byte more is 4097, and a persistent
+    /// create there has room for 4087 directories.
+    #[test]
+    fn the_inode_limit_rounds_up_and_the_preflight_uses_it() {
+        assert_eq!(quota::inode_limit(Some(67_108_864)), Some(4096));
+        assert_eq!(quota::inode_limit(Some(67_108_865)), Some(4097));
+        assert_eq!(quota::inode_limit(None), None);
+        let (root, roots) = scratch_roots("rounding");
+        let mut cfg = config("img", true, &[], "none");
+        cfg.disk = Some(67_108_865);
+        // The scratch image lacks /tmp, /root and /workspace.
+        cfg.writable = deep_set(4087 - 3);
+        validate_image_in_persistent(&roots, &cfg).unwrap();
+        cfg.writable = deep_set(4087 - 2);
+        let error = format!("{:#}", validate_image_in_persistent(&roots, &cfg).unwrap_err());
+        assert!(error.contains("more than the 4087 that --disk leaves (its inode limit of 4097"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The preflight's allowances are exactly the run directory and the
+    /// run's entries in `RUN_ENTRIES` for each kind, and every name the
+    /// run's setup in this file joins onto a run directory is one of those
+    /// entries or the identity (outside the quota). A new run file fails
+    /// here until it's in `RUN_ENTRIES` and the allowances; the VM's
+    /// `create-certainty-regressions.sh` pins the physical boundaries.
+    #[test]
+    fn run_inode_allowances_match_the_run_entries() {
+        let oneshot = RUN_ENTRIES.iter().filter(|(_, persistent_only)| !persistent_only).count() as u64;
+        assert_eq!(1 + oneshot, ONESHOT_RUN_INODES);
+        assert_eq!(1 + RUN_ENTRIES.len() as u64, PERSISTENT_RUN_INODES);
+        assert_eq!((ONESHOT_RUN_INODES, PERSISTENT_RUN_INODES), (8, 10));
+        assert_eq!((RunKind::OneShot.run_inodes(), RunKind::Persistent.run_inodes()), (8, 10));
+
+        let source = include_str!("container.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let mut joined = std::collections::BTreeSet::new();
+        for (at, _) in code.match_indices(".join(") {
+            let before = &code[..at];
+            if before.ends_with("run_dir") || before.ends_with("run_dir(id)") {
+                let rest = &code[at + ".join(".len()..];
+                joined.insert(rest[..rest.find(')').unwrap()].trim_start_matches('&'));
+            }
+        }
+        let known = ["\"upper\"", "\"work\"", "\"merged\"", "CONTROL_SOCKET", "INIT_PID", "checkpoint::POLICY_FILE",
+            "overlay::LAYOUT_FILE", "IDENTITY_PID", "\"shim.start\"", "\"shim.pid\""];
+        for name in &joined {
+            assert!(known.contains(name), "{name} is joined onto a run directory: add it to RUN_ENTRIES (and the \
+                allowances) if setup leaves it under the quota, then here");
+        }
+        assert!(joined.len() >= 8, "the scan found too few names: {joined:?}");
     }
 
     /// An image name that is a symlink (an alias of another image) is refused
@@ -1005,14 +1243,14 @@ mod tests {
         let (root, roots) = scratch_roots("alias");
         symlink("img", roots.images.join("latest")).unwrap();
         for read_only in [false, true] {
-            let error = validate_image_in(&roots, &config("latest", read_only, &[], "none")).unwrap_err();
+            let error = validate_image_in_persistent(&roots, &config("latest", read_only, &[], "none")).unwrap_err();
             assert!(format!("{error:#}").contains("latest"), "{error:#}");
             // The shim's reference opens the image the same way.
             assert!(image::open_image(&roots, "latest").is_err());
         }
-        validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
+        validate_image_in_persistent(&roots, &config("img", false, &[], "none")).unwrap();
         for bad in ["../img", ".img", "-img", ""] {
-            assert!(validate_image_in(&roots, &config(bad, false, &[], "none")).is_err(), "{bad:?}");
+            assert!(validate_image_in_persistent(&roots, &config(bad, false, &[], "none")).is_err(), "{bad:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1128,6 +1366,134 @@ mod tests {
             assert!(run.join("shim.pid").exists() && run.join("shim.start").exists());
             fs::set_permissions(run.join("upper/tmp/a"), fs::Permissions::from_mode(0o755)).unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An entry a host root writer adds once the identity is gone (the
+    /// adversarial review's M1) is removed and the final `rmdir` retried:
+    /// the removal succeeds and leaves nothing. A writer that adds one before
+    /// every attempt gets the error after `FINAL_RMDIR_RETRIES` retries, with
+    /// no hang, and the directory without its identity is what's left.
+    #[test]
+    fn an_entry_added_after_the_identity_is_removed_and_the_rmdir_retried() {
+        let root = scratch_dir("teardown-late");
+        let run = run_dir_look_alike(&root);
+        let mut hook = |name: &CStr| -> io::Result<()> {
+            if name == c"shim.start" { fs::create_dir_all(run.join("late/deeper"))?; }
+            Ok(())
+        };
+        remove_run_dir_with(&run, &mut hook).unwrap();
+        assert!(!run.exists());
+
+        let run = run_dir_look_alike(&root);
+        let mut attempts = 0;
+        let mut hook = |name: &CStr| -> io::Result<()> {
+            if name == c"." {
+                attempts += 1;
+                fs::write(run.join(format!("late-{attempts}")), "x")?;
+            }
+            Ok(())
+        };
+        let error = remove_run_dir_with(&run, &mut hook).unwrap_err();
+        assert_eq!(attempts, 1 + FINAL_RMDIR_RETRIES);
+        assert_eq!(error.kind(), io::ErrorKind::DirectoryNotEmpty, "{error}");
+        assert!(error.to_string().contains(&format!("after {FINAL_RMDIR_RETRIES} retries")), "{error}");
+        assert!(error.to_string().contains("left for node root"), "{error}");
+        let left: Vec<_> = fs::read_dir(&run).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [format!("late-{attempts}").as_str()]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The sandbox's root, standing in for the merged view the resolver
+    /// write runs in: `/etc` from an image and an `outside` directory.
+    fn resolver_root(tag: &str) -> (PathBuf, OwnedFd) {
+        let root = scratch_dir(tag);
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        let fd: OwnedFd = fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(&root).unwrap().into();
+        (root, fd)
+    }
+
+    /// An ordinary create's resolver write never follows the image's
+    /// symlink (the adversarial review's M2): a symlinked
+    /// `/etc/resolv.conf` (to a file outside `/etc`, to one that doesn't
+    /// exist yet) or a FIFO there is replaced by a regular file with the
+    /// generated content, and the symlink's target is untouched; a regular
+    /// file is rewritten in place, an absent one created. A `/etc` that is a
+    /// symlink, or a `resolv.conf` that is a directory, is an error.
+    #[test]
+    fn the_resolver_write_replaces_a_symlink_and_never_follows_it() {
+        let conf = b"nameserver 10.0.0.1\n";
+        let regular = |root: &Path| {
+            let path = root.join("etc/resolv.conf");
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert!(meta.file_type().is_file(), "{meta:?}");
+            assert_eq!(fs::read(&path).unwrap(), conf);
+        };
+        for target in ["../outside/existing", "../outside/absent"] {
+            let (root, fd) = resolver_root("resolv-link");
+            fs::write(root.join("outside/existing"), "keep").unwrap();
+            symlink(target, root.join("etc/resolv.conf")).unwrap();
+            write_resolv_conf_under(&fd, conf).unwrap_or_else(|e| panic!("{target}: {e:#}"));
+            regular(&root);
+            assert_eq!(fs::read_to_string(root.join("outside/existing")).unwrap(), "keep", "{target}");
+            assert!(!root.join("outside/absent").exists(), "{target}");
+            fs::remove_dir_all(root).unwrap();
+        }
+        let (root, fd) = resolver_root("resolv-fifo");
+        let fifo = CString::new(root.join("etc/resolv.conf").into_os_string().into_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        write_resolv_conf_under(&fd, conf).unwrap();
+        regular(&root);
+        fs::write(root.join("etc/resolv.conf"), "old, and longer than the generated file").unwrap();
+        write_resolv_conf_under(&fd, conf).unwrap();
+        regular(&root);
+        fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+        write_resolv_conf_under(&fd, conf).unwrap();
+        regular(&root);
+        fs::remove_file(root.join("etc/resolv.conf")).unwrap();
+        fs::create_dir(root.join("etc/resolv.conf")).unwrap();
+        assert!(write_resolv_conf_under(&fd, conf).is_err());
+        fs::remove_dir(root.join("etc/resolv.conf")).unwrap();
+        fs::rename(root.join("etc"), root.join("outside/etc")).unwrap();
+        symlink("outside/etc", root.join("etc")).unwrap();
+        assert!(write_resolv_conf_under(&fd, conf).is_err());
+        assert!(!root.join("outside/etc/resolv.conf").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The preflight refuses, before allocation, an image the resolver write
+    /// can't use (the adversarial review's M2): with DNS, its `/etc` a
+    /// symlink, a regular file or absent, or its `/etc/resolv.conf` a
+    /// directory. A symlinked `/etc/resolv.conf` is fine (it's replaced), and
+    /// without DNS, or for a fork, none of this is checked.
+    #[test]
+    fn preflight_refuses_an_image_without_a_real_etc_for_dns() {
+        let (root, roots) = scratch_roots("resolver");
+        let image = roots.images.join("img");
+        let refused = |what: &str| {
+            for read_only in [false, true] {
+                let error = validate_image_in_persistent(&roots, &config("img", read_only, &[], "full")).unwrap_err();
+                assert!(format!("{error:#}").contains("invalid image for a sandbox with DNS"), "{what}: {error:#}");
+                validate_image_in_persistent(&roots, &config("img", read_only, &[], "none")).unwrap();
+                let mut fork = config("img", read_only, &[], "full");
+                fork.fork = Some(checkpoint::capture::ForkInfo { root_mtime: (0, 0), etc_mtime: None });
+                validate_image_in_persistent(&roots, &fork).unwrap();
+            }
+        };
+        symlink("/dev/shm/x", image.join("etc/resolv.conf")).unwrap();
+        validate_image_in_persistent(&roots, &config("img", true, &[], "full")).unwrap();
+        fs::remove_file(image.join("etc/resolv.conf")).unwrap();
+        fs::create_dir(image.join("etc/resolv.conf")).unwrap();
+        refused("resolv.conf a directory");
+        fs::remove_dir(image.join("etc/resolv.conf")).unwrap();
+        fs::rename(image.join("etc"), image.join("etc.real")).unwrap();
+        symlink("etc.real", image.join("etc")).unwrap();
+        refused("/etc a symlink");
+        fs::remove_file(image.join("etc")).unwrap();
+        refused("/etc absent");
+        fs::write(image.join("etc"), "").unwrap();
+        refused("/etc a file");
         fs::remove_dir_all(root).unwrap();
     }
 
