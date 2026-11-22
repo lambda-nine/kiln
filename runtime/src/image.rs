@@ -26,6 +26,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use nix::errno::Errno;
@@ -206,6 +207,30 @@ fn lock(images: &Path, exclusive: bool) -> Result<Lock> {
             return Ok(Lock(dir));
         }
         if Errno::last() != Errno::EINTR { return Err(Errno::last()).context("lock image registry"); }
+    }
+}
+
+/// The shared registry lock, waited for only until `deadline`: polls a
+/// non-blocking flock with short sleeps, so a long exclusive holder (a large
+/// registration) can't stretch a bounded operation. `now` is called only
+/// while the lock is contended.
+fn lock_shared_until(images: &Path, name: &str, deadline: Instant, now: &mut dyn FnMut() -> Instant)
+    -> Result<Lock> {
+    let dir = File::open(images).with_context(|| format!("open image directory {}", images.display()))?;
+    ensure!(dir.metadata()?.is_dir(), "{} is not a directory", images.display());
+    let mut pause = Duration::from_millis(1);
+    loop {
+        // SAFETY: flock on an open descriptor.
+        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 { return Ok(Lock(dir)); }
+        match Errno::last() {
+            Errno::EINTR => continue,
+            Errno::EWOULDBLOCK => {}
+            e => return Err(e).context("lock image registry"),
+        }
+        let at = now();
+        ensure!(at < deadline, VerifyDeadline { name: name.to_owned() });
+        std::thread::sleep(pause.min(deadline - at));
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
 }
 
@@ -530,6 +555,61 @@ pub fn verify(roots: &Roots, name: &str) -> Result<Entry> {
     Ok(entry)
 }
 
+/// An off-lock rehash (`verify_unlocked_with_deadline`) stopped because its
+/// deadline passed. Nothing was decided about the image's content.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifyDeadline { pub name: String }
+
+impl std::fmt::Display for VerifyDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "image {:?} was not verified before its deadline", self.name)
+    }
+}
+impl std::error::Error for VerifyDeadline {}
+
+/// `verify` for capture and fork, which hold a sandbox lease meanwhile: the
+/// rehash runs without the registry lock and stops at `deadline`.
+///
+/// Under the shared lock it reads the registration, opens the image
+/// directory and checks it is the registered one, then releases the lock and
+/// hashes through that held descriptor (nothing is resolved by path again),
+/// checking the deadline between entries and while reading large files. It
+/// then retakes the shared lock and requires the registration to be
+/// unchanged and the name to still resolve to the same directory; anything
+/// else is "changed while it was verified". Waiting for either lock is
+/// bounded by the same deadline. A passed deadline is a `VerifyDeadline`
+/// error.
+pub fn verify_unlocked_with_deadline(roots: &Roots, name: &str, deadline: Instant) -> Result<Entry> {
+    verify_off_lock(roots, name, deadline, &mut Instant::now)
+}
+
+/// `verify_unlocked_with_deadline` with its clock injected. The walk calls
+/// `now` once before each manifest entry and once per 16 MiB of a file.
+fn verify_off_lock(roots: &Roots, name: &str, deadline: Instant, now: &mut dyn FnMut() -> Instant)
+    -> Result<Entry> {
+    let (entry, dir) = {
+        let _lock = lock_shared_until(&roots.images, name, deadline, now)?;
+        let entry = read_entry(&roots.registry, name)?.filter(|e| e.state == State::Registered)
+            .with_context(|| format!("image {name:?} is not registered"))?;
+        let dir = open_image(roots, name)?;
+        ensure!(dir_identity(&dir)? == entry.directory, "image {name:?} is not the registered directory");
+        (entry, dir)
+    };
+    let tree = tree_digest_checked(&dir, &mut || {
+        ensure!(now() < deadline, VerifyDeadline { name: name.to_owned() });
+        Ok(())
+    })?;
+    {
+        let _lock = lock_shared_until(&roots.images, name, deadline, now)?;
+        let current = read_entry(&roots.registry, name)?;
+        let resolves = open_image(roots, name).and_then(|d| dir_identity(&d)).is_ok_and(|d| d == entry.directory);
+        ensure!(current.as_ref() == Some(&entry) && resolves, "image {name:?} changed while it was verified");
+    }
+    ensure!(hex(&tree.sha256) == entry.sha256 && tree.entries == entry.entries && tree.bytes == entry.bytes,
+        "image {name:?} content differs from its registration");
+    Ok(entry)
+}
+
 /// Writes `<run>/image` for a new run, under the shared lock so no
 /// replacement or removal can interleave. Called after the run directory's
 /// quota is set and before anything mounts the image.
@@ -626,7 +706,10 @@ pub fn encode_trailer(out: &mut Vec<u8>, entries: u64) {
 
 pub struct Tree { pub sha256: [u8; 32], pub entries: u64, pub bytes: u64 }
 
-struct Walk {
+struct Walk<'a> {
+    /// Called before every entry and per 16 MiB of file bytes; an error
+    /// stops the walk (a verification deadline).
+    check: &'a mut dyn FnMut() -> Result<()>,
     hash: Sha256,
     entries: u64,
     bytes: u64,
@@ -643,11 +726,14 @@ struct Walk {
 /// Directories, symlinks and special files are inspected without following;
 /// device and FIFO contents are never opened. Crossing a mount, or a file
 /// changing while it is read, is an error.
-pub fn tree_digest(root: &File) -> Result<Tree> {
+pub fn tree_digest(root: &File) -> Result<Tree> { tree_digest_checked(root, &mut || Ok(())) }
+
+/// `tree_digest`, calling `check` before every entry and per 16 MiB read.
+fn tree_digest_checked(root: &File, check: &mut dyn FnMut() -> Result<()>) -> Result<Tree> {
     let st = fstat(root.as_raw_fd())?;
     ensure!(st.st_mode & libc::S_IFMT == libc::S_IFDIR, "image root is not a directory");
     let mnt = mount_id(root.as_raw_fd(), None)?;
-    let mut walk = Walk { hash: Sha256::new(), entries: 0, bytes: 0, dev: st.st_dev, mnt, links: Default::default(),
+    let mut walk = Walk { check, hash: Sha256::new(), entries: 0, bytes: 0, dev: st.st_dev, mnt, links: Default::default(),
         buf: Vec::new() };
     walk.hash.update(TREE_DOMAIN);
     let fd = dup(root.as_raw_fd())?;
@@ -658,8 +744,9 @@ pub fn tree_digest(root: &File) -> Result<Tree> {
     Ok(Tree { sha256: walk.hash.finish(), entries: walk.entries, bytes: walk.bytes })
 }
 
-impl Walk {
+impl Walk<'_> {
     fn emit(&mut self, record: &Record<'_>) -> Result<()> {
+        (self.check)()?;
         ensure!(self.entries < MAX_ENTRIES, "image has more than {MAX_ENTRIES} entries");
         self.buf.clear();
         encode_record(&mut self.buf, record);
@@ -729,7 +816,7 @@ impl Walk {
                 let opened = fstat(fd.as_raw_fd())?;
                 same_inode(&opened, &st)?;
                 ensure!(mount_id(fd.as_raw_fd(), None)? == self.mnt, "image crosses a mount");
-                let (size, sha256) = hash_file(&fd)?;
+                let (size, sha256) = hash_file(&fd, &mut *self.check)?;
                 let after = fstat(fd.as_raw_fd())?;
                 ensure!(size == st.st_size as u64 && unchanged(&opened, &after), "file changed while it was hashed");
                 let xattrs = fd_xattrs(fd.as_raw_fd())?;
@@ -1065,11 +1152,14 @@ fn openat_raw(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(Errno::result(fd).context("open")?) })
 }
 
-fn hash_file(fd: &OwnedFd) -> Result<(u64, [u8; 32])> {
+/// SHA-256 and length of a file's bytes; `check` runs once per 16 MiB.
+fn hash_file(fd: &OwnedFd, check: &mut dyn FnMut() -> Result<()>) -> Result<(u64, [u8; 32])> {
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut size = 0u64;
+    let mut checked = 0u64;
     loop {
+        if size - checked >= 16 << 20 { check()?; checked = size; }
         // SAFETY: read into an owned buffer.
         let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
@@ -1747,6 +1837,129 @@ mod tests {
         drop(held);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
         t.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Whether an exclusive registry lock is free right now (non-blocking, so
+    /// a lock wrongly held by the code under test fails instead of hanging).
+    fn exclusive_is_free(images: &Path) -> bool {
+        let dir = File::open(images).unwrap();
+        // SAFETY: flock on an open descriptor; released when `dir` closes.
+        unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    fn deadline_of(e: &anyhow::Error) -> Option<&VerifyDeadline> {
+        e.chain().find_map(|c| c.downcast_ref::<VerifyDeadline>())
+    }
+
+    #[test]
+    fn off_lock_verify_matches_verify() {
+        let (root, roots) = scratch("offlock-ok");
+        let dir = image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(verify_unlocked_with_deadline(&roots, "img", far).unwrap(), entry);
+        assert!(exclusive_is_free(&roots.images));
+        // The same refusals as `verify`: changed content, an unregistered
+        // name, and a name that resolves to another directory.
+        fs::write(roots.images.join("img/etc/hostname"), "changed\n").unwrap();
+        let e = verify_unlocked_with_deadline(&roots, "img", far).unwrap_err();
+        assert!(format!("{e:#}").contains("content differs from its registration") && deadline_of(&e).is_none(), "{e:#}");
+        assert!(format!("{:#}", verify_unlocked_with_deadline(&roots, "other", far).unwrap_err())
+            .contains("not registered"));
+        fs::rename(&dir, roots.images.join("img-old")).unwrap();
+        image(&roots, "img");
+        assert!(format!("{:#}", verify_unlocked_with_deadline(&roots, "img", far).unwrap_err())
+            .contains("is not the registered directory"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_lock_verify_stops_at_its_deadline_and_frees_the_lock() {
+        let (root, roots) = scratch("offlock-deadline");
+        image(&roots, "img");
+        register(&roots, "img").unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(60);
+        // The clock passes the deadline at the third entry of six.
+        let mut calls = 0u64;
+        let e = verify_off_lock(&roots, "img", deadline, &mut || {
+            calls += 1;
+            if calls >= 3 { deadline } else { start }
+        }).unwrap_err();
+        assert_eq!(deadline_of(&e), Some(&VerifyDeadline { name: "img".into() }), "{e:#}");
+        assert_eq!(calls, 3, "the walk stopped where the deadline passed");
+        assert!(exclusive_is_free(&roots.images), "the registry lock is free after the refusal");
+        // A deadline already passed stops at the first entry.
+        let e = verify_unlocked_with_deadline(&roots, "img", Instant::now()).unwrap_err();
+        assert!(deadline_of(&e).is_some(), "{e:#}");
+        // Waiting for the lock counts too: a held exclusive lock (a long
+        // registration) runs the deadline out instead of blocking.
+        let held = lock(&roots.images, true).unwrap();
+        let begun = Instant::now();
+        let e = verify_unlocked_with_deadline(&roots, "img", begun + Duration::from_millis(200)).unwrap_err();
+        assert!(deadline_of(&e).is_some(), "{e:#}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        drop(held);
+        assert!(exclusive_is_free(&roots.images));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_lock_verify_hashes_without_the_registry_lock() {
+        let (root, roots) = scratch("offlock-free");
+        image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let mut free = Vec::new();
+        let got = verify_off_lock(&roots, "img", Instant::now() + Duration::from_secs(60), &mut || {
+            free.push(exclusive_is_free(&roots.images));
+            Instant::now()
+        }).unwrap();
+        assert_eq!(got, entry);
+        assert_eq!(free, vec![true; 6], "an exclusive lock was free at every entry of the walk");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_lock_verify_refuses_a_registration_changed_during_the_walk() {
+        let (root, roots) = scratch("offlock-changed");
+        image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        let changed_at = |roots: &Roots, at: u64, change: &dyn Fn(&Roots)| {
+            let mut calls = 0u64;
+            verify_off_lock(roots, "img", far, &mut || {
+                calls += 1;
+                if calls == at { change(roots); }
+                Instant::now()
+            }).unwrap_err()
+        };
+        // A generation bump (same content and directory).
+        let e = changed_at(&roots, 2, &|r| {
+            let mut bumped = entry.clone();
+            bumped.generation += 1;
+            write_entry(&r.registry, &bumped).unwrap();
+        });
+        assert!(format!("{e:#}").contains("image \"img\" changed while it was verified"), "{e:#}");
+        write_entry(&roots.registry, &entry).unwrap();
+        // Retired during the walk.
+        let e = changed_at(&roots, 2, &|r| {
+            let mut retired = entry.clone();
+            retired.state = State::Retired;
+            write_entry(&r.registry, &retired).unwrap();
+        });
+        assert!(format!("{e:#}").contains("changed while it was verified"), "{e:#}");
+        write_entry(&roots.registry, &entry).unwrap();
+        // The name moved to another directory with the registration intact.
+        let e = changed_at(&roots, 2, &|r| {
+            fs::rename(r.images.join("img"), r.images.join("img-held")).unwrap();
+            fs::create_dir(r.images.join("img")).unwrap();
+        });
+        assert!(format!("{e:#}").contains("changed while it was verified"), "{e:#}");
+        assert!(exclusive_is_free(&roots.images));
+        fs::remove_dir(roots.images.join("img")).unwrap();
+        fs::rename(roots.images.join("img-held"), roots.images.join("img")).unwrap();
+        assert_eq!(verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap(), entry);
         fs::remove_dir_all(root).unwrap();
     }
 }

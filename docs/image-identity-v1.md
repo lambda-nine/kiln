@@ -96,8 +96,14 @@ identity (`identity none image registry unusable: …`).
 
 Every registry operation, and every reference acquisition, holds an `flock`
 on `/var/lib/kiln/images` itself, so taking the lock creates no files.
-Reference acquisition holds it shared; registration, replacement, retirement
-and removal hold it exclusively. `scripts/fetch-alpine.sh` takes the same
+Reference acquisition and `kiln image verify` hold it shared; registration,
+replacement, retirement and removal hold it exclusively. Capture and fork
+don't hold it for their rehash, which can take long on a large image while
+they hold a sandbox lease: they take it shared to read the registration and
+open the registered directory, release it, hash through that descriptor,
+then take it shared again and require the registration (generation, digest,
+directory, counts) and the directory the name resolves to to be unchanged.
+That rehash, lock waits included, stops at a deadline (120 seconds). `scripts/fetch-alpine.sh` takes the same
 exclusive lock around its directory exchange. It refuses to replace `alpine`
 while that name is registered: install changed content under a new name, or
 unregister it first.

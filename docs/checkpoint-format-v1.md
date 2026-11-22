@@ -335,10 +335,10 @@ runtime paths and kernel xattr names appear as they are.
 | Reason | When |
 |---|---|
 | `sandbox_unsupported:workspace_checkpoint` | The run has no image identity, no verified layout or no policy record (an older kiln created it), or its PID 1 doesn't grant leases. |
-| `checkpoint_busy` | The source runs or queues a command, holds another lease, or the checkpoint already exists or has an operation; or `rm` found a name rebound to another directory after it opened it. |
+| `checkpoint_busy` | The source runs or queues a command, holds another lease, or the checkpoint already exists or has an operation; or `rm` found a name rebound to another directory after it opened it; or the image rehash (capture or fork) passed its 120-second deadline. |
 | `checkpoint_layout_unsupported` | A protected-path violation (anything beneath `/dev`, `/proc` or `/sys/fs/cgroup`; a mount target or ancestor that is not a plain, non-opaque directory; `/etc` not a directory when DNS is generated); a generated file replaced by a directory or hardlinked; a mount crossing; a path over 4,096 bytes or deeper than 128; a writable path overlapping a reserved one, or absent or not a plain directory in the merged view (read-only root). |
 | `checkpoint_metadata_unsupported` | A FIFO, socket, block device or non-whiteout character device; a POSIX ACL; a file capability; any other `security.*`, `trusted.*` or `system.*` xattr; an overlay redirect, metacopy, index handle (`upper`, `nlink`), xattr whiteout or its `opaque=x` marker, escaped (`trusted.overlay.overlay.*`), misplaced or unknown overlay xattr; a `user.overlay.*` xattr; a user xattr on a symlink or whiteout; more than 32 user xattrs or 4 KiB of them; an owner outside the sandbox range; a hardlink with names outside the upper; a hardlinked symlink; a symlink target over 1,023 bytes. |
-| `checkpoint_image_unavailable` | The image is no longer registered with the generation, digest and directory the source recorded, or its rehash differs. |
+| `checkpoint_image_unavailable` | The image is no longer registered with the generation, digest and directory the source recorded, its rehash differs, or its registration or directory changed while it was rehashed. |
 | `checkpoint_size_limit` | Over 65,536 entries or a 16 MiB manifest; retained metadata over the 32 MiB worker heap budget; file bytes (each file rounded up to 4 KiB) plus 16 KiB per entry over R; the artifact's quota filled; or the final charge S over R. |
 | `checkpoint_io` | A source entry changed or was replaced during the copy, PID 1 ended the lease, the run's identity or metadata changed, or the release failed. |
 | `checkpoint_corrupt` | Any artifact check failed (below). |
@@ -361,9 +361,16 @@ by this kernel configuration.
    entries and writable paths.
 2. Take operation 6 in this process (the copy happens under the lease, held
    by the copying process itself). PID 1 refuses while anything runs.
-3. Rehash the image under the shared image lock (`kiln image verify`) and
-   require the registration the run recorded: generation, digest and
-   directory identity.
+3. Rehash the image and require the registration the run recorded:
+   generation, digest and directory identity. Unlike `kiln image verify`,
+   the hash runs without the registry lock: under the shared lock capture
+   reads the registration and opens the registered directory, then hashes
+   through that descriptor with the lock released, then retakes it and
+   requires the registration and the name's directory to be unchanged
+   ("changed while it was verified", `checkpoint_image_unavailable`
+   otherwise). The rehash, waiting for the lock included, has 120 seconds
+   (`IMAGE_VERIFY_DEADLINE`); past that capture refuses `checkpoint_busy`
+   and its lease ends with it. The lease is held throughout the rehash.
 4. Create `.staging-C-G-<nonce>` exclusively (0700), take its lock, install
    the project quota of R while it is empty, create `objects/`, write and
    sync `header`.
@@ -475,8 +482,9 @@ Before allocation:
    and writable paths the manifest's (`checkpoint_spec_mismatch`).
 3. The checkpoint must not hold an entry the new sandbox's runtime
    generates, and the parent of each must be a plain directory or absent.
-4. Rehash the image (`verify`): its digest must be the manifest's
-   `image_sha256` (`checkpoint_image_unavailable`).
+4. Rehash the image as capture does (off the registry lock, within the
+   same 120-second deadline, `checkpoint_busy` past it): its digest must be
+   the manifest's `image_sha256` (`checkpoint_image_unavailable`).
 5. `--disk` must be at least S.
 6. For a read-only root, every writable path must be a plain directory in
    the merged view of the checkpoint over the image (see Writable paths).

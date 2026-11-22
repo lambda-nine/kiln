@@ -14,6 +14,7 @@
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use nix::errno::Errno;
@@ -22,7 +23,7 @@ use super::manifest::{Body, Manifest};
 use super::restore::check_generated;
 use super::store::{Artifact, Header, Marker, Store, binding_sha256};
 use super::walk::{self, IdMap, Options, fstat, openat};
-use super::{Policy, Reason, read_policy, refuse, validate_checkpoint_id, validate_instance};
+use super::{IMAGE_VERIFY_DEADLINE, Policy, Reason, read_policy, refuse, validate_checkpoint_id, validate_instance};
 use crate::exec_protocol::FailureKind;
 use crate::image::{self, DirIdentity, Roots};
 use crate::protected;
@@ -78,6 +79,24 @@ fn facts(run: &Path) -> Result<SourceFacts> {
         layout: text(crate::overlay::LAYOUT_FILE)?, policy: text(super::POLICY_FILE)?, shim: text("shim.pid")? })
 }
 
+/// Rehashes the image against its registration without holding the registry
+/// lock during the hash, within `IMAGE_VERIFY_DEADLINE`. A passed deadline
+/// is `checkpoint_busy` (retry later); any other failure is
+/// `checkpoint_image_unavailable`.
+fn verify_image(roots: &Roots, name: &str) -> Result<image::Entry> {
+    image::verify_unlocked_with_deadline(roots, name, Instant::now() + IMAGE_VERIFY_DEADLINE)
+        .map_err(|e| verify_refusal(name, e))
+}
+
+fn verify_refusal(name: &str, e: anyhow::Error) -> anyhow::Error {
+    if e.chain().any(|c| c.is::<image::VerifyDeadline>()) {
+        refuse(Reason::Busy, format!("image {name:?} was not verified within the {}-second deadline; retry later",
+            IMAGE_VERIFY_DEADLINE.as_secs()))
+    } else {
+        refuse(Reason::ImageUnavailable, format!("image {name:?}: {e:#}"))
+    }
+}
+
 pub fn capture(store: &Store, roots: &Roots, req: &Request) -> Result<String> {
     validate_instance(&req.instance)?;
     validate_checkpoint_id(&req.checkpoint)?;
@@ -114,8 +133,7 @@ pub fn capture(store: &Store, roots: &Roots, req: &Request) -> Result<String> {
         }, o.diagnostic)),
     };
     // The base image must still be the one the run recorded, by content.
-    let entry = image::verify(roots, &reference.name)
-        .map_err(|e| refuse(Reason::ImageUnavailable, format!("image {:?}: {e:#}", reference.name)))?;
+    let entry = verify_image(roots, &reference.name)?;
     ensure!(entry.generation == identity.generation && entry.sha256 == identity.sha256
         && entry.directory == identity.directory, refuse(Reason::ImageUnavailable,
         format!("image {:?} is no longer the registration the sandbox was created from", reference.name)));
@@ -248,8 +266,7 @@ pub fn preflight(store: &Store, roots: &Roots, source: &str, image_name: &str, p
         refuse(Reason::SpecMismatch, "the root-write policy or writable paths differ from the checkpoint's"));
     reserved_overlap(policy, generated)?;
     check_generated(m, generated)?;
-    let entry = image::verify(roots, image_name)
-        .map_err(|e| refuse(Reason::ImageUnavailable, format!("image {image_name:?}: {e:#}")))?;
+    let entry = verify_image(roots, image_name)?;
     ensure!(entry.sha256 == m.image_sha256, refuse(Reason::ImageUnavailable,
         format!("image {image_name:?} no longer has the checkpoint's content")));
     let image_dir = OwnedFd::from(image::open_image(roots, image_name)
@@ -355,6 +372,18 @@ mod tests {
         for p in ["workspace/sub/deeper", "workspace/sub", "workspace/a.txt", "workspace/abs", "tmp", "workspace", ""] {
             set_mtime(&u.join(p), 1_700_000_000 + p.len() as i64, 123_456_789);
         }
+    }
+
+    #[test]
+    fn image_verify_deadline_is_busy_and_other_failures_unavailable() {
+        let late = anyhow::Error::new(image::VerifyDeadline { name: "alpine".into() }).context("image entry etc");
+        let e = verify_refusal("alpine", late);
+        assert_eq!(super::super::reason_of(&e), Reason::Busy);
+        assert_eq!(e.to_string(), "checkpoint_busy: image \"alpine\" was not verified within the 120-second \
+            deadline; retry later");
+        let e = verify_refusal("alpine", anyhow::anyhow!("image \"alpine\" changed while it was verified"));
+        assert_eq!(super::super::reason_of(&e), Reason::ImageUnavailable);
+        assert!(e.to_string().contains("changed while it was verified"), "{e}");
     }
 
     #[test]

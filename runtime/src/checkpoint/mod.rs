@@ -53,6 +53,10 @@ pub const MAX_USER_XATTR_BYTES: usize = 4096;
 pub const HEAP_BUDGET: usize = 32 * 1024 * 1024;
 /// The per-entry metadata allowance in the storage charge.
 pub const ENTRY_ALLOWANCE: u64 = 16 * 1024;
+/// How long capture and a fork's preflight may spend rehashing the image
+/// (waiting for the registry lock included). Capture holds the source's lease
+/// meanwhile; past this it refuses `checkpoint_busy`.
+pub const IMAGE_VERIFY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 /// Bounds on the reservation a capture may be given (`--max-bytes`).
 pub const MIN_LIMIT_BYTES: u64 = 64 * 1024;
 pub const MAX_LIMIT_BYTES: u64 = 1 << 40;

@@ -5,6 +5,19 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Rehash the image for `kiln checkpoint capture` and a fork's preflight
+  without holding the image registry lock, and give it a deadline. Before,
+  both ran `kiln image verify`, which holds the lock (shared) for the whole
+  hash, while capture also holds the source sandbox's lease: a large or
+  slow image blocked every registration, replacement and removal, and held
+  the lease, for as long as the hash took. Now the lock is held only to read
+  the registration and open the registered directory, and again afterwards
+  to check that the registration and the directory the name resolves to
+  haven't changed ("changed while it was verified" otherwise). The hash runs
+  through the descriptor it opened. The rehash, lock waits included, has
+  120 seconds; past that the command refuses `checkpoint_busy`, naming the
+  image and the deadline. `kiln image verify` itself is unchanged.
+
 - Make a persistent create's shim die with `kiln create` until the run has
   its identity: a CLI killed between the shim's fork and the run directory
   left a shim that went on to start a sandbox nothing listed or waited for.
