@@ -312,8 +312,9 @@ range), so a symlinked alias is refused here too. With `--read-only`
 it runs the shim's own writable-path walk (`landlock::walk`) over that image
 directory: a symlinked or regular-file
 component, a path over kiln's own `/proc`, `/sys` or `/dev` mounts (all but
-`/dev` itself and `/dev/shm` and below it), a path through a file kiln writes
-(`/etc/resolv.conf` with DNS) or a component over 255 bytes is refused.
+`/dev` itself and anything at or under `/dev/shm`), a path through a file
+kiln writes (`/etc/resolv.conf` with DNS) or a component over 255 bytes is
+refused.
 Where the image lacks a component the preflight accepts it, because an
 ordinary create's shim makes it, and counts what the walk will leave in the
 sandbox's upper: every component of such a path (the shim makes the missing

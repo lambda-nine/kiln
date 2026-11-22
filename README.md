@@ -209,9 +209,9 @@ and prompt removal.
    and `run` walk the same paths through the image with the same code before
    anything is allocated, so a symlinked or regular-file component (Alpine's
    `/var/run -> ../run`, `/etc/passwd/x`), a path under `/proc`, `/sys` or
-   `/dev` other than `/dev` itself and `/dev/shm` and below it, a path through
-   `/etc/resolv.conf` when kiln writes it, or a component longer than 255
-   bytes is refused up front (`create` exits 124). Components the image
+   `/dev` (except `/dev` itself and anything at or under `/dev/shm`), a path
+   through `/etc/resolv.conf` when kiln writes it, or a component longer than
+   255 bytes is refused up front (`create` exits 124). Components the image
    doesn't have are created by the sandbox's setup, and they count against
    `--disk`'s inode limit together with the image directories above them,
    which the overlay copies up: `create` and `run` count them first and refuse
