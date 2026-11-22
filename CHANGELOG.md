@@ -23,6 +23,12 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   no boot identity, but kilnd's startup reconciliation covers the sandboxes
   kilnd created. A run created with kiln alone still needs `kiln gc`.
 
+- Correct what happens when `kiln create` is killed after its shim's parent
+  check but before `shim.pid` (the shim handoff comment and the entry
+  below): normally the shim removes the run itself, once its readiness
+  write to the gone CLI fails. The run is left stale only if the shim
+  itself dies there.
+
 - Make a persistent create's shim die with `kiln create` until the run has
   its identity: a CLI killed between the shim's fork and the run directory
   left a shim that went on to start a sandbox nothing listed or waited for.
@@ -33,9 +39,12 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   `shim.pid`, from which point `kiln ls` lists the run and `kiln gc`
   collects it. So a shim never lives on unfindable, and a findable one never
   dies with its CLI. A create killed between the run directory's `mkdir`
-  and the clear leaves that directory empty, as a crash there always did;
-  one killed between the check and `shim.pid` leaves a stale create that
-  `kiln ls` lists and `kiln gc` collects.
+  and the clear leaves that directory empty, as a crash there always did.
+  One killed between the check and `shim.pid` normally leaves nothing: the
+  shim publishes, its readiness write to the gone CLI fails (`EPIPE`), and
+  it tears the sandbox down and removes the run itself. Only if the shim
+  itself dies there is the run left stale, listed by `kiln ls` and
+  collected by `kiln gc`.
 
 - Report a persistent create's PID 1 setup error to the caller: PID 1 printed
   it to the shim's stderr, which is `/dev/null`, so `kiln create` said only

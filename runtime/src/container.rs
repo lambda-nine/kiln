@@ -144,10 +144,13 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, parent: Pid
 ///    while the signal was armed or just after the clear: exit without
 ///    publishing, removing the empty run directory.
 /// 3. Publish the identity (`shim.start`, then `shim.pid`, each synced).
-///    A parent death after the clear no longer kills the shim; one between
-///    the check and the end of publication leaves a run that becomes
-///    findable and lives on as a stale create, which `kiln ls` lists and
-///    `kiln gc` collects, as with every crash below.
+///    A parent death after the clear no longer kills the shim. One between
+///    the check and the end of publication normally costs nothing: the shim
+///    publishes and sets up, its readiness write to the gone CLI fails with
+///    `EPIPE`, and it tears the sandbox down and removes the run itself (a
+///    setup that fails first removes it as always). Only if the shim itself
+///    dies there is the run left stale, which `kiln ls` lists and `kiln gc`
+///    collects, as with every crash below.
 ///
 /// Any error from here on (a failed publication or `setup`) removes the
 /// directory again, so a shim never runs unfindable and a create that fails
