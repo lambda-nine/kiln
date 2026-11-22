@@ -5,6 +5,18 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Count the writable directories a create makes against its inode quota
+  before allocation (kiln security review round 2, finding A): with
+  `--read-only`, `create` and `run` count every entry the shim's walk will
+  leave in the sandbox's upper (each component of a path the image lacks
+  part of, which the shim makes or overlayfs copies up, once across the set,
+  and the generated `/etc/resolv.conf`) and refuse a set that needs more
+  than `--disk`'s inode limit leaves after 32 for the run's own files;
+  `create` exits 124. Sixteen 512-component paths at the 64M floor used to
+  pass the preflight and fail in the shim with ENOSPC after allocation,
+  which kilnd records as an ambiguous, charged create. `--disk max` and
+  forks aren't counted.
+
 - Make the create-certainty unit tests observe ID creation (adversarial
   review): the persistent create takes its ID generator as a parameter
   internally, and the tests that claim a refusal comes before allocation pass

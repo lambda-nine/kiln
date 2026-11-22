@@ -129,8 +129,34 @@ fn restrict_writes_under(root: &OwnedFd, writable: &[PathBuf], create_missing: b
 /// create's shim makes them (`Missing::Create`); a fork's absent paths are
 /// its own preflight's refusal (`checkpoint::capture::check_writable`, over
 /// the image and the checkpoint together).
-pub(crate) fn preflight(image: &OwnedFd, writable: &[PathBuf], generated: &[&str]) -> Result<()> {
-    walk(image, writable, Missing::Accept, generated).map(drop)
+///
+/// Returns how many entries an ordinary create's setup leaves in the
+/// sandbox's upper for these paths and the `generated` files, each counted
+/// once across the set, so the create can check them against the run's
+/// inode quota before allocating. A path the image has in full costs nothing
+/// (the shim only opens it); one the image lacks part of costs every one of
+/// its components, because the shim makes the missing ones and overlayfs
+/// copies the image's directories above them up first; a generated file
+/// (written before the walk) costs itself and its parents. Paths on kiln's
+/// /dev tmpfs aren't in the upper.
+pub(crate) fn preflight(image: &OwnedFd, writable: &[PathBuf], generated: &[&str]) -> Result<u64> {
+    let walked = walk(image, writable, Missing::Accept, generated)?;
+    let mut upper = std::collections::BTreeSet::new();
+    let mut add = |path: &str| {
+        // "/a/b/c" leaves "/a", "/a/b" and "/a/b/c" in the upper.
+        upper.extend(path.match_indices('/').skip(1).map(|(end, _)| path[..end].to_owned()));
+        upper.insert(path.to_owned());
+    };
+    for (dir, path, _) in &walked {
+        let text = path.to_str().context("--writable paths must be valid UTF-8")?;
+        if dir.is_none() && place(text, generated)? == Place::Image {
+            add(text);
+        }
+    }
+    for file in generated {
+        add(*file);
+    }
+    Ok(upper.len() as u64)
 }
 
 /// What the walk does with a component that doesn't exist.
@@ -398,6 +424,67 @@ pub(crate) mod tests {
         preflight(&image_fd, &[PathBuf::from("/etc/resolv.conf/x")], &[]).unwrap();
         // The preflight never creates anything in the image.
         assert!(!image.join("workspace").exists() && !image.join("var/new").exists());
+        fs::remove_dir_all(image).unwrap();
+    }
+
+    /// Every directory under `root`, as "/a/b", without following symlinks.
+    fn directories(root: &Path) -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut pending = vec![String::new()];
+        while let Some(at) = pending.pop() {
+            for entry in fs::read_dir(root.join(at.trim_start_matches('/'))).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    let path = format!("{at}/{}", entry.file_name().to_str().unwrap());
+                    pending.push(path.clone());
+                    found.insert(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// The preflight counts what the shim's walk leaves in the upper, once
+    /// across the set: every component of a path the image lacks part of
+    /// (made, or copied up by overlayfs above what's made) and each generated
+    /// file with its parents. What the walk only opens, and kiln's /dev
+    /// tmpfs, cost nothing.
+    #[test]
+    fn preflight_counts_what_the_shim_walk_leaves_in_the_upper() {
+        let image = alpine_like("count-image");
+        let image_fd = root_fd(&image);
+        let count = |paths: &[&str], generated: &[&str]| {
+            preflight(&image_fd, &paths.iter().map(PathBuf::from).collect::<Vec<_>>(), generated).unwrap()
+        };
+        // The image has /tmp and /root, but not /workspace.
+        assert_eq!(count(&[], &[]), 1);
+        assert_eq!(count(&[], &GENERATED), 1 + 2, "/etc and /etc/resolv.conf");
+        assert_eq!(count(&["/etc", "/var/cache", "/tmp", "/dev/shm/x/y"], &[]), 1);
+        assert_eq!(count(&["/var/cache/a/b"], &[]), 1 + 4, "/var and /var/cache are copied up");
+        assert_eq!(count(&["/new/a/b", "/new/a", "/new/c", "/new/a/b"], &[]), 1 + 4);
+        assert_eq!(count(&["/workspace/x", "/workspace"], &[]), 2);
+        assert_eq!(count(&["/etc/new"], &GENERATED), 1 + 3);
+        // The 2026-11-22 review's set: 16 paths of 512 one-byte components
+        // under top-level names the image lacks.
+        let deep: Vec<String> = ('b'..='q').map(|top| format!("/{top}{}", "/a".repeat(511))).collect();
+        let deep: Vec<&str> = deep.iter().map(String::as_str).collect();
+        assert_eq!(count(&deep, &[]), 1 + 16 * 512);
+
+        // The shim's walk over the same tree makes the missing components;
+        // with the image's directories above them, which overlayfs copies up
+        // first, that is the count (kiln's /dev tmpfs aside).
+        for set in [&["/var/cache/a/b", "/new/a/b", "/new/c", "/etc", "/tmp/x"][..], &deep[..]] {
+            let sandbox = alpine_like("count-sandbox");
+            let before = directories(&sandbox);
+            walk(&root_fd(&sandbox), &set.iter().map(PathBuf::from).collect::<Vec<_>>(), Missing::Create, &[]).unwrap();
+            let made: Vec<String> = directories(&sandbox).difference(&before)
+                .filter(|path| !path.starts_with("/dev/")).cloned().collect();
+            let copied: std::collections::BTreeSet<&str> = made.iter()
+                .flat_map(|path| path.match_indices('/').skip(1).map(|(end, _)| &path[..end]))
+                .filter(|parent| before.contains(*parent)).collect();
+            assert_eq!((made.len() + copied.len()) as u64, count(set, &[]), "a set of {} paths", set.len());
+            fs::remove_dir_all(sandbox).unwrap();
+        }
         fs::remove_dir_all(image).unwrap();
     }
 

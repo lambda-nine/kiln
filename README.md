@@ -212,7 +212,11 @@ and prompt removal.
    `/dev` other than `/dev` itself and `/dev/shm`, a path through
    `/etc/resolv.conf` when kiln writes it, or a component longer than 255
    bytes is refused up front (`create` exits 124). Components the image
-   doesn't have are created by the sandbox's setup, as before.
+   doesn't have are created by the sandbox's setup, and they count against
+   `--disk`'s inode limit together with the image directories above them,
+   which the overlay copies up: `create` and `run` count them first and refuse
+   a set that doesn't fit after 32 inodes for the run's own files (about 4000
+   directories at the 64M floor).
 7. **Startup overhead** (done): randomized v2 measurements on one ARM Lima VM
    show that there is no universal “cold-start” number. After 5 seconds idle,
    a one-shot `kiln run -- true` CLI lifecycle (setup, command and synchronous

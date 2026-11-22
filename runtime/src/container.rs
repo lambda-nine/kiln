@@ -169,12 +169,22 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
 /// (`image::open_image`: no symlink at the name, owned by the sandbox ID
 /// range), so an alias symlinked to another image is refused here rather
 /// than in the shim; and with `--read-only` every writable path survives the
-/// shim's Landlock walk over that directory (`landlock::preflight`). The
-/// shim repeats this before its run directory, so an image changed in
-/// between fails before anything exists.
+/// shim's Landlock walk over that directory (`landlock::preflight`), and the
+/// directories that walk will make fit the run's inode quota. The shim
+/// repeats this before its run directory, so an image changed in between
+/// fails before anything exists.
 pub fn validate_image(cfg: &Config) -> Result<()> {
     validate_image_in(&image::Roots::system(), cfg)
 }
+
+/// What a run's own setup puts under its quota besides the sandbox's root,
+/// as the create preflight allows for it: the run directory itself, `upper`,
+/// `work` and overlayfs's `work/work`, `merged`, the `image`, `policy` and
+/// `layout` records, `control.sock` and `init.pid` are 10, with at most a
+/// few more at a time while a record's temporary or overlayfs's mount-time
+/// probes exist. Rounded up, so a new run file doesn't silently break the
+/// preflight's count.
+pub(crate) const RUN_INODES: u64 = 32;
 
 fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
     let image = image::open_image(roots, &cfg.image).map_err(|e| {
@@ -183,7 +193,17 @@ fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
         if missing { e.context("image is missing (try: sudo scripts/fetch-alpine.sh)") } else { e }
     })?;
     if cfg.read_only {
-        landlock::preflight(&OwnedFd::from(image), &cfg.writable, &generated(cfg))?;
+        let made = landlock::preflight(&OwnedFd::from(image), &cfg.writable, &generated(cfg))?;
+        // An ordinary create's shim makes the writable directories the image
+        // lacks in the upper, under the run's inode quota, which runs out with
+        // ENOSPC long after allocation. A fork's walk makes none: its absent
+        // paths are refused, and its upper is the checkpoint's.
+        if cfg.fork.is_none() && let Some(limit) = quota::inode_limit(cfg.disk) {
+            let room = limit.saturating_sub(RUN_INODES);
+            ensure!(made <= room, "invalid --writable paths: setting them up needs {made} new entries in the \
+                sandbox's root, more than the {room} that --disk leaves (its inode limit of {limit}, one per 16 KiB, \
+                less {RUN_INODES} for the run's own files); use a larger --disk or fewer, shallower paths");
+        }
     }
     Ok(())
 }
@@ -874,6 +894,40 @@ mod tests {
         validate_image_in(&roots, &config("img", false, &[], "none")).unwrap();
         let missing = validate_image_in(&roots, &config("missing", false, &[], "none")).unwrap_err();
         assert!(format!("{missing:#}").contains("fetch-alpine"), "{missing:#}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// With `--read-only`, what the shim's walk will make counts against the
+    /// run's inode quota in the preflight (the 2026-11-22 review's finding A):
+    /// a set that needs one inode more than `--disk` leaves is refused before
+    /// allocation, one that fits exactly is accepted, and neither `--disk max`
+    /// nor a fork, whose walk makes nothing, is counted.
+    #[test]
+    fn preflight_refuses_writable_paths_past_the_inode_quota() {
+        let (root, roots) = scratch_roots("inodes");
+        // The scratch image lacks /tmp, /root and /workspace: 3 of the room.
+        let room = quota::inode_limit(Some(quota::MIN_DISK)).unwrap() - RUN_INODES - 3;
+        let deep = |top: char, components: u64| format!("/{top}{}", "/a".repeat(components as usize - 1));
+        let mut paths: Vec<String> = ('b'..='h').map(|top| deep(top, 512)).collect();
+        paths.push(deep('i', room - 7 * 512));
+        let mut cfg = config("img", true, &paths.iter().map(String::as_str).collect::<Vec<_>>(), "none");
+        validate_image_in(&roots, &cfg).unwrap();
+        cfg.writable.push(PathBuf::from("/j"));
+        let error = validate_image_in(&roots, &cfg).unwrap_err();
+        assert!(format!("{error:#}").contains("--disk"), "{error:#}");
+        // Another 16 KiB of disk is another inode.
+        cfg.disk = Some(quota::MIN_DISK + 16 * 1024);
+        validate_image_in(&roots, &cfg).unwrap();
+
+        // The review's set, 16 paths of 512 components, at the 64M floor.
+        let review: Vec<String> = ('b'..='q').map(|top| deep(top, 512)).collect();
+        let mut cfg = config("img", true, &review.iter().map(String::as_str).collect::<Vec<_>>(), "none");
+        assert!(validate_image_in(&roots, &cfg).is_err());
+        cfg.disk = None;
+        validate_image_in(&roots, &cfg).unwrap();
+        cfg.disk = Some(quota::MIN_DISK);
+        cfg.fork = Some(checkpoint::capture::ForkInfo { root_mtime: (0, 0), etc_mtime: None });
+        validate_image_in(&roots, &cfg).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

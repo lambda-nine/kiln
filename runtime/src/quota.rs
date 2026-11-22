@@ -130,7 +130,7 @@ pub fn limit(dir: &Path, bytes: Option<u64>) -> Result<()> {
     // Always write the limit, even "none" (0): IDs are inode numbers, which
     // get reused, and a reused ID would otherwise inherit an old limit.
     let blocks = bytes.map_or(0, |b| b.div_ceil(BASIC_BLOCK));
-    let inodes = bytes.map_or(0, |b| b.div_ceil(BYTES_PER_INODE).max(MIN_INODES));
+    let inodes = inode_limit(bytes).unwrap_or(0);
     let mut quota = FsDiskQuota {
         version: FS_DQUOT_VERSION,
         flags: FS_PROJ_QUOTA,
@@ -143,6 +143,13 @@ pub fn limit(dir: &Path, bytes: Option<u64>) -> Result<()> {
         ..Default::default()
     };
     quotactl(&dir_file, Q_XSETQLIM, id, &mut quota).context("set disk quota")
+}
+
+/// The inode limit `limit` gives `bytes` of disk: one inode per 16 KiB, at
+/// least 128. `None` (`--disk max`) has none. The create preflight counts
+/// what setup makes against it.
+pub fn inode_limit(bytes: Option<u64>) -> Option<u64> {
+    bytes.map(|b| b.div_ceil(BYTES_PER_INODE).max(MIN_INODES))
 }
 
 /// A project's disk use and hard limit, in bytes.

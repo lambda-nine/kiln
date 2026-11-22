@@ -200,7 +200,7 @@ version. Protocol v1 is first supplied by the resulting kiln commit based on
 | Active `kiln rm` leaves exec descendants | Handled: PID 1 interrupts the active exec and drains its cgroup before acknowledging removal; cleanup/GC removes child cgroup directories first |
 | Descendants hold exec output pipes open | Handled: all descendants are killed and drained before completion, including separate sessions/process groups, `nohup` and double forks |
 | Task stuck in uninterruptible kernel sleep | Limit: SIGKILL cannot finish until the kernel wait ends; cgroup drainage and removal have no fixed time bound |
-| Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run |
+| Disk or inode exhaustion        | Handled: XFS project block and inode quotas per run; the writable directories a create makes are counted against the inode quota before allocation |
 | I/O bandwidth hog                | Partial: iocost + io.weight wired and accounted; not enforced on this VM's fast disk without a tuned cost model |
 | O_DIRECT writes beyond memory.max | Handled: loop device in direct I/O mode (was an OOM kill) |
 | Supervisor crash leaves orphans  | Persistent sandboxes: handled (pdeathsig kills PID 1; `kiln gc` removes cgroup, network state and run dir, also of a shim that died during setup). Only a crash between the run directory's `mkdir` and its identity files leaves a directory without `shim.pid` to remove by hand. One-shot `kiln run`: pdeathsig kills the sandbox, but its cgroup, run dir and lease stay until cleaned by hand |
@@ -304,9 +304,17 @@ directory: a symlinked or regular-file
 component, a path over kiln's own `/proc`, `/sys` or `/dev` mounts (all but
 `/dev` and `/dev/shm`), a path through a file kiln writes
 (`/etc/resolv.conf` with DNS) or a component over 255 bytes is refused.
-Where the image lacks a component the preflight stops and accepts, because
-an ordinary create's shim makes it; a fork's absent paths are refused by its
-own preflight over the image and the checkpoint together.
+Where the image lacks a component the preflight accepts it, because an
+ordinary create's shim makes it, and counts what the walk will leave in the
+sandbox's upper: every component of such a path (the shim makes the missing
+ones and overlayfs copies up the image's directories above them), once
+across the set, and the generated `/etc/resolv.conf` with `/etc`. They come
+out of the run's inode quota (one inode per 16 KiB of `--disk`), so a set
+that needs more than the quota leaves after 32 inodes for the run's own
+files is refused here instead of failing in the shim with ENOSPC; at the
+64 MiB floor that is about 4000 directories, and `--disk max` has no limit.
+A fork's absent paths are refused by its own preflight over the image and
+the checkpoint together, and its walk makes nothing.
 
 ### Exec options
 
