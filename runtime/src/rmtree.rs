@@ -156,6 +156,8 @@ pub(crate) fn empty_dir(top: &OwnedFd, keep: &[&CStr], mut hook: Hook) -> io::Re
                         }
                         Outcome::NotEmpty => {
                             // Go down into it; this scan resumes just before it.
+                            #[cfg(test)]
+                            tests::before_open(name);
                             let child = open_dir_at(fd, name).map_err(|e| context(e, "open", name, depth))?;
                             let (child_dev, child_ino, child_mnt) = identity(child.as_raw_fd())?;
                             if child_dev != dev || (mnt.is_some() && child_mnt.is_some() && child_mnt != mnt) {
@@ -251,6 +253,86 @@ pub(crate) mod tests {
     }
 
     fn no_hook() -> impl FnMut(&CStr) -> io::Result<()> { |_| Ok(()) }
+
+    type OpenHook = Option<Box<dyn FnMut(&CStr)>>;
+
+    thread_local! {
+        /// What `before_open` runs on this test's thread.
+        static BEFORE_OPEN: std::cell::RefCell<OpenHook> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by the walk just before it opens a directory it found not
+    /// empty, so a test can swap that directory the way a racing writer would.
+    pub(super) fn before_open(name: &CStr) {
+        BEFORE_OPEN.with(|hook| if let Some(hook) = hook.borrow_mut().as_mut() { hook(name) });
+    }
+
+    /// The `..` reopen checks what it reopened (the adversarial review's L2):
+    /// below the descriptor window, a held directory moved out of the tree
+    /// (into `outside/victim`, with a fresh directory put in its place) makes
+    /// the climb back up past the window refuse with an error, and nothing
+    /// in `outside/victim` is removed. Without the check the walk would
+    /// empty `victim`, the moved directory's new parent.
+    #[test]
+    fn a_held_directory_moved_out_of_the_tree_is_refused_on_the_way_up() {
+        let root = scratch("moved");
+        let tree = root.join("tree");
+        // WINDOW + 1 levels below the top: the climb reopens only level 1,
+        // as `..` of level 2.
+        let bottom = (0..=WINDOW).fold(tree.clone(), |dir, _| dir.join("d"));
+        fs::create_dir_all(&bottom).unwrap();
+        fs::write(bottom.join("bottom"), "x").unwrap();
+        let victim = root.join("outside/victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "keep").unwrap();
+        let level2 = tree.join("d/d");
+        let mut moved = false;
+        let mut hook = |name: &CStr| -> io::Result<()> {
+            if name == c"bottom" && !moved {
+                moved = true;
+                fs::rename(&level2, victim.join("moved"))?;
+                fs::create_dir(&level2)?;
+            }
+            Ok(())
+        };
+        let error = empty_dir(&open(&tree), &[], &mut hook).unwrap_err();
+        assert!(moved);
+        assert!(error.to_string().contains("moved during removal"), "{error}");
+        assert_eq!(fs::read_to_string(victim.join("keep")).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The walk opens a directory without following a symlink (the
+    /// adversarial review's L2): a directory swapped for a symlink to one
+    /// outside the tree between its failed `rmdir` and the walk's open makes
+    /// the open fail, and the outside directory keeps its contents. Without
+    /// `O_NOFOLLOW` the walk would empty it.
+    #[test]
+    fn a_directory_swapped_for_a_symlink_before_its_open_is_not_followed() {
+        let root = scratch("swap");
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("x/target")).unwrap();
+        fs::write(tree.join("x/target/f"), "x").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(outside.join("inner")).unwrap();
+        fs::write(outside.join("inner/file"), "keep").unwrap();
+        let (target, aside) = (tree.join("x/target"), root.join("aside"));
+        let swap_outside = outside.clone();
+        BEFORE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(move |name: &CStr| {
+            if name == c"target" && !aside.exists() {
+                fs::rename(&target, &aside).unwrap();
+                symlink(&swap_outside, &target).unwrap();
+            }
+        })));
+        let result = empty_dir(&open(&tree), &[], &mut no_hook());
+        BEFORE_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(root.join("aside").exists(), "the hook didn't run");
+        assert_eq!(fs::read_to_string(outside.join("inner/file")).unwrap(), "keep");
+        if let Err(error) = result {
+            assert!(error.to_string().contains("open \"target\""), "{error}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn empties_a_tree_and_keeps_only_the_named_top_entries() {
