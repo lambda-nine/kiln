@@ -111,7 +111,7 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   scratch directories through the image with the shim's own no-follow walk,
   so `/var/run/x` on the default Alpine image (`/var/run -> ../run`),
   `/etc/passwd/x`, paths over kiln's `/proc`, `/sys` and `/dev` mounts (but
-  `/dev` and `/dev/shm`), paths through `/etc/resolv.conf` when kiln writes
+  `/dev` itself and `/dev/shm` and below it), paths through `/etc/resolv.conf` when kiln writes
   it, and components over 255 bytes are refused with exit 124 instead of
   failing in the shim after allocation. The shim refuses the same paths.
 
