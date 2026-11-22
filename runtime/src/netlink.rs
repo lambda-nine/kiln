@@ -239,15 +239,18 @@ impl Netlink {
     }
 
     /// Sends requests in one datagram, then waits for the acknowledgement of
-    /// each one that asked for it. Returns the first error.
+    /// each one that asked for it. Returns the first error, including one
+    /// for a request that didn't ask for an acknowledgement (`take_acks`).
     fn send(&mut self, reqs: Vec<Request>) -> Result<()> {
         let mut buf = Vec::new();
+        let mut seqs = Vec::new();
         let mut unacked = Vec::new();
         for mut req in reqs {
             self.seq += 1;
             let len = req.buf.len() as u32;
             req.buf[0..4].copy_from_slice(&len.to_ne_bytes());
             req.buf[8..12].copy_from_slice(&self.seq.to_ne_bytes());
+            seqs.push(self.seq);
             if u16::from_ne_bytes([req.buf[6], req.buf[7]]) & NLM_F_ACK != 0 {
                 unacked.push(self.seq);
             }
@@ -264,27 +267,38 @@ impl Netlink {
             // SAFETY: receives into a live buffer of the given length.
             let n = unsafe { libc::recv(fd, reply.as_mut_ptr().cast(), reply.len(), 0) };
             let n = Errno::result(n).context("netlink recv")? as usize;
-            let mut msg = &reply[..n];
-            while msg.len() >= NLMSG_HDRLEN {
-                let msg_len = u32::from_ne_bytes(msg[0..4].try_into()?) as usize;
-                let kind = u16::from_ne_bytes(msg[4..6].try_into()?);
-                let seq = u32::from_ne_bytes(msg[8..12].try_into()?);
-                if msg_len < NLMSG_HDRLEN || msg_len > msg.len() {
-                    bail!("malformed netlink reply");
-                }
-                if kind == NLMSG_ERROR && unacked.contains(&seq) {
-                    // struct nlmsgerr: int error, then a copy of our header.
-                    let error = i32::from_ne_bytes(msg.get(16..20).context("short netlink error")?.try_into()?);
-                    if error != 0 {
-                        return Err(Errno::from_raw(-error).into());
-                    }
-                    unacked.retain(|&s| s != seq);
-                }
-                msg = &msg[align(msg_len).min(msg.len())..];
-            }
+            take_acks(&reply[..n], &seqs, &mut unacked)?;
         }
         Ok(())
     }
+}
+
+/// Reads one datagram of replies to the requests `sent`, crossing off
+/// `unacked` the ones acknowledged with success. Any error reply to a sent
+/// request fails, whether or not it asked for an acknowledgement: when an
+/// nftables transaction fails to commit after every message in it was
+/// accepted, the kernel aborts it and reports the error against the batch's
+/// begin marker (which asks for none), and then still sends each message's
+/// success acknowledgement (`nfnetlink_rcv_batch` in net/netfilter/nfnetlink.c).
+fn take_acks(mut msg: &[u8], sent: &[u32], unacked: &mut Vec<u32>) -> Result<()> {
+    while msg.len() >= NLMSG_HDRLEN {
+        let msg_len = u32::from_ne_bytes(msg[0..4].try_into()?) as usize;
+        let kind = u16::from_ne_bytes(msg[4..6].try_into()?);
+        let seq = u32::from_ne_bytes(msg[8..12].try_into()?);
+        if msg_len < NLMSG_HDRLEN || msg_len > msg.len() {
+            bail!("malformed netlink reply");
+        }
+        if kind == NLMSG_ERROR && sent.contains(&seq) {
+            // struct nlmsgerr: int error, then a copy of our header.
+            let error = i32::from_ne_bytes(msg.get(16..20).context("short netlink error")?.try_into()?);
+            if error != 0 {
+                return Err(Errno::from_raw(-error).into());
+            }
+            unacked.retain(|&s| s != seq);
+        }
+        msg = &msg[align(msg_len).min(msg.len())..];
+    }
+    Ok(())
 }
 
 /// An nftables transaction on `inet` tables, committed by `Netlink::commit`.
@@ -400,4 +414,43 @@ fn c_str(s: &str) -> Result<Vec<u8>> {
 
 fn align(len: usize) -> usize {
     (len + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use nix::errno::Errno;
+
+    use super::{NLMSG_ERROR, take_acks};
+
+    /// An NLMSG_ERROR reply to request `seq`: the header, then the error.
+    fn ack(seq: u32, error: i32) -> Vec<u8> {
+        let mut msg = vec![0; 20];
+        msg[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        msg[4..6].copy_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        msg[8..12].copy_from_slice(&seq.to_ne_bytes());
+        msg[16..20].copy_from_slice(&error.to_ne_bytes());
+        msg
+    }
+
+    /// A transaction that fails at commit is reported against its begin
+    /// marker (1), which asked for no acknowledgement, before the success
+    /// acknowledgements of the messages in it (2, 3): that is a failure.
+    #[test]
+    fn a_failed_commit_reported_on_the_batch_marker_fails() {
+        let (sent, mut unacked) = ([1, 2, 3, 4], vec![2, 3]);
+        let reply = [ack(1, -libc::ENOMEM), ack(2, 0), ack(3, 0)].concat();
+        let error = take_acks(&reply, &sent, &mut unacked).unwrap_err();
+        assert_eq!(error.downcast_ref(), Some(&Errno::ENOMEM));
+    }
+
+    #[test]
+    fn acknowledgements_cross_off_only_their_own_requests() {
+        let (sent, mut unacked) = ([1, 2, 3, 4], vec![2, 3]);
+        take_acks(&[ack(2, 0), ack(9, -libc::EPERM)].concat(), &sent, &mut unacked).unwrap();
+        assert_eq!(unacked, [3]);
+        take_acks(&ack(3, 0), &sent, &mut unacked).unwrap();
+        assert!(unacked.is_empty());
+        let error = take_acks(&ack(3, -libc::EBUSY), &sent, &mut vec![3]).unwrap_err();
+        assert_eq!(error.downcast_ref(), Some(&Errno::EBUSY));
+    }
 }
