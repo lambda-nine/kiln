@@ -2139,7 +2139,6 @@ mod tests {
         assert!(format!("{error:#}").contains("shim.start"), "{error:#}");
         BETWEEN_SHIM_READS.with(|hook| *hook.borrow_mut() = None);
         // Unreadable, not missing: still an error.
-        fs::remove_file(root.join("aaaa-1/shim.start")).unwrap();
         fs::create_dir(root.join("aaaa-1/shim.start")).unwrap();
         assert!(list_records(&root).is_err());
         assert!(stale_gc_candidates(&root, &[]).is_err());

@@ -302,9 +302,9 @@ pub(crate) const RUN_ENTRIES: [(&str, bool); 9] = [
 pub(crate) const PERSISTENT_RUN_INODES: u64 = 10;
 pub(crate) const ONESHOT_RUN_INODES: u64 = 8;
 
-// The allowances are the run directory and its `RUN_ENTRIES`, or this
-// doesn't compile.
-const _: () = {
+/// The allowances are the run directory and its `RUN_ENTRIES`, or kiln
+/// doesn't compile (`RunKind::run_inodes` evaluates this).
+const ALLOWANCES_COUNT_RUN_ENTRIES: () = {
     let (mut oneshot, mut i) = (0, 0);
     while i < RUN_ENTRIES.len() {
         if !RUN_ENTRIES[i].1 { oneshot += 1; }
@@ -318,6 +318,7 @@ impl RunKind {
     /// The inodes this kind of run's own files use (`PERSISTENT_RUN_INODES`,
     /// `ONESHOT_RUN_INODES`).
     pub(crate) const fn run_inodes(self) -> u64 {
+        let () = ALLOWANCES_COUNT_RUN_ENTRIES;
         match self {
             RunKind::OneShot => ONESHOT_RUN_INODES,
             RunKind::Persistent => PERSISTENT_RUN_INODES,
@@ -1345,8 +1346,9 @@ mod tests {
         let mut order = Vec::new();
         remove_run_dir_with(&run, &mut |name: &CStr| { order.push(name.to_owned()); Ok(()) }).unwrap();
         assert!(!run.exists());
-        let last: Vec<&CStr> = order.iter().rev().take(3).rev().map(|n| n.as_c_str()).collect();
-        assert_eq!(last, [c"image", c"shim.pid", c"shim.start"], "{order:?}");
+        // The run directory itself (the hook's ".") comes after the identity.
+        let last: Vec<&CStr> = order.iter().rev().take(4).rev().map(|n| n.as_c_str()).collect();
+        assert_eq!(last, [c"image", c"shim.pid", c"shim.start", c"."], "{order:?}");
         fs::remove_dir_all(root).unwrap();
     }
 
