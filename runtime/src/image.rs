@@ -1951,11 +1951,25 @@ mod tests {
         assert!(format!("{e:#}").contains("changed while it was verified"), "{e:#}");
         write_entry(&roots.registry, &entry).unwrap();
         // The name moved to another directory with the registration intact.
-        let e = changed_at(&roots, 2, &|r| {
-            fs::rename(r.images.join("img"), r.images.join("img-held")).unwrap();
-            fs::create_dir(r.images.join("img")).unwrap();
-        });
-        assert!(format!("{e:#}").contains("changed while it was verified"), "{e:#}");
+        // Renaming the walked directory mid-walk changes its ctime, which the
+        // walk itself refuses; so hold the registry lock exclusively through
+        // the walk and move the name only once the walk is done, while the
+        // relock waits, so the recheck is what has to catch it.
+        let walk_calls = entry.entries;
+        let mut held = None;
+        let mut calls = 0u64;
+        let e = verify_off_lock(&roots, "img", far, &mut || {
+            calls += 1;
+            if calls == 1 { held = Some(lock(&roots.images, true).unwrap()); }
+            if calls == walk_calls + 1 {
+                fs::rename(roots.images.join("img"), roots.images.join("img-held")).unwrap();
+                fs::create_dir(roots.images.join("img")).unwrap();
+                held = None;
+            }
+            Instant::now()
+        }).unwrap_err();
+        assert!(held.is_none() && calls == walk_calls + 1, "calls {calls}");
+        assert!(format!("{e:#}").contains("image \"img\" changed while it was verified"), "{e:#}");
         assert!(exclusive_is_free(&roots.images));
         fs::remove_dir(roots.images.join("img")).unwrap();
         fs::rename(roots.images.join("img-held"), roots.images.join("img")).unwrap();
