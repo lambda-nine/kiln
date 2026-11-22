@@ -5,6 +5,20 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Remove a run directory with its identity last and a bounded number of
+  descriptors at any depth (kiln security review round 2, finding B): a
+  sandbox that built a directory tree deeper than the shim's soft descriptor
+  limit (1024 under systemd) made `std::fs::remove_dir_all` fail with EMFILE
+  at teardown after it had already unlinked `shim.start` and `shim.pid`, so
+  `kiln ls`, `kiln gc` and `kiln rm` could no longer see the leftover and
+  kilnd released its disk reservation. Teardown, `kiln gc`, a failed setup and
+  `kiln run` now share one removal that empties everything else first (at
+  most 32 directories open below the top, never following a symlink or
+  crossing a mount), then unlinks the image reference, `shim.pid` and
+  `shim.start`. A removal that fails keeps the run listed as stale for
+  `kiln gc ID` to retry, the shim logs it to the system log, and `kiln rm`
+  says the run directory is still present.
+
 - Count the writable directories a create makes against its inode quota
   before allocation (kiln security review round 2, finding A): with
   `--read-only`, `create` and `run` count every entry the shim's walk will

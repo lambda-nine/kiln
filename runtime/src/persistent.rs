@@ -915,7 +915,13 @@ pub fn remove(id: &str) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    bail!("sandbox {id} did not finish cleanup")
+    // The shim removes its run directory last and keeps the identity until
+    // the rest is gone, so a failed removal leaves a stale run to retry.
+    if read_shim(&dir).and_then(|shim| shim.is_live()).unwrap_or(false) {
+        bail!("sandbox {id} did not finish cleanup: its shim is still removing {}", dir.display());
+    }
+    bail!("sandbox {id} did not finish cleanup: its run directory {} is still present (the shim's error is in \
+        the system log); `kiln gc {id}` retries the removal", dir.display())
 }
 
 pub fn list() -> Result<()> {
@@ -983,7 +989,7 @@ pub fn gc(ids: &[String]) -> Result<()> {
 fn finish_gc(dir: &Path, cgroup: Result<()>, network: Result<()>) -> Result<()> {
     cgroup.context("cgroup teardown")?;
     network.context("network teardown")?;
-    fs::remove_dir_all(dir).with_context(|| format!("remove stale sandbox {}", dir.display()))
+    container::remove_run_dir(dir).with_context(|| format!("remove stale sandbox {}", dir.display()))
 }
 
 fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>> {

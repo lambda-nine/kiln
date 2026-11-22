@@ -15,6 +15,7 @@ mod overlay;
 mod persistent;
 mod protected;
 mod quota;
+mod rmtree;
 mod seccomp;
 mod sha256;
 mod storage;

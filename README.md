@@ -313,7 +313,10 @@ and prompt removal.
     state look live. A shim publishes that identity right after creating its
     run directory and removes the directory if setup fails, so `ls` and `gc`
     also see a shim that is still being set up or died during setup; `kiln rm`
-    of a dead one points at `kiln gc`. `kiln rm` stops one and waits for its resources to be removed, and
+    of a dead one points at `kiln gc`. Every removal of a run directory takes
+    that identity last and works at any depth with a bounded number of open
+    descriptors, so a teardown that fails (the shim logs why to the system
+    log) leaves a stale run that `kiln ls` lists and `kiln gc ID` retries. `kiln rm` stops one and waits for its resources to be removed, and
     `kiln gc` removes cgroups, network state and run directories left by
     crashed shims, removing child cgroup directories before their parent.
     Optional ID arguments restrict cleanup to those sandboxes, so a manager

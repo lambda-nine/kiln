@@ -60,3 +60,59 @@ sudo test ! -e "$lease"
 sudo test ! -e "$cgroup"
 id=
 echo 'PASS: network teardown failure retains lease and registry for retry'
+
+# A sandbox can build a directory tree deeper than the shim's soft descriptor
+# limit (1024 under systemd, which kilnd's helper and the shims it starts
+# inherit). Its teardown must still remove everything.
+command -v chattr >/dev/null || { echo 'FAIL: needs chattr (e2fsprogs)'; exit 1; }
+pinned=
+cleanup_deep() {
+    if [ -n "$pinned" ]; then sudo chattr -i "$pinned" 2>/dev/null || true; fi
+    cleanup_network
+}
+trap cleanup_deep EXIT HUP INT TERM
+chain='cd /tmp && i=0; while [ "$i" -lt 1500 ]; do mkdir d && cd d || exit 1; i=$((i + 1)); done; touch bottom'
+id=$(sudo sh -c "ulimit -S -n 1024; exec \"$KILN\" create --net=none")
+run=/var/lib/kiln/runs/$id
+sudo "$KILN" exec "$id" -- sh -c "$chain"
+sudo "$KILN" rm "$id"
+sudo test ! -e "$run"
+sudo test ! -e "/sys/fs/cgroup/kiln/$id"
+id=
+echo 'PASS: a 1500-level tree under a soft descriptor limit of 1024 is torn down completely'
+
+# A teardown that fails keeps the identity: the run stays listed (stale), and
+# kiln gc removes it once the cause is gone. An immutable file in the upper,
+# which only host root can set, makes the shim's removal fail.
+id=$(sudo sh -c "ulimit -S -n 1024; exec \"$KILN\" create --net=none")
+run=/var/lib/kiln/runs/$id
+sudo "$KILN" exec "$id" -- sh -c "$chain && mkdir -p /tmp/pin && touch /tmp/pin/file"
+pinned=$run/upper/tmp/pin/file
+sudo chattr +i "$pinned"
+if out=$(sudo "$KILN" rm "$id" 2>&1); then
+    echo 'FAIL: rm succeeded with an immutable file in the upper'; exit 1
+fi
+echo "$out" | grep -qF 'is still present' && echo "$out" | grep -qF "kiln gc $id" ||
+    { echo "FAIL: rm did not say the run directory is left for gc: $out"; exit 1; }
+sudo test -f "$run/shim.pid"
+sudo test -f "$run/shim.start"
+sudo test -f "$run/image"
+sudo "$KILN" ls | awk -F '\t' -v id="$id" '$1 == id && $2 == "stale" { found = 1 } END { exit !found }' ||
+    { echo 'FAIL: the failed teardown is not listed as stale'; exit 1; }
+logged=0
+for _ in 1 2 3 4 5; do
+    if sudo journalctl -q -t kiln -n 50 --no-pager | grep -qF "sandbox $id: teardown left"; then logged=1; break; fi
+    sleep 0.2
+done
+[ "$logged" = 1 ] || { echo 'FAIL: the shim did not log its teardown failure'; exit 1; }
+if sudo "$KILN" gc "$id"; then
+    echo 'FAIL: gc succeeded with the immutable file still there'; exit 1
+fi
+sudo test -f "$run/shim.pid"
+sudo chattr -i "$pinned"
+pinned=
+sudo "$KILN" gc "$id"
+sudo test ! -e "$run"
+sudo test ! -e "/sys/fs/cgroup/kiln/$id"
+id=
+echo 'PASS: a failed teardown stays listed with its identity, logs why, and kiln gc finishes it'

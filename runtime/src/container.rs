@@ -1,6 +1,6 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, chown, symlink};
@@ -25,6 +25,7 @@ use crate::landlock;
 use crate::net;
 use crate::overlay;
 use crate::protected;
+use crate::rmtree;
 use crate::seccomp;
 use crate::storage;
 use crate::quota;
@@ -86,7 +87,7 @@ pub fn run(cfg: &Config) -> Result<i32> {
     // with the sandbox. Only the directories are left to clean up.
     if cfg.keep {
         eprintln!("kiln: kept {} (changes are in upper/)", run_dir.display());
-    } else if let Err(e) = fs::remove_dir_all(&run_dir) {
+    } else if let Err(e) = remove_run_dir(&run_dir) {
         eprintln!("kiln: failed to remove {}: {e}", run_dir.display());
     }
     trace::mark("host: remove run dir");
@@ -119,7 +120,9 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
         bind_control_socket(&run_dir.join("control.sock"))
     })?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
-    let _ = fs::remove_dir_all(&run_dir);
+    if let Err(e) = remove_run_dir(&run_dir) {
+        report(&format!("kiln: sandbox {id}: teardown left {}: {e}; `kiln gc {id}` retries it", run_dir.display()));
+    }
     result.map(|_| ())
 }
 
@@ -127,16 +130,74 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
 /// in it at once, before its quota and everything else, then runs `setup`.
 /// From the identity on, `kiln ls` lists the directory and `kiln gc` removes
 /// it if this shim dies; and any error here removes it again, so a create
-/// that fails before its sandbox starts leaves nothing behind. Only a crash
-/// between the `mkdir` and the identity leaves a directory without
-/// `shim.pid`. A directory that already existed is never touched.
+/// that fails before its sandbox starts leaves nothing behind. Every removal
+/// (`remove_run_dir`, here, at teardown and in `kiln gc`) takes the identity
+/// last, so one that fails leaves a run `kiln ls` lists and `kiln gc`
+/// retries. Only a crash between the `mkdir` and the identity leaves a
+/// directory without `shim.pid`. A directory that already existed is never
+/// touched.
 fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, setup: impl FnOnce() -> Result<T>) -> Result<T> {
     create_run_dir(run_dir)?;
     let result = publish_shim_identity(run_dir, pid, start).and_then(|()| setup());
-    if result.is_err() {
-        let _ = fs::remove_dir_all(run_dir);
+    if result.is_err() && let Err(e) = remove_run_dir(run_dir) {
+        report(&format!("kiln: failed setup left {}: {e}; `kiln gc` removes it", run_dir.display()));
     }
     result
+}
+
+/// A run directory's identity, in the order `remove_run_dir` unlinks it:
+/// `shim.pid` first, so a concurrent `kiln ls` never finds `shim.pid`
+/// without `shim.start`.
+const IDENTITY: [&CStr; 2] = [c"shim.pid", c"shim.start"];
+
+/// Removes a run directory, for a one-shot run, a persistent shim's teardown
+/// and `kiln gc`. Everything but the image reference and the identity goes
+/// first, with a fixed number of descriptors at any depth and never across a
+/// symlink or a mount (`rmtree`); then the image reference, `shim.pid`,
+/// `shim.start` and the directory. Any error returns before the identity is
+/// touched: the run stays listed by `kiln ls` (stale once its shim is gone),
+/// `kiln gc` retries it, kilnd keeps it charged, and its image stays
+/// referenced.
+pub(crate) fn remove_run_dir(run_dir: &Path) -> io::Result<()> {
+    remove_run_dir_with(run_dir, &mut |_| Ok(()))
+}
+
+/// `remove_run_dir` with a hook called before each removal (tests inject
+/// failures with it; production passes one that does nothing).
+pub(crate) fn remove_run_dir_with(run_dir: &Path, hook: rmtree::Hook) -> io::Result<()> {
+    let dir: OwnedFd = fs::File::options().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(run_dir)?.into();
+    let reference = CString::new(image::REFERENCE_FILE).expect("no NUL in the reference name");
+    let last = [reference.as_c_str(), IDENTITY[0], IDENTITY[1]];
+    rmtree::empty_dir(&dir, &last, &mut *hook)?;
+    for name in last {
+        hook(name)?;
+        // SAFETY: unlinkat of a name in an open directory.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(io::Error::new(e.kind(), format!("remove {name:?}: {e}")));
+            }
+        }
+    }
+    drop(dir);
+    fs::remove_dir(run_dir)
+}
+
+/// A shim's failure that no caller is left to read: its stderr is /dev/null
+/// once `kiln create` has returned, so it also goes to the system log (the
+/// journal on systemd hosts: `journalctl -t kiln`).
+fn report(message: &str) {
+    eprintln!("{message}");
+    if let Ok(text) = CString::new(message) {
+        // SAFETY: the ident is a static C string, and "%s" takes exactly the
+        // one C string passed.
+        unsafe {
+            libc::openlog(c"kiln".as_ptr(), libc::LOG_PID, libc::LOG_DAEMON);
+            libc::syslog(libc::LOG_ERR, c"%s".as_ptr(), text.as_ptr());
+            libc::closelog();
+        }
+    }
 }
 
 /// Linux's limit on a hostname (`HOST_NAME_MAX`); `sethostname` refuses longer.
@@ -1005,6 +1066,109 @@ mod tests {
         assert!(!ran.get());
         assert_eq!(fs::read_to_string(run.join("shim.pid")).unwrap(), "1234");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A run directory look-alike: the identity, the image reference and
+    /// the other records, and an upper with a sandbox's files in it.
+    fn run_dir_look_alike(root: &Path) -> PathBuf {
+        let run = root.join("run");
+        for dir in ["upper/tmp/a/b", "upper/etc", "work/work", "merged"] { fs::create_dir_all(run.join(dir)).unwrap(); }
+        for file in ["shim.start", "shim.pid", image::REFERENCE_FILE, "policy", "layout", "init.pid",
+            "upper/etc/resolv.conf", "upper/tmp/a/b/victim", "upper/tmp/a/z"] {
+            fs::write(run.join(file), file).unwrap();
+        }
+        run
+    }
+
+    /// Teardown keeps the identity to the end (the 2026-11-22 review's
+    /// finding B): a removal that fails on one entry returns the error and
+    /// leaves `shim.pid`, `shim.start` and the image reference, so the run
+    /// stays listed and `kiln gc` retries it; the retry removes everything.
+    #[test]
+    fn a_failed_teardown_keeps_the_identity_and_a_retry_finishes() {
+        let root = scratch_dir("teardown-identity");
+        let run = run_dir_look_alike(&root);
+        let mut seen = Vec::new();
+        let mut hook = |name: &CStr| {
+            seen.push(name.to_owned());
+            if name == c"victim" { Err(io::Error::other("injected removal failure")) } else { Ok(()) }
+        };
+        let error = remove_run_dir_with(&run, &mut hook).unwrap_err();
+        assert!(error.to_string().contains("injected removal failure"), "{error}");
+        for file in ["shim.pid", "shim.start", image::REFERENCE_FILE] {
+            assert!(run.join(file).exists(), "{file} removed before the rest of the run directory");
+        }
+        assert!(!seen.iter().any(|n| [c"shim.pid", c"shim.start", c"image"].contains(&n.as_c_str())), "{seen:?}");
+
+        let mut order = Vec::new();
+        remove_run_dir_with(&run, &mut |name: &CStr| { order.push(name.to_owned()); Ok(()) }).unwrap();
+        assert!(!run.exists());
+        let last: Vec<&CStr> = order.iter().rev().take(3).rev().map(|n| n.as_c_str()).collect();
+        assert_eq!(last, [c"image", c"shim.pid", c"shim.start"], "{order:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Without root, a mode 000 directory the sandbox left can't be emptied:
+    /// the teardown fails and the identity stays. Root removes it.
+    #[test]
+    fn an_unremovable_directory_keeps_the_identity() {
+        let root = scratch_dir("teardown-mode000");
+        let run = run_dir_look_alike(&root);
+        fs::set_permissions(run.join("upper/tmp/a"), fs::Permissions::from_mode(0o000)).unwrap();
+        let result = remove_run_dir(&run);
+        if unsafe { libc::geteuid() } == 0 {
+            result.unwrap();
+            assert!(!run.exists());
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(run.join("shim.pid").exists() && run.join("shim.start").exists());
+            fs::set_permissions(run.join("upper/tmp/a"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The environment variable that hands `child_removes_a_deep_tree_under_a_low_descriptor_limit`
+    /// its scratch directory.
+    const DEEP_CHILD: &str = "KILN_TEST_DEEP_TEARDOWN_DIR";
+    /// Deeper than the soft descriptor limit the child sets, many times over.
+    const DEEP: usize = 5000;
+    const LOW_NOFILE: libc::rlim_t = 64;
+
+    /// A sandbox's tree 5000 levels deep, with the soft `RLIMIT_NOFILE` at
+    /// 64, is removed completely; std's `remove_dir_all` fails on the same
+    /// tree with EMFILE. The limit is set in a child process (this test
+    /// binary, running only the test below), so it binds nothing else.
+    #[test]
+    fn a_tree_deeper_than_the_descriptor_limit_is_removed() {
+        let root = scratch_dir("teardown-deep");
+        let run = run_dir_look_alike(&root);
+        crate::rmtree::tests::chain(&run.join("upper/tmp"), DEEP, 997);
+        fs::create_dir(root.join("std")).unwrap();
+        crate::rmtree::tests::chain(&root.join("std"), DEEP, 997);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "container::tests::child_removes_a_deep_tree_under_a_low_descriptor_limit",
+                "--ignored", "--nocapture", "--test-threads=1"])
+            .env(DEEP_CHILD, &root)
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && text.contains("1 passed"), "{text}");
+        assert!(!run.exists(), "the deep run directory survived: {text}");
+        // std's leftover, removed here without the low limit.
+        crate::rmtree::empty_dir(&crate::rmtree::tests::open(&root), &[], &mut |_| Ok(())).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run in a child process by a_tree_deeper_than_the_descriptor_limit_is_removed"]
+    fn child_removes_a_deep_tree_under_a_low_descriptor_limit() {
+        let Some(root) = std::env::var_os(DEEP_CHILD).map(PathBuf::from) else { return };
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        limit.rlim_cur = LOW_NOFILE;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let control = fs::remove_dir_all(root.join("std")).unwrap_err();
+        assert_eq!(control.raw_os_error(), Some(libc::EMFILE), "{control}");
+        remove_run_dir(&root.join("run")).unwrap();
     }
 
     #[test]
