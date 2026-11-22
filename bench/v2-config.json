@@ -35,7 +35,7 @@
       },
       "argv": ["{kiln}", "run", "--", "{workload}"],
       "version_argv": ["{kiln}", "--version"],
-      "version_note": "kiln --version reports the package version and the build's git commit (clean, dirty or unknown); the manifest also records the binary's SHA-256 and the repo commit.",
+      "version_note": "kiln --version reports the package version and the build's git commit (clean, dirty, override, override-dirty or unknown); the manifest also records the binary's SHA-256 and the repo commit.",
       "memory": {
         "start_argv": ["{kiln}", "create"],
         "sandbox_id_from": "stdout",
@@ -54,7 +54,7 @@
       },
       "argv": ["{kiln}", "run", "--net", "full", "--", "{workload}"],
       "version_argv": ["{kiln}", "--version"],
-      "version_note": "kiln --version reports the package version and the build's git commit (clean, dirty or unknown); the manifest also records the binary's SHA-256 and the repo commit.",
+      "version_note": "kiln --version reports the package version and the build's git commit (clean, dirty, override, override-dirty or unknown); the manifest also records the binary's SHA-256 and the repo commit.",
       "memory": {
         "start_argv": ["{kiln}", "create", "--net", "full"],
         "sandbox_id_from": "stdout",

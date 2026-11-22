@@ -307,7 +307,9 @@ command: argv, exit code, stdout, stderr; `null` for a case without one), and
 
 kiln builds identify themselves: `kiln --version` prints the package version
 and the commit its build inputs came from, like `kiln 0.1.0 (git
-abcdef123456, clean)`, or `dirty` or `git unknown`. The shipped configs run it
+abcdef123456, clean)`, or `dirty`, or `git unknown`. A build told its commit
+through `KILN_BUILD_COMMIT` says `override` or `override-dirty` instead of
+`clean` or `dirty`, since nothing checked it. The shipped configs run it
 for every kiln case, so manifests from now on capture that output alongside
 the binary's SHA-256 (`executables`) and the repository commit (`git`).
 Archived results predate `--version` and have `null` there; they identify

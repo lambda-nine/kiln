@@ -4,7 +4,9 @@
 //! (the build inputs differ from that commit) or `git unknown` (no git, not a
 //! checkout, or git failed). Builds outside a checkout, such as from a source
 //! tarball, can set `KILN_BUILD_COMMIT` to the commit (`<hex>`, `<hex>-dirty`
-//! or `unknown`) instead.
+//! or `unknown`) instead. Nothing checks such a claim, so it is reported as
+//! `git <commit>, override` or `git <commit>, override-dirty`, never `clean`
+//! or `dirty`; `unknown` stays `git unknown`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,8 +35,8 @@ fn from_override(v: &str) -> String {
         return "git unknown".into();
     }
     let (commit, state) = match v.strip_suffix("-dirty") {
-        Some(c) => (c, "dirty"),
-        None => (v, "clean"),
+        Some(c) => (c, "override-dirty"),
+        None => (v, "override"),
     };
     if commit.len() < 12 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
         panic!("KILN_BUILD_COMMIT={v:?}: expected a commit hash of at least 12 hex digits, optionally ending in -dirty, or \"unknown\"");
@@ -175,6 +177,17 @@ mod tests {
                 "fixture",
             ],
         );
+    }
+
+    #[test]
+    fn an_override_never_claims_a_checked_out_build() {
+        assert_eq!(from_override("0123456789abCDEF0123-dirty"), "git 0123456789ab, override-dirty");
+        assert_eq!(from_override("0123456789abCDEF0123"), "git 0123456789ab, override");
+        assert_eq!(from_override("0123456789ab"), "git 0123456789ab, override");
+        assert_eq!(from_override("unknown"), "git unknown");
+        for bad in ["0123456789a", "0123456789a-dirty", "0123456789ag", "-dirty", "unknown-dirty", "clean"] {
+            assert!(std::panic::catch_unwind(|| from_override(bad)).is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

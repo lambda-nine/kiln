@@ -18,6 +18,15 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   120 seconds; past that the command refuses `checkpoint_busy`, naming the
   image and the deadline. `kiln image verify` itself is unchanged.
 
+- Stop `KILN_BUILD_COMMIT` builds from claiming a clean checkout: `kiln
+  --version` reported any commit given that way as `clean` (or `dirty` for a
+  `-dirty` suffix), though nothing checked it. Such a build now says `git
+  <commit>, override` or `git <commit>, override-dirty`; `unknown` still
+  gives `git unknown`, and a build from a checkout is unchanged. A check that
+  accepts only `clean`, such as one that wants a clean build of a pinned
+  commit, now refuses an override build. The guest image's kiln, which
+  kiln-guest builds with `KILN_BUILD_COMMIT` set, now reports `override`.
+
 - Correct the failure-mode table's host reboot row: it said automatic
   daemon startup reconciliation was still open. kiln itself still records
   no boot identity, but kilnd's startup reconciliation covers the sandboxes
