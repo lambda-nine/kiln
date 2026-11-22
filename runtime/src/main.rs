@@ -530,7 +530,7 @@ mod tests {
             let (commit, state) = rest.split_once(", ").unwrap();
             assert_eq!(commit.len(), 12, "{version:?}");
             assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{version:?}");
-            assert!(state == "clean" || state == "dirty", "{version:?}");
+            assert!(matches!(state, "clean" | "dirty" | "override" | "override-dirty"), "{version:?}");
         }
     }
 }
