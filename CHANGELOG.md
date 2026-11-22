@@ -8,12 +8,16 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 - Make a persistent create's shim die with `kiln create` until the run has
   its identity: a CLI killed between the shim's fork and the run directory
   left a shim that went on to start a sandbox nothing listed or waited for.
-  The shim now sets a parent-death signal (SIGKILL) right after the fork,
-  exits at once if its parent is already gone, and clears the signal once
-  `shim.pid` is published, from which point `kiln ls` lists the run and
-  `kiln gc` collects it. A create killed between the run directory's
-  `mkdir` and `shim.pid` leaves that directory empty, as a crash there
-  always did.
+  The shim now sets a parent-death signal (SIGKILL) right after the fork
+  and exits at once if its parent is already gone. Once its run directory
+  exists, it clears the signal, checks its parent again (and exits without
+  publishing anything if the CLI is gone), and only then publishes
+  `shim.pid`, from which point `kiln ls` lists the run and `kiln gc`
+  collects it. So a shim never lives on unfindable, and a findable one never
+  dies with its CLI. A create killed between the run directory's `mkdir`
+  and the clear leaves that directory empty, as a crash there always did;
+  one killed between the check and `shim.pid` leaves a stale create that
+  `kiln ls` lists and `kiln gc` collects.
 
 - Report a persistent create's PID 1 setup error to the caller: PID 1 printed
   it to the shim's stderr, which is `/dev/null`, so `kiln create` said only

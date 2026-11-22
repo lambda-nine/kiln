@@ -386,8 +386,14 @@ pub(crate) fn create_in(
             // now would leave a shim that publishes a sandbox later. The
             // signal covers a death from here on; `getppid` covers one
             // before it (the shim has been reparented). prctl, getppid and
-            // _exit are async-signal-safe. `create_owned_run_dir` clears the
-            // signal once the identity is published.
+            // _exit are async-signal-safe. `create_owned_run_dir` hands the
+            // shim over to the run's identity: it clears the signal first,
+            // then checks `parent` again (one that died while the signal was
+            // armed or just after the clear: exit, publishing nothing), and
+            // only then publishes `shim.pid`. So the shim never lives on
+            // unfindable, and never dies with its CLI once findable.
+            #[cfg(test)]
+            container::at_handoff(container::Handoff::BeforeDeathSignal);
             // SAFETY: prctl with integer arguments, getppid and _exit.
             unsafe {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0 as libc::c_ulong,
@@ -398,7 +404,7 @@ pub(crate) fn create_in(
             drop(ready_rx);
             let _ = setsid();
             redirect_stdio();
-            let code = match container::supervise_persistent(cfg, &id, &ready_tx, from_checkpoint) {
+            let code = match container::supervise_persistent(cfg, &id, &ready_tx, parent, from_checkpoint) {
                 Ok(()) => 0,
                 Err(e) => {
                     // Read only before readiness; afterwards the CLI is gone
@@ -2405,33 +2411,174 @@ mod tests {
         assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Failed(None));
     }
 
-    /// The environment variable that lets
-    /// `child_a_shim_dies_with_a_create_killed_before_its_run_directory` run.
-    const SHIM_DEATH_CHILD: &str = "KILN_TEST_SHIM_DEATH";
-    /// The pipe `hold_before_run_dir` reports on, in the create's process.
+    /// The environment variable naming the `container::Handoff` point at
+    /// which `child_kill_the_create_at_a_handoff_point` holds the shim.
+    const HANDOFF_CHILD: &str = "KILN_TEST_HANDOFF";
+    /// In the create's process and so in its shim: the pipe
+    /// `hold_at_handoff` reports on, the pipe it waits on to be released,
+    /// and the point it holds the shim at.
     static HOLD_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static RELEASE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static HOLD_AT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    /// What `hold_at_handoff` reports once the shim has outlived its create.
+    const ALIVE: u8 = b'A';
+    /// Every `container::Handoff` point, in the order the shim passes them.
+    const HANDOFFS: [container::Handoff; 6] = {
+        use container::Handoff::*;
+        [BeforeDeathSignal, BeforeRunDir, BeforeClear, AfterClear, BeforeIdentity, AfterIdentity]
+    };
 
     /// A shim whose `kiln create` is killed before the shim makes its run
     /// directory dies with it (its parent-death signal), and no run
-    /// directory appears. Root only: the shim's preflight uses the system's
-    /// `alpine` image and kiln's runs root. In a child process running only
-    /// the test below, so its forks copy no other test's threads.
+    /// directory appears. This and the tests below are root only: the
+    /// shim's preflight uses the system's `alpine` image and kiln's runs
+    /// root. Each runs `child_kill_the_create_at_a_handoff_point` in a child
+    /// process running only it, so its forks copy no other test's threads.
     #[test]
     fn a_shim_dies_with_a_create_killed_before_its_run_directory() {
+        kill_the_create_in_a_child_process(container::Handoff::BeforeRunDir);
+    }
+
+    /// (a) Killed after the run directory but before the shim clears its
+    /// parent-death signal: the shim dies with it, and the run never gets
+    /// an identity (its empty directory is the one crash residue).
+    #[test]
+    fn a_shim_dies_with_a_create_killed_before_the_clear() {
+        kill_the_create_in_a_child_process(container::Handoff::BeforeClear);
+    }
+
+    /// (b) Killed after the clear but before the parent check: the shim
+    /// survives, sees it was reparented, publishes nothing and removes its
+    /// run directory.
+    #[test]
+    fn a_shim_whose_create_dies_after_the_clear_publishes_nothing() {
+        kill_the_create_in_a_child_process(container::Handoff::AfterClear);
+    }
+
+    /// (b) Killed after the parent check but before publication: the shim
+    /// survives and publishes, so `kiln ls` lists it live; once it dies,
+    /// `kiln gc` collects it.
+    #[test]
+    fn a_shim_whose_create_dies_after_the_check_is_findable_and_collected() {
+        kill_the_create_in_a_child_process(container::Handoff::BeforeIdentity);
+    }
+
+    /// (c) Killed once `shim.pid` is durable: the findable shim survives,
+    /// `kiln ls` lists it live, and it goes on to tear its run down itself
+    /// when it can't report readiness.
+    #[test]
+    fn a_findable_shim_survives_its_create() {
+        kill_the_create_in_a_child_process(container::Handoff::AfterIdentity);
+    }
+
+    /// Killed between the fork and the shim's `PR_SET_PDEATHSIG`, so no
+    /// signal ever comes: the child arm's `getppid` check makes it exit
+    /// before it reaches its run directory.
+    #[test]
+    fn a_shim_whose_create_died_before_its_death_signal_exits_at_once() {
+        kill_the_create_in_a_child_process(container::Handoff::BeforeDeathSignal);
+    }
+
+    fn kill_the_create_in_a_child_process(point: container::Handoff) {
         if unsafe { libc::geteuid() } != 0 { eprintln!("skipped: needs root, kiln's runs root and the alpine image"); return; }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "persistent::tests::child_a_shim_dies_with_a_create_killed_before_its_run_directory",
+            .args(["--exact", "persistent::tests::child_kill_the_create_at_a_handoff_point",
                 "--ignored", "--nocapture", "--test-threads=1"])
-            .env(SHIM_DEATH_CHILD, "1")
+            .env(HANDOFF_CHILD, format!("{point:?}"))
             .output().unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success() && text.contains("1 passed"), "{text}");
+        eprintln!("{}", text.lines().filter(|l| l.starts_with("handoff ")).collect::<Vec<_>>().join("\n"));
     }
 
     #[test]
-    #[ignore = "run in a child process by a_shim_dies_with_a_create_killed_before_its_run_directory"]
-    fn child_a_shim_dies_with_a_create_killed_before_its_run_directory() {
-        if std::env::var_os(SHIM_DEATH_CHILD).is_none() { return; }
+    #[ignore = "run in a child process by the handoff tests above"]
+    fn child_kill_the_create_at_a_handoff_point() {
+        use container::Handoff::*;
+        use nix::sys::signal::Signal::SIGKILL;
+        use nix::sys::wait::WaitStatus::{Exited, Signaled};
+        let Some(name) = std::env::var_os(HANDOFF_CHILD) else { return };
+        let point = *HANDOFFS.iter().find(|p| std::ffi::OsString::from(format!("{p:?}")) == name).unwrap();
+        // The shim that outlives its create is listed and then killed (and
+        // so collected by `kiln gc`) only at the check-to-publication point.
+        let h = kill_the_create_at(point, point == BeforeIdentity);
+        eprintln!("handoff {point:?}: {h:?}");
+        assert!(h.clean, "the test's cleanup left {}", h.run.display());
+        assert!(!h.timed_out, "the shim neither ended nor reported in time");
+        // Never a findable shim killed by its CLI's death.
+        if (h.left == Left::Identity || h.had_identity.contains(&true)) && !h.killed_by_test {
+            assert!(!matches!(h.status, Some(Signaled(_, SIGKILL, _))), "a findable shim died with its create");
+        }
+        match point {
+            BeforeDeathSignal | AfterClear => {
+                assert!(h.alive, "the shim did not outlive its create");
+                assert!(h.reached.is_empty(), "the orphaned shim went on to {:?}", h.reached);
+                assert!(matches!(h.status, Some(Exited(_, 1))), "{:?}", h.status);
+                assert_eq!(h.left, Left::Absent);
+            }
+            BeforeRunDir | BeforeClear => {
+                assert!(!h.alive, "the shim outlived its create");
+                assert!(h.reached.is_empty());
+                assert!(matches!(h.status, Some(Signaled(_, SIGKILL, _))), "{:?}", h.status);
+                assert_eq!(h.left, if point == BeforeRunDir { Left::Absent } else { Left::Empty });
+            }
+            BeforeIdentity => {
+                assert!(h.alive, "the shim did not outlive its create");
+                assert_eq!(h.reached, [AfterIdentity]);
+                assert_eq!(h.had_identity, [false, true]);
+                assert_eq!(h.listed_live, [false, true], "`kiln ls` did not list the published shim live");
+                assert_eq!(h.left, Left::Identity);
+                assert_eq!(h.gc.as_deref(), Some("ok"), "`kiln gc` did not collect it");
+            }
+            AfterIdentity => {
+                assert!(h.alive, "the findable shim died with its create");
+                assert!(h.reached.is_empty());
+                assert_eq!(h.had_identity, [true]);
+                assert_eq!(h.listed_live, [true], "`kiln ls` did not list the surviving shim live");
+                assert!(matches!(h.status, Some(Exited(..))), "{:?}", h.status);
+                assert_eq!(h.left, Left::Absent);
+            }
+        }
+    }
+
+    /// What became of a shim whose create was killed at a handoff point.
+    #[derive(Debug)]
+    struct Handed {
+        run: PathBuf,
+        /// The shim was still alive 100 ms after its create died.
+        alive: bool,
+        /// The points the shim reported passing after that.
+        reached: Vec<container::Handoff>,
+        /// At each point the test held the shim (once it had outlived its
+        /// create, and after its identity): whether `shim.pid` existed, and
+        /// whether `kiln ls` listed the run with this shim live.
+        had_identity: Vec<bool>,
+        listed_live: Vec<bool>,
+        killed_by_test: bool,
+        timed_out: bool,
+        /// How the shim ended (`None`: it never did).
+        status: Option<nix::sys::wait::WaitStatus>,
+        left: Left,
+        /// `kiln gc ID` when the shim left an identity: `ok` or its error.
+        gc: Option<String>,
+        /// The run directory is gone after the test's cleanup.
+        clean: bool,
+    }
+
+    /// A run directory once its shim has ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Left { Absent, Empty, Identity }
+
+    /// Runs a real persistent create (alpine, no network) in a forked
+    /// "CLI", holds its shim at `point`, kills the CLI there, and follows
+    /// the shim to its end. With `kill_when_findable`, the test kills the
+    /// shim once it has published `shim.pid` (a stale create), so that
+    /// `kiln gc` has a run to collect. Always cleans up the run by its ID.
+    fn kill_the_create_at(point: container::Handoff, kill_when_findable: bool) -> Handed {
+        use nix::sys::signal::{Signal::SIGKILL, kill};
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        // The orphaned shim is reparented to this process, which can wait for it.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
         let cfg = Config {
             limits: crate::cgroup::Limits { memory: Some(64 << 20), cpus: Some(1.0), pids: Some(16) },
             disk: Some(64 << 20),
@@ -2440,62 +2587,151 @@ mod tests {
             writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,
         };
         let id = container::new_id();
-        let (rx, tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let run = container::run_dir(&id);
+        let (report_rx, report_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        let (release_rx, release_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
         // SAFETY: this process runs only this test, and the child is the
         // create: it runs `create_in` as the CLI would, then exits.
-        match unsafe { fork() }.unwrap() {
+        let create = match unsafe { fork() }.unwrap() {
             ForkResult::Child => {
-                drop(rx);
-                HOLD_FD.store(tx.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
-                let _ = container::BEFORE_RUN_DIR.set(hold_before_run_dir);
+                drop(report_rx);
+                drop(release_tx);
+                HOLD_FD.store(report_tx.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+                RELEASE_FD.store(release_rx.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+                HOLD_AT.store(point as u8, std::sync::atomic::Ordering::Relaxed);
+                let _ = container::AT_HANDOFF.set(hold_at_handoff);
                 if let Err(e) = create_in(&crate::image::Roots::system(), &cfg, None, || id.clone()) {
                     eprintln!("create: {e:#}");
                 }
                 unsafe { libc::_exit(0) }
             }
-            ForkResult::Parent { child: create } => {
-                drop(tx);
-                let mut pid = [0u8; 4];
-                let got = read_full(&rx, &mut pid).unwrap();
-                if got != 4 {
-                    let _ = nix::sys::wait::waitpid(create, None);
-                    panic!("the shim never reached its run directory (see the create's error above)");
-                }
-                let shim = i32::from_ne_bytes(pid);
-                nix::sys::signal::kill(create, nix::sys::signal::Signal::SIGKILL).unwrap();
-                nix::sys::wait::waitpid(create, None).unwrap();
-                // End of file once the shim is gone; it says "alive" first if it outlived the create.
-                let mut said = Vec::new();
-                fs::File::from(rx).read_to_end(&mut said).unwrap();
-                let run = container::run_dir(&id);
-                assert!(said.is_empty(), "the shim {shim} outlived its create: {:?}", String::from_utf8_lossy(&said));
-                assert!(!run.exists(), "a run directory appeared: {}", run.display());
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    let stat = fs::read_to_string(format!("/proc/{shim}/stat")).unwrap_or_default();
-                    let state = stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next());
-                    if state.is_none_or(|s| s == 'Z') { break; }
-                    assert!(Instant::now() < deadline, "the shim {shim} is still running: {stat}");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                eprintln!("shim {shim} died with its create; no run directory {}", run.display());
+            ForkResult::Parent { child } => child,
+        };
+        drop(report_tx);
+        drop(release_rx);
+        let mut pid = [0u8; 4];
+        if read_full(&report_rx, &mut pid).unwrap() != 4 {
+            let _ = waitpid(create, None);
+            panic!("the shim never reached {point:?} (see the create's error above)");
+        }
+        let shim = nix::unistd::Pid::from_raw(i32::from_ne_bytes(pid));
+        kill(create, SIGKILL).unwrap();
+        waitpid(create, None).unwrap();
+
+        let mut h = Handed { run: run.clone(), alive: false, reached: Vec::new(), had_identity: Vec::new(),
+            listed_live: Vec::new(), killed_by_test: false, timed_out: false, status: None, left: Left::Absent,
+            gc: None, clean: false };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let byte = match report_byte(&report_rx, deadline) {
+                Report::Byte(b) => b,
+                Report::Eof => break,
+                Report::Timeout => { h.timed_out = true; break }
+            };
+            let stop = if byte == ALIVE {
+                h.alive = true;
+                true
+            } else {
+                let reached = HANDOFFS[byte as usize];
+                h.reached.push(reached);
+                reached == container::Handoff::AfterIdentity
+            };
+            if !stop { continue }
+            let identity = run.join("shim.pid").exists();
+            h.had_identity.push(identity);
+            h.listed_live.push(list_records(Path::new(RUNS_ROOT)).unwrap_or_default().iter()
+                .any(|(listed, live, pid)| *listed == id && *live && pid.trim() == shim.to_string()));
+            if identity && kill_when_findable {
+                kill(shim, SIGKILL).unwrap();
+                h.killed_by_test = true;
+            } else {
+                nix::unistd::write(&release_tx, b"1").unwrap();
             }
+        }
+        drop(release_tx);
+        while Instant::now() < deadline + Duration::from_secs(30) {
+            match waitpid(shim, Some(WaitPidFlag::WNOHANG)).unwrap() {
+                WaitStatus::StillAlive => std::thread::sleep(Duration::from_millis(20)),
+                status => { h.status = Some(status); break }
+            }
+        }
+        if h.status.is_none() {
+            h.timed_out = true;
+            let _ = kill(shim, SIGKILL);
+            let _ = waitpid(shim, None);
+        }
+        // The sandbox's PID 1, if any, ends with its shim; reap what came here.
+        while matches!(waitpid(None::<nix::unistd::Pid>, Some(WaitPidFlag::WNOHANG)), Ok(s) if s != WaitStatus::StillAlive) {}
+
+        h.left = if run.join("shim.pid").exists() { Left::Identity }
+            else if run.exists() { Left::Empty } else { Left::Absent };
+        match h.left {
+            Left::Identity => h.gc = Some(match gc(std::slice::from_ref(&id)) {
+                Ok(()) => "ok".into(),
+                Err(e) => format!("{e:#}"),
+            }),
+            Left::Empty => { let _ = container::remove_run_dir(&run); }
+            Left::Absent => {}
+        }
+        h.clean = !run.exists();
+        h
+    }
+
+    enum Report { Byte(u8), Eof, Timeout }
+
+    /// One byte the held shim reports, waiting until `deadline`.
+    fn report_byte(fd: &OwnedFd, deadline: Instant) -> Report {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Report::Timeout }
+            let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one pollfd that lives across the call.
+            match unsafe { libc::poll(&mut poll, 1, left.as_millis().min(1000) as libc::c_int) } {
+                0 => continue,
+                n if n < 0 => { assert_eq!(Errno::last(), Errno::EINTR); continue }
+                _ => {}
+            }
+            let mut byte = [0u8];
+            return match read(fd, &mut byte) {
+                Ok(0) => Report::Eof,
+                Ok(_) => Report::Byte(byte[0]),
+                Err(Errno::EINTR) => continue,
+                Err(e) => panic!("read the shim's report: {e}"),
+            };
         }
     }
 
-    /// `container::BEFORE_RUN_DIR` for the test above, in the shim: reports
-    /// its PID, waits 3 s for the create to be killed (and, with its
-    /// parent-death signal, itself), and if still alive says so and exits
-    /// without making the run directory.
-    fn hold_before_run_dir() {
-        let fd = HOLD_FD.load(std::sync::atomic::Ordering::Relaxed);
-        let pid = std::process::id() as i32;
-        // SAFETY: writes of local buffers to the test's pipe, then _exit.
-        unsafe {
-            libc::write(fd, pid.to_ne_bytes().as_ptr().cast(), 4);
-            std::thread::sleep(Duration::from_secs(3));
-            libc::write(fd, b"alive".as_ptr().cast(), 5);
-            libc::_exit(0);
+    /// `container::AT_HANDOFF` for the tests above, in the shim. At
+    /// `HOLD_AT` it reports its PID, waits up to 10 s for its create to be
+    /// killed (and, with the parent-death signal still set, itself), then
+    /// 100 ms more for a signal to land; if still alive it says so and
+    /// waits to be released. At each later point it reports the point, and
+    /// after the identity it waits to be released again.
+    fn hold_at_handoff(point: container::Handoff) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let at = HOLD_AT.load(Relaxed);
+        if (point as u8) < at { return }
+        let report = HOLD_FD.load(Relaxed);
+        let release = || {
+            let mut byte = 0u8;
+            // SAFETY: a one-byte read into a local; end of file releases too.
+            unsafe { libc::read(RELEASE_FD.load(Relaxed), (&raw mut byte).cast(), 1) };
+        };
+        // SAFETY: writes of local buffers to the test's pipe.
+        if point as u8 == at {
+            let pid = std::process::id() as i32;
+            unsafe { libc::write(report, pid.to_ne_bytes().as_ptr().cast(), 4) };
+            let parent = nix::unistd::getppid();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while nix::unistd::getppid() == parent && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::write(report, [ALIVE].as_ptr().cast(), 1) };
+            release();
+        } else {
+            unsafe { libc::write(report, [point as u8].as_ptr().cast(), 1) };
+            if point == container::Handoff::AfterIdentity { release() }
         }
     }
 

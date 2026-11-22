@@ -96,8 +96,10 @@ pub fn run(cfg: &Config) -> Result<i32> {
 
 /// Runs the long-lived init for a persistent sandbox. This function is called
 /// by its detached host shim, which stays alive to own cleanup resources.
-pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Option<checkpoint::capture::Fork>)
-    -> Result<()> {
+/// `parent` is `kiln create`'s PID, captured before the fork
+/// (`create_owned_run_dir` checks it).
+pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, parent: Pid,
+    fork: Option<checkpoint::capture::Fork>) -> Result<()> {
     preflight(cfg, RunKind::Persistent)?;
     storage::prepare(&Path::new(KILN_ROOT).join("runs"))?;
     let run_dir = run_dir(id);
@@ -109,7 +111,7 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     };
     let pid = std::process::id();
     let start = process_start_time(pid)?;
-    let listener = create_owned_run_dir(&run_dir, pid, &start, || {
+    let listener = create_owned_run_dir(&run_dir, pid, &start, parent, || {
         prepare(cfg, &run_dir, &layers)?;
         if let Some(fork) = fork {
             // The upper is rebuilt before anything mounts it; the artifact's
@@ -127,42 +129,83 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     result.map(|_| ())
 }
 
-/// Creates a persistent run's directory and publishes this shim's identity
-/// in it at once, before its quota and everything else, then runs `setup`.
-/// From the identity on, `kiln ls` lists the directory and `kiln gc` removes
-/// it if this shim dies; and any error here removes it again, so a create
-/// that fails before its sandbox starts leaves nothing behind. Every removal
+/// Creates a persistent run's directory, hands the shim over from its
+/// `kiln create` to the run's identity, then runs `setup`. The invariant:
+/// never a live shim nobody can find, and never a findable shim killed by
+/// its CLI's death. Until here only `kiln create` (`parent`) knows of the
+/// shim, so it dies with it (`persistent::create_in` set its parent-death
+/// signal); once `shim.pid` is published, `kiln ls` lists the run and
+/// `kiln gc` collects it. The handoff, in this order:
+///
+/// 1. Clear the parent-death signal, before anything is published: a
+///    `SIGKILL` already generated can't be taken back, so no findable shim
+///    may still have it set.
+/// 2. Check that `parent` is still this shim's parent. If not, it died
+///    while the signal was armed or just after the clear: exit without
+///    publishing, removing the empty run directory.
+/// 3. Publish the identity (`shim.start`, then `shim.pid`, each synced).
+///    A parent death after the clear no longer kills the shim; one between
+///    the check and the end of publication leaves a run that becomes
+///    findable and lives on as a stale create, which `kiln ls` lists and
+///    `kiln gc` collects, as with every crash below.
+///
+/// Any error from here on (a failed publication or `setup`) removes the
+/// directory again, so a shim never runs unfindable and a create that fails
+/// before its sandbox starts leaves nothing behind. Every removal
 /// (`remove_run_dir`, here, at teardown and in `kiln gc`) takes the identity
 /// last, so one that fails leaves a run `kiln ls` lists and `kiln gc`
 /// retries. Only a crash between the `mkdir` and the identity leaves a
-/// directory without `shim.pid`. A directory that already existed is never
-/// touched.
-///
-/// The shim dies with `kiln create` until then (`persistent::create_in`
-/// sets its parent-death signal): before the identity, nothing else can
-/// find the run, so a shim that outlived a killed CLI would publish a
-/// sandbox nobody waits for or collects. With `shim.pid` published (synced,
-/// after `shim.start`), `kiln ls` lists the run and `kiln gc` collects it,
-/// so the signal is cleared there and a persistent run outlives its create.
-/// A create killed between the `mkdir` and the identity is such a crash: it
-/// leaves the empty directory, before any quota, cgroup or network exists.
-fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, setup: impl FnOnce() -> Result<T>) -> Result<T> {
+/// directory without `shim.pid`; a `kiln create` killed between the `mkdir`
+/// and the clear is one (it takes the shim with it), and leaves the empty
+/// directory, before any quota, cgroup or network exists. A directory that
+/// already existed is never touched.
+fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, parent: Pid,
+    setup: impl FnOnce() -> Result<T>) -> Result<T> {
     #[cfg(test)]
-    if let Some(hook) = BEFORE_RUN_DIR.get() { hook(); }
+    at_handoff(Handoff::BeforeRunDir);
     create_run_dir(run_dir)?;
-    let result = publish_shim_identity(run_dir, pid, start)
-        .and_then(|()| nix::sys::prctl::set_pdeathsig(None).context("clear the shim's parent-death signal"))
-        .and_then(|()| setup());
+    let result = hand_off(run_dir, pid, start, parent).and_then(|()| setup());
     if result.is_err() && let Err(e) = remove_run_dir(run_dir) {
         report(&format!("kiln: failed setup left {}: {e}; `kiln gc` removes it", run_dir.display()));
     }
     result
 }
 
-/// Called by `create_owned_run_dir` just before it makes the run directory,
-/// when set: a test-only window for killing `kiln create` there.
+/// Steps 1-3 of `create_owned_run_dir`'s handoff: clear the parent-death
+/// signal, check the parent, publish the identity.
+fn hand_off(run_dir: &Path, pid: u32, start: &str, parent: Pid) -> Result<()> {
+    #[cfg(test)]
+    at_handoff(Handoff::BeforeClear);
+    nix::sys::prctl::set_pdeathsig(None).context("clear the shim's parent-death signal")?;
+    #[cfg(test)]
+    at_handoff(Handoff::AfterClear);
+    ensure!(nix::unistd::getppid() == parent, "kiln create exited before the shim published its identity");
+    #[cfg(test)]
+    at_handoff(Handoff::BeforeIdentity);
+    publish_shim_identity(run_dir, pid, start)?;
+    #[cfg(test)]
+    at_handoff(Handoff::AfterIdentity);
+    Ok(())
+}
+
+/// The points of a persistent create at which a test holds its shim
+/// (`AT_HANDOFF`), in the order the shim passes them: in the fork's child
+/// arm before its parent-death signal is set, then in
+/// `create_owned_run_dir`. Test-only: release binaries have no hooks.
 #[cfg(test)]
-pub(crate) static BEFORE_RUN_DIR: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Handoff { BeforeDeathSignal, BeforeRunDir, BeforeClear, AfterClear, BeforeIdentity, AfterIdentity }
+
+/// Called with each `Handoff` point the shim reaches, when set: a test-only
+/// window for killing `kiln create` there.
+#[cfg(test)]
+pub(crate) static AT_HANDOFF: std::sync::OnceLock<fn(Handoff)> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn at_handoff(point: Handoff) {
+    if let Some(hook) = AT_HANDOFF.get() { hook(point); }
+}
 
 /// A run directory's identity, in the order `remove_run_dir` unlinks it:
 /// `shim.pid` first, so a concurrent `kiln ls` never finds `shim.pid`
@@ -1463,7 +1506,8 @@ mod tests {
     fn a_run_directory_has_its_identity_first_and_is_removed_on_failure() {
         let root = scratch_dir("owned-run");
         let run = root.join("run");
-        let error = create_owned_run_dir(&run, 1234, "5678", || -> Result<()> {
+        let parent = nix::unistd::getppid();
+        let error = create_owned_run_dir(&run, 1234, "5678", parent, || -> Result<()> {
             assert_eq!(fs::read_to_string(run.join("shim.pid")).unwrap(), "1234");
             assert_eq!(fs::read_to_string(run.join("shim.start")).unwrap(), "5678");
             fs::create_dir(run.join("upper")).unwrap();
@@ -1472,14 +1516,31 @@ mod tests {
         assert_eq!(error.to_string(), "prepare failed");
         assert!(!run.exists(), "a failed setup left its run directory");
 
-        let value = create_owned_run_dir(&run, 1234, "5678", || Ok(7)).unwrap();
+        let value = create_owned_run_dir(&run, 1234, "5678", parent, || Ok(7)).unwrap();
         assert_eq!(value, 7);
         assert!(run.join("shim.pid").exists());
         // A collision fails before setup and leaves the other directory alone.
         let ran = std::cell::Cell::new(false);
-        assert!(create_owned_run_dir(&run, 99, "1", || { ran.set(true); Ok(()) }).is_err());
+        assert!(create_owned_run_dir(&run, 99, "1", parent, || { ran.set(true); Ok(()) }).is_err());
         assert!(!ran.get());
         assert_eq!(fs::read_to_string(run.join("shim.pid")).unwrap(), "1234");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A shim whose `kiln create` is no longer its parent once the
+    /// parent-death signal is cleared publishes nothing, runs no setup and
+    /// removes the empty run directory it made (handoff step 2).
+    #[test]
+    fn a_shim_whose_create_is_gone_publishes_no_identity() {
+        let root = scratch_dir("orphaned-run");
+        let run = root.join("run");
+        let ran = std::cell::Cell::new(false);
+        // This process is never its own parent: the create is gone.
+        let error = create_owned_run_dir(&run, 1234, "5678", nix::unistd::getpid(), || { ran.set(true); Ok(()) })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "kiln create exited before the shim published its identity");
+        assert!(!ran.get(), "setup ran for a shim whose create is gone");
+        assert!(!run.exists(), "the orphaned shim left its run directory");
         fs::remove_dir_all(root).unwrap();
     }
 
