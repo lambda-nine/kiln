@@ -113,7 +113,7 @@ done
 if sudo sh -c "ulimit -S -n 1024; exec \"$KILN\" gc \"$id\""; then
     echo 'FAIL: gc succeeded with the immutable file still there'; exit 1
 fi
-sudo test -f "$run/shim.pid"
+sudo test -f "$run/shim.pid" || { echo 'FAIL: the failed kiln gc removed the identity of a run it did not finish'; exit 1; }
 sudo test -f "$pinned" || { echo 'FAIL: the deep branch is gone before gc could remove it'; exit 1; }
 sudo chattr -i "$pinned"
 pinned=
