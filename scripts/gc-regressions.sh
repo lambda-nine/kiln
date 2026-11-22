@@ -117,7 +117,8 @@ sudo test -f "$run/shim.pid"
 sudo test -f "$pinned" || { echo 'FAIL: the deep branch is gone before gc could remove it'; exit 1; }
 sudo chattr -i "$pinned"
 pinned=
-sudo sh -c "ulimit -S -n 1024; exec \"$KILN\" gc \"$id\""
+sudo sh -c "ulimit -S -n 1024; exec \"$KILN\" gc \"$id\"" ||
+    { echo 'FAIL: kiln gc did not remove the 1500-level tree under a soft descriptor limit of 1024'; exit 1; }
 sudo test ! -e "$run"
 sudo test ! -e "/sys/fs/cgroup/kiln/$id"
 id=
