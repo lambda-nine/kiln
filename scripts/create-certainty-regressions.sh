@@ -231,16 +231,19 @@ try:
 
     # This passes the whole preflight and fails after new_id: the image has no
     # /dev for kiln's /dev tmpfs (container.rs setup_dev), which only the
-    # sandbox's own setup finds. Image content is the operator's, not the
-    # caller's, so the preflight doesn't look for it. Even when its cleanup
-    # succeeds, it must not claim preflight certainty.
+    # sandbox's own setup finds, in its PID 1. Image content is the
+    # operator's, not the caller's, so the preflight doesn't look for it.
+    # Even when its cleanup succeeds, it must not claim preflight certainty,
+    # and PID 1's own error reaches the caller (its stderr is /dev/null).
     result = subprocess.run([kiln, 'create', f'--image={empty.name}'], capture_output=True, timeout=15)
     if result.returncode == 0:
         subprocess.run([kiln, 'rm', result.stdout.decode().strip()], check=True, timeout=10)
-    assert result.returncode not in (0, 124), result
+    assert result.returncode == 1, result
     assert result.stdout == b'', result
+    assert b'sandbox shim failed during setup: mount /dev tmpfs: ENOENT' in result.stderr, result
     assert inventory() == before, 'runtime failure left resources behind'
-    print('PASS: post-preflight failure stays ambiguous (exit', result.returncode, ') and leaves no run directory')
+    print('PASS: post-preflight failure stays ambiguous (exit', result.returncode, '), leaves no run directory '
+          'and reports PID 1\'s error:', result.stderr.decode().strip().splitlines()[-1])
 finally:
     alias.unlink(missing_ok=True)
     if empty.exists():

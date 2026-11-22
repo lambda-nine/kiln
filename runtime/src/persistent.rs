@@ -234,6 +234,106 @@ pub fn before_allocation<T>(result: Result<T>) -> Result<T> {
     result.context(CreatePreflightFailure)
 }
 
+/// A persistent create's setup replies, on its two setup pipes: the shim's
+/// readiness pipe to `kiln create`, and PID 1's pipe to its shim. `READY`
+/// alone says the step succeeded. A failure is a frame: `SETUP_FAILED`, the
+/// reason's length in two little-endian bytes, then the reason, UTF-8 with
+/// no control characters and at most `MAX_SETUP_REASON` bytes, so the whole
+/// frame fits `PIPE_BUF` and one `write` delivers it. End of file with
+/// nothing read is a failure without a reason.
+pub(crate) const READY: u8 = b'1';
+const SETUP_FAILED: u8 = b'E';
+pub(crate) const MAX_SETUP_REASON: usize = 4096 - 3;
+
+/// What a setup pipe said.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SetupReply {
+    Ready,
+    /// The reason, when a well-formed failure frame carried a non-empty one.
+    Failed(Option<String>),
+}
+
+/// The failure frame for `reason`: control characters become spaces (the
+/// reason is one line of the caller's error) and it is cut to
+/// `MAX_SETUP_REASON` bytes at a character boundary.
+pub(crate) fn setup_failure_frame(reason: &str) -> Vec<u8> {
+    let clean: String = reason.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut end = clean.len().min(MAX_SETUP_REASON);
+    while !clean.is_char_boundary(end) { end -= 1; }
+    let mut frame = Vec::with_capacity(3 + end);
+    frame.push(SETUP_FAILED);
+    frame.extend_from_slice(&(end as u16).to_le_bytes());
+    frame.extend_from_slice(&clean.as_bytes()[..end]);
+    frame
+}
+
+/// Decodes what a setup pipe delivered (`read_setup_reply` reads exactly one
+/// reply). Anything but `READY` or a complete, in-bounds failure frame is a
+/// failure without a reason.
+pub(crate) fn decode_setup_reply(bytes: &[u8]) -> SetupReply {
+    match bytes {
+        [READY, ..] => SetupReply::Ready,
+        [SETUP_FAILED, lo, hi, reason @ ..] => {
+            let len = u16::from_le_bytes([*lo, *hi]) as usize;
+            if len > MAX_SETUP_REASON || reason.len() != len { return SetupReply::Failed(None); }
+            let text: String = String::from_utf8_lossy(reason).chars()
+                .map(|c| if c.is_control() { ' ' } else { c }).collect();
+            SetupReply::Failed(Some(text).filter(|t| !t.trim().is_empty()))
+        }
+        _ => SetupReply::Failed(None),
+    }
+}
+
+/// Sends `reason` as a failure frame, best effort: the reader may be gone.
+pub(crate) fn send_setup_failure(fd: &OwnedFd, reason: &str) {
+    let frame = setup_failure_frame(reason);
+    let mut sent = 0;
+    while sent < frame.len() {
+        match nix::unistd::write(fd, &frame[sent..]) {
+            Ok(0) => return,
+            Ok(n) => sent += n,
+            Err(Errno::EINTR) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Reads one setup reply, byte-exact: the one-byte `READY`, or a failure
+/// frame's header and then just its announced length, so nothing written
+/// after the reply is consumed (PID 1 may follow a `READY` with a failure
+/// frame for the next step).
+pub(crate) fn read_setup_reply(fd: &OwnedFd) -> nix::Result<SetupReply> {
+    let mut reply = vec![0u8; 1];
+    if read_full(fd, &mut reply)? == 1 && reply[0] == SETUP_FAILED {
+        let mut len = [0u8; 2];
+        let got = read_full(fd, &mut len)?;
+        reply.extend_from_slice(&len[..got]);
+        let len = u16::from_le_bytes(len) as usize;
+        if got == 2 && len <= MAX_SETUP_REASON {
+            let mut reason = vec![0u8; len];
+            let got = read_full(fd, &mut reason)?;
+            reply.extend_from_slice(&reason[..got]);
+        }
+    } else if reply[0] != READY {
+        reply.clear();
+    }
+    Ok(decode_setup_reply(&reply))
+}
+
+/// Fills `buf` from `fd` unless end of file comes first; returns how much it read.
+fn read_full(fd: &OwnedFd, buf: &mut [u8]) -> nix::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match read(fd, &mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(Errno::EINTR) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
+}
+
 /// `fork` is a checkpoint that passed the preflight; its upper is restored
 /// by the shim before the sandbox mounts it.
 pub fn create(cfg: &Config, from_checkpoint: Option<crate::checkpoint::capture::Fork>) -> Result<String> {
@@ -261,24 +361,40 @@ pub(crate) fn create_in(
     before_allocation(container::preflight_in(roots, cfg, container::RunKind::Persistent))?;
     let id = new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
+    let parent = nix::unistd::getpid();
     // SAFETY: the CLI is single-threaded here.
     match unsafe { fork() }.context("fork shim")? {
         ForkResult::Parent { child } => {
             drop(ready_tx);
             drop(from_checkpoint);
-            // "1" is readiness; a shim that fails during setup may write "E"
-            // and a one-line reason first (typed checkpoint reasons lead it).
-            let mut reply = [0u8; 1024];
-            let n = read(&ready_rx, &mut reply).context("wait for shim")?;
-            if n == 0 || reply[0] != b'1' {
-                let _ = nix::sys::wait::waitpid(child, None);
-                let why = if n > 1 && reply[0] == b'E' { String::from_utf8_lossy(&reply[1..n]).into_owned() } else { String::new() };
-                if why.is_empty() { bail!("sandbox shim failed during setup"); }
-                bail!("sandbox shim failed during setup: {why}");
+            // `READY`, or a failure frame whose reason (typed checkpoint
+            // reasons lead it) may come from the shim or its PID 1.
+            match read_setup_reply(&ready_rx).context("wait for shim")? {
+                SetupReply::Ready => Ok(id),
+                SetupReply::Failed(why) => {
+                    let _ = nix::sys::wait::waitpid(child, None);
+                    match why {
+                        Some(why) => bail!("sandbox shim failed during setup: {why}"),
+                        None => bail!("sandbox shim failed during setup"),
+                    }
+                }
             }
-            Ok(id)
         }
         ForkResult::Child => {
+            // Until its run directory has an identity, only `kiln create`
+            // knows of this shim, so it dies with it: otherwise a CLI killed
+            // now would leave a shim that publishes a sandbox later. The
+            // signal covers a death from here on; `getppid` covers one
+            // before it (the shim has been reparented). prctl, getppid and
+            // _exit are async-signal-safe. `create_owned_run_dir` clears the
+            // signal once the identity is published.
+            // SAFETY: prctl with integer arguments, getppid and _exit.
+            unsafe {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0 as libc::c_ulong,
+                    0 as libc::c_ulong, 0 as libc::c_ulong) != 0 || libc::getppid() != parent.as_raw() {
+                    libc::_exit(1);
+                }
+            }
             drop(ready_rx);
             let _ = setsid();
             redirect_stdio();
@@ -287,8 +403,7 @@ pub(crate) fn create_in(
                 Err(e) => {
                     // Read only before readiness; afterwards the CLI is gone
                     // and this write fails harmlessly.
-                    let why: String = format!("E{e:#}").chars().map(|c| if c.is_control() { ' ' } else { c }).take(1000).collect();
-                    let _ = nix::unistd::write(&ready_tx, why.as_bytes());
+                    send_setup_failure(&ready_tx, &format!("{e:#}"));
                     1
                 }
             };
@@ -2228,6 +2343,160 @@ mod tests {
         limit.rlim_cur = 64;
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
         finish_gc(&root.join("run"), Ok(()), Ok(())).unwrap();
+    }
+
+    /// A failure frame carries its reason byte for byte, with control
+    /// characters made spaces; `READY` and malformed replies decode as such.
+    #[test]
+    fn setup_failure_frames_round_trip() {
+        let frame = setup_failure_frame("layout_unsupported: mount /dev tmpfs:\nENOENT\tx");
+        assert_eq!(&frame[..3], [b'E', 46, 0]);
+        assert_eq!(decode_setup_reply(&frame),
+            SetupReply::Failed(Some("layout_unsupported: mount /dev tmpfs: ENOENT x".into())));
+        assert_eq!(decode_setup_reply(&[READY]), SetupReply::Ready);
+        assert_eq!(decode_setup_reply(&[]), SetupReply::Failed(None));
+        assert_eq!(decode_setup_reply(b"x"), SetupReply::Failed(None));
+        assert_eq!(decode_setup_reply(&setup_failure_frame("")), SetupReply::Failed(None));
+        // Short, long and over-limit frames carry no reason.
+        assert_eq!(decode_setup_reply(&frame[..frame.len() - 1]), SetupReply::Failed(None));
+        assert_eq!(decode_setup_reply(&[&frame[..], b"!"].concat()), SetupReply::Failed(None));
+        assert_eq!(decode_setup_reply(&[&[b'E', 0xfe, 0x0f][..], &[b'a'; 4094]].concat()), SetupReply::Failed(None));
+        assert_eq!(decode_setup_reply(&[b'E', 1, 0]), SetupReply::Failed(None));
+    }
+
+    /// A long reason is cut to `MAX_SETUP_REASON` bytes, never inside a
+    /// character, so the frame fits `PIPE_BUF`.
+    #[test]
+    fn a_long_setup_reason_is_cut_at_a_character_boundary() {
+        assert_eq!(3 + MAX_SETUP_REASON, libc::PIPE_BUF);
+        let ascii = "a".repeat(MAX_SETUP_REASON + 10);
+        let frame = setup_failure_frame(&ascii);
+        assert_eq!(frame.len(), 3 + MAX_SETUP_REASON);
+        assert_eq!(decode_setup_reply(&frame), SetupReply::Failed(Some(ascii[..MAX_SETUP_REASON].into())));
+        // "é" is two bytes: one byte of room left at the limit must not split it.
+        let reason = format!("{}é tail", "a".repeat(MAX_SETUP_REASON - 1));
+        let frame = setup_failure_frame(&reason);
+        assert_eq!(u16::from_le_bytes([frame[1], frame[2]]) as usize, MAX_SETUP_REASON - 1);
+        assert_eq!(decode_setup_reply(&frame), SetupReply::Failed(Some("a".repeat(MAX_SETUP_REASON - 1))));
+        // A three-byte character ending exactly at the limit is kept.
+        let reason = format!("{}€", "a".repeat(MAX_SETUP_REASON - 3));
+        let SetupReply::Failed(Some(text)) = decode_setup_reply(&setup_failure_frame(&reason)) else { panic!() };
+        assert_eq!(text, reason);
+    }
+
+    /// The reader takes exactly one reply off the pipe: a `READY` followed
+    /// by a failure frame is two replies (PID 1 sends both when its second
+    /// step fails), and end of file is a failure without a reason.
+    #[test]
+    fn a_setup_reply_is_read_exactly() {
+        let (rx, tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        nix::unistd::write(&tx, &[READY]).unwrap();
+        send_setup_failure(&tx, "seccomp: install filter");
+        nix::unistd::write(&tx, &[READY]).unwrap();
+        drop(tx);
+        assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Ready);
+        assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Failed(Some("seccomp: install filter".into())));
+        assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Ready);
+        assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Failed(None));
+        // A frame cut short by end of file carries no reason.
+        let (rx, tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        nix::unistd::write(&tx, &setup_failure_frame("cut short")[..6]).unwrap();
+        drop(tx);
+        assert_eq!(read_setup_reply(&rx).unwrap(), SetupReply::Failed(None));
+    }
+
+    /// The environment variable that lets
+    /// `child_a_shim_dies_with_a_create_killed_before_its_run_directory` run.
+    const SHIM_DEATH_CHILD: &str = "KILN_TEST_SHIM_DEATH";
+    /// The pipe `hold_before_run_dir` reports on, in the create's process.
+    static HOLD_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// A shim whose `kiln create` is killed before the shim makes its run
+    /// directory dies with it (its parent-death signal), and no run
+    /// directory appears. Root only: the shim's preflight uses the system's
+    /// `alpine` image and kiln's runs root. In a child process running only
+    /// the test below, so its forks copy no other test's threads.
+    #[test]
+    fn a_shim_dies_with_a_create_killed_before_its_run_directory() {
+        if unsafe { libc::geteuid() } != 0 { eprintln!("skipped: needs root, kiln's runs root and the alpine image"); return; }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "persistent::tests::child_a_shim_dies_with_a_create_killed_before_its_run_directory",
+                "--ignored", "--nocapture", "--test-threads=1"])
+            .env(SHIM_DEATH_CHILD, "1")
+            .output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by a_shim_dies_with_a_create_killed_before_its_run_directory"]
+    fn child_a_shim_dies_with_a_create_killed_before_its_run_directory() {
+        if std::env::var_os(SHIM_DEATH_CHILD).is_none() { return; }
+        let cfg = Config {
+            limits: crate::cgroup::Limits { memory: Some(64 << 20), cpus: Some(1.0), pids: Some(16) },
+            disk: Some(64 << 20),
+            net: crate::net::Plan::new("none", &[]).unwrap(),
+            hostname: "kiln".into(), image: "alpine".into(), keep: false, read_only: false,
+            writable: Vec::new(), stats: false, cmd: Vec::new(), fork: None,
+        };
+        let id = container::new_id();
+        let (rx, tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        // SAFETY: this process runs only this test, and the child is the
+        // create: it runs `create_in` as the CLI would, then exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                drop(rx);
+                HOLD_FD.store(tx.into_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+                let _ = container::BEFORE_RUN_DIR.set(hold_before_run_dir);
+                if let Err(e) = create_in(&crate::image::Roots::system(), &cfg, None, || id.clone()) {
+                    eprintln!("create: {e:#}");
+                }
+                unsafe { libc::_exit(0) }
+            }
+            ForkResult::Parent { child: create } => {
+                drop(tx);
+                let mut pid = [0u8; 4];
+                let got = read_full(&rx, &mut pid).unwrap();
+                if got != 4 {
+                    let _ = nix::sys::wait::waitpid(create, None);
+                    panic!("the shim never reached its run directory (see the create's error above)");
+                }
+                let shim = i32::from_ne_bytes(pid);
+                nix::sys::signal::kill(create, nix::sys::signal::Signal::SIGKILL).unwrap();
+                nix::sys::wait::waitpid(create, None).unwrap();
+                // End of file once the shim is gone; it says "alive" first if it outlived the create.
+                let mut said = Vec::new();
+                fs::File::from(rx).read_to_end(&mut said).unwrap();
+                let run = container::run_dir(&id);
+                assert!(said.is_empty(), "the shim {shim} outlived its create: {:?}", String::from_utf8_lossy(&said));
+                assert!(!run.exists(), "a run directory appeared: {}", run.display());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let stat = fs::read_to_string(format!("/proc/{shim}/stat")).unwrap_or_default();
+                    let state = stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next());
+                    if state.is_none_or(|s| s == 'Z') { break; }
+                    assert!(Instant::now() < deadline, "the shim {shim} is still running: {stat}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                eprintln!("shim {shim} died with its create; no run directory {}", run.display());
+            }
+        }
+    }
+
+    /// `container::BEFORE_RUN_DIR` for the test above, in the shim: reports
+    /// its PID, waits 3 s for the create to be killed (and, with its
+    /// parent-death signal, itself), and if still alive says so and exits
+    /// without making the run directory.
+    fn hold_before_run_dir() {
+        let fd = HOLD_FD.load(std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id() as i32;
+        // SAFETY: writes of local buffers to the test's pipe, then _exit.
+        unsafe {
+            libc::write(fd, pid.to_ne_bytes().as_ptr().cast(), 4);
+            std::thread::sleep(Duration::from_secs(3));
+            libc::write(fd, b"alive".as_ptr().cast(), 5);
+            libc::_exit(0);
+        }
     }
 
     #[test]

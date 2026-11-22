@@ -75,9 +75,9 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let run_dir = run_dir(&id);
     let layers = Layers {
         lower,
-        upper: run_dir.join("upper"),
-        work: run_dir.join("work"),
-        merged: run_dir.join("merged"),
+        upper: run_dir.join(UPPER),
+        work: run_dir.join(WORK),
+        merged: run_dir.join(MERGED),
     };
     create_run_dir(&run_dir)?;
 
@@ -103,9 +103,9 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     let run_dir = run_dir(id);
     let layers = Layers {
         lower: Path::new(KILN_ROOT).join("images").join(&cfg.image),
-        upper: run_dir.join("upper"),
-        work: run_dir.join("work"),
-        merged: run_dir.join("merged"),
+        upper: run_dir.join(UPPER),
+        work: run_dir.join(WORK),
+        merged: run_dir.join(MERGED),
     };
     let pid = std::process::id();
     let start = process_start_time(pid)?;
@@ -121,7 +121,7 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
     })?;
     let result = spawn_and_wait_mode(cfg, id, &layers, Some(listener), Some(ready));
     if let Err(e) = remove_run_dir(&run_dir) {
-        let retry = if run_dir.join(IDENTITY_PID).exists() { format!("; `kiln gc {id}` retries it") } else { String::new() };
+        let retry = if run_dir.join(SHIM_PID).exists() { format!("; `kiln gc {id}` retries it") } else { String::new() };
         report(&format!("kiln: sandbox {id}: teardown left {}: {e}{retry}", run_dir.display()));
     }
     result.map(|_| ())
@@ -137,21 +137,38 @@ pub fn supervise_persistent(cfg: &Config, id: &str, ready: &OwnedFd, fork: Optio
 /// retries. Only a crash between the `mkdir` and the identity leaves a
 /// directory without `shim.pid`. A directory that already existed is never
 /// touched.
+///
+/// The shim dies with `kiln create` until then (`persistent::create_in`
+/// sets its parent-death signal): before the identity, nothing else can
+/// find the run, so a shim that outlived a killed CLI would publish a
+/// sandbox nobody waits for or collects. With `shim.pid` published (synced,
+/// after `shim.start`), `kiln ls` lists the run and `kiln gc` collects it,
+/// so the signal is cleared there and a persistent run outlives its create.
+/// A create killed between the `mkdir` and the identity is such a crash: it
+/// leaves the empty directory, before any quota, cgroup or network exists.
 fn create_owned_run_dir<T>(run_dir: &Path, pid: u32, start: &str, setup: impl FnOnce() -> Result<T>) -> Result<T> {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_RUN_DIR.get() { hook(); }
     create_run_dir(run_dir)?;
-    let result = publish_shim_identity(run_dir, pid, start).and_then(|()| setup());
+    let result = publish_shim_identity(run_dir, pid, start)
+        .and_then(|()| nix::sys::prctl::set_pdeathsig(None).context("clear the shim's parent-death signal"))
+        .and_then(|()| setup());
     if result.is_err() && let Err(e) = remove_run_dir(run_dir) {
         report(&format!("kiln: failed setup left {}: {e}; `kiln gc` removes it", run_dir.display()));
     }
     result
 }
 
+/// Called by `create_owned_run_dir` just before it makes the run directory,
+/// when set: a test-only window for killing `kiln create` there.
+#[cfg(test)]
+pub(crate) static BEFORE_RUN_DIR: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 /// A run directory's identity, in the order `remove_run_dir` unlinks it:
 /// `shim.pid` first, so a concurrent `kiln ls` never finds `shim.pid`
-/// without `shim.start`.
+/// without `shim.start`. The same names as `SHIM_PID` and `SHIM_START`
+/// (`run_inode_allowances_match_the_run_entries` checks).
 const IDENTITY: [&CStr; 2] = [c"shim.pid", c"shim.start"];
-/// `IDENTITY[0]` as a path name.
-const IDENTITY_PID: &str = "shim.pid";
 
 /// Removes a run directory, for a one-shot run, a persistent shim's teardown
 /// and `kiln gc`. Everything but the image reference and the identity goes
@@ -259,13 +276,22 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// A persistent run's control socket and its PID 1's PID record: the run
-/// files only a persistent run has (`RUN_ENTRIES`).
+/// The names in a run directory (`RUN_DIR_ENTRIES`): a persistent run's
+/// identity, the overlay's directories, and a persistent run's control
+/// socket and PID 1's PID record. The image, policy and layout records are
+/// named by the modules that write them.
+const SHIM_PID: &str = "shim.pid";
+const SHIM_START: &str = "shim.start";
+const UPPER: &str = "upper";
+const WORK: &str = "work";
+/// overlayfs's own work directory, which the mount makes in `WORK`.
+const OVERLAY_WORK: &str = "work/work";
+const MERGED: &str = "merged";
 const CONTROL_SOCKET: &str = "control.sock";
 const INIT_PID: &str = "init.pid";
 
 /// Which kind of run a preflight decides for: the two leave different run
-/// files under the run's inode quota (`RUN_ENTRIES`).
+/// files under the run's inode quota (`RUN_DIR_ENTRIES`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunKind {
     /// `kiln run`.
@@ -274,27 +300,43 @@ pub enum RunKind {
     Persistent,
 }
 
-/// Every entry a run's own setup leaves under its project's inode quota
-/// besides the run directory itself (which takes the project too) and the
-/// sandbox's root, and whether only a persistent run has it: the overlay's
-/// `upper`, `work`, overlayfs's own `work/work` (made at mount) and `merged`;
-/// the `image`, `policy` and `layout` records; a persistent run's control
-/// socket and `init.pid`. A persistent run's identity files are published
-/// before the quota is set and stay outside it. A new run file goes here and
-/// into the allowances below, or `run_inode_allowances_match_the_run_entries`
-/// fails.
-pub(crate) const RUN_ENTRIES: [(&str, bool); 9] = [
-    ("upper", false), ("work", false), ("work/work", false), ("merged", false),
-    (image::REFERENCE_FILE, false), (checkpoint::POLICY_FILE, false), (overlay::LAYOUT_FILE, false),
-    (CONTROL_SOCKET, true), (INIT_PID, true),
+/// Where a run directory's entry counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Counted {
+    /// Outside the run's inode quota: a persistent run's identity, published
+    /// before the quota is set.
+    Outside,
+    /// Under the quota, in every run.
+    Always,
+    /// Under the quota, in a persistent run only.
+    Persistent,
+}
+
+/// Every name kiln makes in a run directory, the one list of the run's
+/// layout: the identity; the overlay's `upper`, `work`, overlayfs's own
+/// `work/work` (made at mount) and `merged`; the `image`, `policy` and
+/// `layout` records; a persistent run's control socket and `init.pid`.
+/// Besides these, the quota counts the run directory itself (which takes
+/// the project too); the sandbox's root is the caller's. A new run file
+/// goes here, and if it's under the quota into the allowances below, or
+/// kiln doesn't compile; `run_inode_allowances_match_the_run_entries` fails
+/// for a name joined onto a run directory anywhere in kiln's source that
+/// isn't here.
+pub(crate) const RUN_DIR_ENTRIES: [(&str, Counted); 11] = [
+    (SHIM_PID, Counted::Outside), (SHIM_START, Counted::Outside),
+    (UPPER, Counted::Always), (WORK, Counted::Always), (OVERLAY_WORK, Counted::Always), (MERGED, Counted::Always),
+    (image::REFERENCE_FILE, Counted::Always), (checkpoint::POLICY_FILE, Counted::Always),
+    (overlay::LAYOUT_FILE, Counted::Always),
+    (CONTROL_SOCKET, Counted::Persistent), (INIT_PID, Counted::Persistent),
 ];
 
 /// What the create preflight allows for a run's own files under its inode
 /// quota, exactly their measured peak and no margin (an allowance above it
 /// refuses sandboxes that fit, the adversarial review's H1): the run
-/// directory and `RUN_ENTRIES`. Measured on the VM (Linux 6.8, XFS,
-/// 2026-11-22): a persistent run holds 10 at rest and a one-shot run 8, and
-/// with a setup that doesn't count, the largest writable walk that still
+/// directory and its entries under the quota (`RUN_DIR_ENTRIES`). Measured
+/// on the VM (Linux 6.8, XFS, 2026-11-22): a persistent run holds 10 at
+/// rest and a one-shot run 8, and with a setup that doesn't count, the
+/// largest writable walk that still
 /// creates at `--disk=64M` (4096 inodes) makes 4086 directories for a
 /// persistent run and 4088 for a one-shot run: a record's temporary and
 /// overlayfs's mount-time probes are gone before the walk's last mkdir.
@@ -302,16 +344,21 @@ pub(crate) const RUN_ENTRIES: [(&str, bool); 9] = [
 pub(crate) const PERSISTENT_RUN_INODES: u64 = 10;
 pub(crate) const ONESHOT_RUN_INODES: u64 = 8;
 
-/// The allowances are the run directory and its `RUN_ENTRIES`, or kiln
-/// doesn't compile (`RunKind::run_inodes` evaluates this).
+/// The allowances are the run directory and its entries under the quota
+/// in `RUN_DIR_ENTRIES`, or kiln doesn't compile (`RunKind::run_inodes`
+/// evaluates this).
 const ALLOWANCES_COUNT_RUN_ENTRIES: () = {
-    let (mut oneshot, mut i) = (0, 0);
-    while i < RUN_ENTRIES.len() {
-        if !RUN_ENTRIES[i].1 { oneshot += 1; }
+    let (mut always, mut persistent, mut i) = (0, 0, 0);
+    while i < RUN_DIR_ENTRIES.len() {
+        match RUN_DIR_ENTRIES[i].1 {
+            Counted::Outside => {}
+            Counted::Always => always += 1,
+            Counted::Persistent => persistent += 1,
+        }
         i += 1;
     }
-    assert!(1 + oneshot == ONESHOT_RUN_INODES && 1 + RUN_ENTRIES.len() as u64 == PERSISTENT_RUN_INODES,
-        "the run inode allowances must count the run directory and RUN_ENTRIES");
+    assert!(1 + always == ONESHOT_RUN_INODES && 1 + always + persistent == PERSISTENT_RUN_INODES,
+        "the run inode allowances must count the run directory and its entries under the quota in RUN_DIR_ENTRIES");
 };
 
 impl RunKind {
@@ -456,11 +503,11 @@ fn publish_shim_identity_with<F>(run_dir: &Path, pid: u32, start: &str,
 where
     F: FnOnce(),
 {
-    atomic_publish_with(&run_dir.join("shim.start"), start.as_bytes(), || {})?;
+    atomic_publish_with(&run_dir.join(SHIM_START), start.as_bytes(), || {})?;
     // shim.pid is the completed identity marker. Each file is renamed from a
     // fully written, synced temporary file, and the marker is published last.
     atomic_publish_with(
-        &run_dir.join("shim.pid"),
+        &run_dir.join(SHIM_PID),
         pid.to_string().as_bytes(),
         before_pid_publish,
     )
@@ -620,6 +667,10 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
             // buffered output belong to the parent.
             let code = init(cfg, layers, ip, &to_child_rx, &to_parent_tx, listener.as_ref(), exec_scope.as_ref())
                 .unwrap_or_else(|e| {
+                    // A persistent shim's stderr is /dev/null, so this PID 1
+                    // also sends its reason to the shim, which passes it on
+                    // to `kiln create`. A one-shot run's goes to its terminal.
+                    if persistent { crate::persistent::send_setup_failure(&to_parent_tx, &format!("{e:#}")); }
                     eprintln!("kiln: {e:#}");
                     1
                 });
@@ -647,20 +698,19 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
 
         // The child does its mounts as real root, then creates its user
         // namespace and waits for us to write its ID maps.
-        let mut buf = [0u8; 1];
-        if read(&to_parent_rx, &mut buf).context("wait for child")? == 0 {
+        if !child_step(&to_parent_rx, "wait for child")? {
             return Ok(()); // Child failed and printed why; wait_for collects it.
         }
         trace::mark("host: wait for child's mounts");
         userns::write_maps(pid)?;
         write(&to_child_tx, b"1").context("signal child")?;
         trace::mark("host: ID maps");
-        if persistent && read(&to_parent_rx, &mut buf).context("wait for persistent init")? == 0 {
+        if persistent && !child_step(&to_parent_rx, "wait for persistent init")? {
             return Ok(());
         }
         if let Some(ready) = ready {
             fs::write(run_dir(id).join(INIT_PID), pid.to_string())?;
-            write(ready, b"1").context("signal create")?;
+            write(ready, &[crate::persistent::READY]).context("signal create")?;
         }
         Ok(())
     })();
@@ -689,6 +739,18 @@ fn spawn_and_wait_mode(cfg: &Config, id: &str, layers: &Layers,
     drop(cgroup);
     trace::mark("host: cgroup cleanup");
     Ok(code)
+}
+
+/// Reads PID 1's reply to a setup step: true when it succeeded, false when
+/// it failed and printed why (end of file), and the error a persistent
+/// PID 1 sent (its stderr is /dev/null) as this setup's own, verbatim, so a
+/// typed reason still leads it (`what` names only a failed read).
+fn child_step(to_parent_rx: &OwnedFd, what: &'static str) -> Result<bool> {
+    match crate::persistent::read_setup_reply(to_parent_rx).context(what)? {
+        crate::persistent::SetupReply::Ready => Ok(true),
+        crate::persistent::SetupReply::Failed(None) => Ok(false),
+        crate::persistent::SetupReply::Failed(Some(why)) => Err(anyhow::anyhow!(why)),
+    }
 }
 
 /// Waits for the sandbox to exit, passing `init::FORWARDED` signals on to its
@@ -1204,36 +1266,146 @@ mod tests {
     }
 
     /// The preflight's allowances are exactly the run directory and the
-    /// run's entries in `RUN_ENTRIES` for each kind, and every name the
-    /// run's setup in this file joins onto a run directory is one of those
-    /// entries or the identity (outside the quota). A new run file fails
-    /// here until it's in `RUN_ENTRIES` and the allowances; the VM's
-    /// `create-certainty-regressions.sh` pins the physical boundaries.
+    /// run's entries under the quota in `RUN_DIR_ENTRIES` for each kind, and
+    /// every name joined onto a run directory in kiln's non-test source, in
+    /// every file under `src/`, is in `RUN_DIR_ENTRIES`: a string literal
+    /// must be one of its names, a constant one of the names' constants, and
+    /// a computed name one of `COMPUTED`'s reviewed sites. A run directory
+    /// here is a receiver named `run_dir` or `run`, or a call of `run_dir`.
+    /// So a run file a module adds through one fails here until it's listed
+    /// (and, under the quota, counted by the allowances); one built another
+    /// way is caught by the VM's `create-certainty-regressions.sh`, which
+    /// pins the physical boundaries.
     #[test]
     fn run_inode_allowances_match_the_run_entries() {
-        let oneshot = RUN_ENTRIES.iter().filter(|(_, persistent_only)| !persistent_only).count() as u64;
-        assert_eq!(1 + oneshot, ONESHOT_RUN_INODES);
-        assert_eq!(1 + RUN_ENTRIES.len() as u64, PERSISTENT_RUN_INODES);
+        let count = |counted: Counted| RUN_DIR_ENTRIES.iter().filter(|(_, c)| *c == counted).count() as u64;
+        assert_eq!(1 + count(Counted::Always), ONESHOT_RUN_INODES);
+        assert_eq!(1 + count(Counted::Always) + count(Counted::Persistent), PERSISTENT_RUN_INODES);
         assert_eq!((ONESHOT_RUN_INODES, PERSISTENT_RUN_INODES), (8, 10));
         assert_eq!((RunKind::OneShot.run_inodes(), RunKind::Persistent.run_inodes()), (8, 10));
+        assert_eq!(count(Counted::Outside), 2);
+        assert_eq!(IDENTITY.map(|name| name.to_str().unwrap()), [SHIM_PID, SHIM_START]);
+        let names: Vec<&str> = RUN_DIR_ENTRIES.iter().map(|(name, _)| *name).collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "a name is listed twice: {names:?}");
 
-        let source = include_str!("container.rs");
-        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
-        let mut joined = std::collections::BTreeSet::new();
-        for (at, _) in code.match_indices(".join(") {
-            let before = &code[..at];
-            if before.ends_with("run_dir") || before.ends_with("run_dir(id)") {
-                let rest = &code[at + ".join(".len()..];
-                joined.insert(rest[..rest.find(')').unwrap()].trim_start_matches('&'));
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let joined = run_dir_joins(&src);
+        let files: std::collections::BTreeSet<&str> = joined.iter().map(|(file, _)| file.as_str()).collect();
+        for file in ["container.rs", "image.rs", "overlay.rs", "persistent.rs", "net.rs", "checkpoint/mod.rs",
+            "checkpoint/capture.rs"] {
+            assert!(files.contains(file), "the scan found no run directory join in {file}: {files:?}");
+        }
+        let unlisted = check_run_dir_joins(&joined, &names);
+        assert!(unlisted.is_empty(), "joined onto a run directory but not in RUN_DIR_ENTRIES: {unlisted:?}; list \
+            it there (and in the allowances if it's under the quota)");
+        // The list isn't stale: every name kiln makes itself is joined somewhere.
+        for name in names.iter().filter(|name| **name != OVERLAY_WORK) {
+            assert!(joined.iter().any(|(_, arg)| resolve_run_entry_arg(arg) == Some(*name)),
+                "{name} is listed but nothing joins it onto a run directory");
+        }
+    }
+
+    /// Run directory joins the scan accepts without knowing the name: a
+    /// file and the computed argument, each read only with listed names.
+    const COMPUTED: [(&str, &str); 1] = [
+        // `text(name)` reads the image, layout and policy records and shim.pid.
+        ("checkpoint/capture.rs", "name"),
+    ];
+
+    /// The listed name a constant argument stands for.
+    fn resolve_run_entry_arg(arg: &str) -> Option<&'static str> {
+        if let Some(literal) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            return RUN_DIR_ENTRIES.iter().map(|(name, _)| *name).find(|name| *name == literal);
+        }
+        let constant = arg.rsplit("::").next().unwrap_or(arg);
+        [("SHIM_PID", SHIM_PID), ("SHIM_START", SHIM_START), ("UPPER", UPPER), ("WORK", WORK),
+            ("MERGED", MERGED), ("CONTROL_SOCKET", CONTROL_SOCKET), ("INIT_PID", INIT_PID),
+            ("REFERENCE_FILE", image::REFERENCE_FILE), ("POLICY_FILE", checkpoint::POLICY_FILE),
+            ("LAYOUT_FILE", overlay::LAYOUT_FILE)]
+            .into_iter().find(|(text, _)| *text == constant).map(|(_, name)| name)
+    }
+
+    /// The joins in `joined` (file, argument) whose argument isn't a listed name.
+    fn check_run_dir_joins(joined: &[(String, String)], names: &[&str]) -> Vec<(String, String)> {
+        joined.iter().filter(|(file, arg)| {
+            let listed = resolve_run_entry_arg(arg).is_some_and(|name| names.contains(&name));
+            !listed && !COMPUTED.contains(&(file.as_str(), arg.as_str()))
+        }).cloned().collect()
+    }
+
+    /// Every `.join(...)` onto a run directory in the non-test code of the
+    /// `.rs` files under `src` (each file's code before its test module),
+    /// as (path relative to `src`, argument without a leading `&`).
+    fn run_dir_joins(src: &Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        let mut dirs = vec![src.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { dirs.push(path); } else if path.extension().is_some_and(|e| e == "rs") { files.push(path); }
             }
         }
-        let known = ["\"upper\"", "\"work\"", "\"merged\"", "CONTROL_SOCKET", "INIT_PID", "checkpoint::POLICY_FILE",
-            "overlay::LAYOUT_FILE", "IDENTITY_PID", "\"shim.start\"", "\"shim.pid\""];
-        for name in &joined {
-            assert!(known.contains(name), "{name} is joined onto a run directory: add it to RUN_ENTRIES (and the \
-                allowances) if setup leaves it under the quota, then here");
+        files.sort();
+        let mut joined = Vec::new();
+        for path in files {
+            let file = path.strip_prefix(src).unwrap().to_string_lossy().into_owned();
+            joined.extend(source_run_dir_joins(&fs::read_to_string(&path).unwrap()).into_iter().map(|arg| (file.clone(), arg)));
         }
-        assert!(joined.len() >= 8, "the scan found too few names: {joined:?}");
+        joined
+    }
+
+    /// `run_dir_joins` for one file's text.
+    fn source_run_dir_joins(source: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let tests = lines.windows(2).position(|pair| pair[0].trim() == "#[cfg(test)]"
+            && ["mod ", "pub(crate) mod "].iter().any(|m| pair[1].starts_with(m))).unwrap_or(lines.len());
+        let code = lines[..tests].join("\n");
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices(".join(") {
+            let mut before = code[..at].trim_end();
+            // A call receiver: `run_dir(id)` or `container::run_dir(&id)`.
+            if before.ends_with(')') {
+                let mut depth = 0;
+                let Some(open) = before.char_indices().rev().find_map(|(i, c)| {
+                    match c { ')' => depth += 1, '(' => { depth -= 1; if depth == 0 { return Some(i); } } _ => {} }
+                    None
+                }) else { continue };
+                before = &before[..open];
+            }
+            let receiver = before.rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or("");
+            if receiver != "run_dir" && receiver != "run" { continue; }
+            let rest = &code[at + ".join(".len()..];
+            let (mut depth, mut end) = (0, rest.len());
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 0 => { end = i; break; }
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            found.push(rest[..end].trim().trim_start_matches('&').to_string());
+        }
+        found
+    }
+
+    /// The scan fails for a run file named in another module: a literal, a
+    /// constant it doesn't know, or a computed name at an unreviewed site.
+    #[test]
+    fn the_run_directory_scan_refuses_unlisted_names() {
+        let names: Vec<&str> = RUN_DIR_ENTRIES.iter().map(|(name, _)| *name).collect();
+        let source = "fn a(run_dir: &Path) { fs::write(run_dir.join(\"x\"), \"\").unwrap(); }\n\
+            fn b(id: &str) { let _ = container::run_dir(id).join(STRAY); }\n\
+            fn c(run: &Path, name: &str) { let _ = run.join(&name); }\n\
+            fn d(run_dir: &Path) { let _ = run_dir.join(crate::image::REFERENCE_FILE); let _ = run_dir.join(\"upper\"); }\n\
+            fn e(dir: &Path) { let _ = dir.join(\"y\"); }\n\
+            #[cfg(test)]\nmod tests {\n    fn f(run_dir: &Path) { let _ = run_dir.join(\"z\"); }\n}\n";
+        let joined: Vec<(String, String)> = source_run_dir_joins(source).into_iter().map(|arg| ("image.rs".to_string(), arg)).collect();
+        assert_eq!(joined.iter().map(|(_, arg)| arg.as_str()).collect::<Vec<_>>(),
+            ["\"x\"", "STRAY", "name", "crate::image::REFERENCE_FILE", "\"upper\""]);
+        let unlisted: Vec<String> = check_run_dir_joins(&joined, &names).into_iter().map(|(_, arg)| arg).collect();
+        assert_eq!(unlisted, ["\"x\"", "STRAY", "name"]);
     }
 
     /// An image name that is a symlink (an alias of another image) is refused

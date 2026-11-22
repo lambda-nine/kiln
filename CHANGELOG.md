@@ -5,6 +5,35 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Make a persistent create's shim die with `kiln create` until the run has
+  its identity: a CLI killed between the shim's fork and the run directory
+  left a shim that went on to start a sandbox nothing listed or waited for.
+  The shim now sets a parent-death signal (SIGKILL) right after the fork,
+  exits at once if its parent is already gone, and clears the signal once
+  `shim.pid` is published, from which point `kiln ls` lists the run and
+  `kiln gc` collects it. A create killed between the run directory's
+  `mkdir` and `shim.pid` leaves that directory empty, as a crash there
+  always did.
+
+- Report a persistent create's PID 1 setup error to the caller: PID 1 printed
+  it to the shim's stderr, which is `/dev/null`, so `kiln create` said only
+  "sandbox shim failed during setup". PID 1 now sends the error to its shim
+  and the shim passes it on over the readiness pipe, so the message ends with
+  it (for example `sandbox shim failed during setup: mount /dev tmpfs: ENOENT:
+  No such file or directory`); a typed checkpoint reason still leads it. The
+  reason is one line of at most 4093 bytes, cut at a character boundary
+  (it was 1000 characters). The exit code (1) and the cleanup of a failed
+  create are unchanged; `kiln run` still prints the error to its terminal.
+
+- Keep one list of a run directory's entries (`RUN_DIR_ENTRIES`), identity
+  included, and have the writers use its names. The test of the inode
+  allowances now checks them against that list and scans every source file
+  under `runtime/src/` for names joined onto a run directory (a receiver
+  named `run_dir` or `run`): a name not on the list fails it, wherever it is
+  written. Before, it scanned only `container.rs`, so a run file another
+  module wrote (such as the image reference) passed it unseen. A path built
+  another way still reaches only the VM regression's literal boundaries.
+
 - Keep a sandbox's network lease when its firewall teardown fails, so the
   retry can find it: teardown logged a failed removal of the sandbox's
   nftables chain and map element, then removed the lease anyway, and `kiln
@@ -21,9 +50,10 @@ before 1.0, any minor release may change the CLI or on-disk layout.
   (adversarial review H1): the create preflight kept 32 inodes for them, 22
   more than a persistent run uses, so it refused sandboxes that fit. It now
   keeps 10 for `create` and 8 for `run`, the measured peaks, and at the 64M
-  floor accepts 4086 and 4088 writable directories. A compile-time check and
-  a unit test tie the allowances to the run's list of files, and the VM
-  regression pins both boundaries with literal numbers.
+  floor accepts 4086 and 4088 writable directories. A compile-time check
+  ties the allowances to the run's list of files, and the VM regression
+  pins both boundaries with literal numbers. (The unit test that came with
+  it saw only names joined in `container.rs`; see the entry above.)
 
 - Write a sandbox's `/etc/resolv.conf` without following a symlink
   (adversarial review M2): an image's symlinked or non-regular
