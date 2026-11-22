@@ -177,11 +177,13 @@ pub fn host_resolvers() -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
-/// A sandbox's network. Dropping it removes its firewall chain, host veth and
-/// IP lease. The namespace itself dies with the sandbox's last process.
+/// A sandbox's network. Dropping it removes its firewall chain and DNS policy
+/// file, and its IP lease once the chain is gone. The namespace (and with it
+/// the veth) dies with the sandbox's last process.
 pub struct Network {
     ip: Ipv4Addr,
     lease: PathBuf,
+    run_id: String,
 }
 
 impl Network {
@@ -285,19 +287,64 @@ pub fn dns_policy_path(ip: Ipv4Addr) -> PathBuf {
 }
 
 impl Drop for Network {
+    /// Removes the sandbox's DNS policy file and firewall policy, then its
+    /// lease. The lease is the retry identity for the policy (`remove_run`,
+    /// `reconcile_leases` and `kiln gc` find the policy through it), so it's
+    /// removed only once the policy is gone: `remove_policy`'s transaction
+    /// committed and every message in it was acknowledged. That is the
+    /// proof here, without listing the table (an `nft` process, several ms
+    /// per networked run): the transaction is all or nothing, and `destroy`
+    /// succeeds only with its object gone. Nothing re-adds them meanwhile,
+    /// since only a sandbox that leased this IP adds its chain and map
+    /// element. If the removal fails, the lease, and with it the address, is
+    /// kept and logged, and `kiln gc <run-id>` retries it.
     fn drop(&mut self) {
         let _ = fs::remove_file(dns_policy_path(self.ip));
-        if let Err(e) = remove_policy(self.ip) {
-            eprintln!("kiln: failed to remove the firewall policy for {}: {e:#}", self.ip);
-        }
         // The veth isn't deleted here. The sandbox has exited, so its network
         // namespace is being destroyed, and that destroys both ends of the
         // pair. The kernel does it from a work queue, batched with other
         // dying namespaces; deleting the host end ourselves would be the same
         // unregistration done synchronously, with its RCU waits (10-15 ms).
         // `plug` copes with a host end that's still there.
-        let _ = fs::remove_file(&self.lease);
+        let remove = |ip| remove_policy(ip).context("remove sandbox firewall policy");
+        if let Err(e) = retire(self.ip, remove, &[&self.lease]) {
+            crate::container::report(&format!(
+                "kiln: kept network lease {} of sandbox {}: {e:#}; `kiln gc {}` retries the removal",
+                self.ip, self.run_id, self.run_id));
+        }
     }
+}
+
+/// Removes `ip`'s firewall policy with `remove`, and only once that
+/// succeeds, `files` in order, the lease last. The lease is the retry
+/// identity for everything before it, so any failure returns with it still
+/// in place. `remove` is a parameter so tests can make it fail; production
+/// passes `remove_policy` (teardown) or `clear_policy` (reclaiming).
+fn retire(ip: Ipv4Addr, remove: impl FnOnce(Ipv4Addr) -> Result<()>, files: &[&Path]) -> Result<()> {
+    remove(ip)?;
+    for file in files {
+        remove_state_file(file)?;
+    }
+    Ok(())
+}
+
+/// Removes `ip`'s firewall policy, if kiln's table exists, and checks with
+/// a listing of the table that no chain, `egress` map element or `connlimit`
+/// element for it is left. For the rare paths (`remove_run`, reclaiming a
+/// stale lease), which can't take a missing table (an error to `destroy`)
+/// as a failure.
+fn clear_policy(ip: Ipv4Addr) -> Result<()> {
+    if lists_kiln_table(&run("nft", &["list", "tables"], None)?) {
+        remove_policy(ip).context("remove sandbox firewall policy")?;
+        let table = run("nft", &["-n", "list", "table", "inet", "kiln"], None)?;
+        anyhow::ensure!(policy_is_absent(&table, ip), "firewall objects for {ip} remain after teardown");
+    }
+    Ok(())
+}
+
+/// Whether an `nft list tables` listing includes `table inet kiln`.
+fn lists_kiln_table(tables: &str) -> bool {
+    tables.lines().any(|line| line.split_whitespace().eq(["table", "inet", "kiln"]))
 }
 
 /// Leases an IP for a sandbox about to be cloned, so its init knows its
@@ -439,7 +486,9 @@ fn policy(network: &Network, plan: &Plan) -> String {
 
 /// Removes everything `policy` added for `ip`, in one transaction. `destroy`
 /// (unlike `delete`) ignores objects that are already gone, so one missing
-/// piece can't abort the rest. Deletions need no rule bytecode, so they go
+/// piece can't abort the rest; a missing table or set, or a chain another
+/// rule still jumps to, is an error and aborts all of it. So `Ok` means the
+/// table has none of the three objects left (`Network::drop`). Deletions need no rule bytecode, so they go
 /// straight over netlink instead of through an `nft` process, and the socket
 /// is closed in the background: closing it right after a deleting commit
 /// would wait 10-20 ms for nftables to free the old objects (netlink.rs).
@@ -599,7 +648,7 @@ fn lease(run_id: &str) -> Result<Network> {
         let path = dir.join(ip.to_string());
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let network = Network { ip, lease: path };
+                let network = Network { ip, lease: path, run_id: run_id.to_string() };
                 file.write_all(run_id.as_bytes()).context("write lease")?;
                 return Ok(network);
             }
@@ -613,25 +662,33 @@ fn lease(run_id: &str) -> Result<Network> {
 /// Removes leases left by a supervisor that died before `Network::drop` ran.
 /// A run is stale only when every independent sign of life is gone. Requiring
 /// all four avoids reclaiming a lease during setup, while its supervisor is
-/// alive but the veth and nft map element do not exist yet.
+/// alive but the veth and nft map element do not exist yet. A stale lease is
+/// removed, after its DNS policy file, only once its firewall policy is
+/// verifiably gone; otherwise it's kept, with its address, for the next retry.
 fn reconcile_leases(dir: &Path) {
+    reconcile_leases_in(dir, &Path::new(STATE_DIR).join("dns"), |ip, run_id| {
+        // Cheapest checks first; `nft get` starts a process.
+        let cgroup = || Path::new("/sys/fs/cgroup/kiln").join(run_id).exists();
+        let veth = || Path::new("/sys/class/net").join(host_if(ip)).exists();
+        cgroup() || veth() || supervisor_alive(run_id) || nft_has_map_entry(ip)
+    }, clear_policy);
+}
+
+/// `reconcile_leases` with the DNS policy directory, the liveness check and
+/// the policy removal passed in, so tests can run it on a scratch directory.
+fn reconcile_leases_in(dir: &Path, dns_dir: &Path, alive: impl Fn(Ipv4Addr, &str) -> bool,
+    clear_policy: impl Fn(Ipv4Addr) -> Result<()>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let Some(ip) = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok()) else { continue };
         let Ok(run_id) = fs::read_to_string(entry.path()) else { continue };
         let run_id = run_id.trim();
-        // Cheapest checks first; `nft get` starts a process.
-        let cgroup = || Path::new("/sys/fs/cgroup/kiln").join(run_id).exists();
-        let veth = || Path::new("/sys/class/net").join(host_if(ip)).exists();
-        if cgroup() || veth() || supervisor_alive(run_id) || nft_has_map_entry(ip) {
+        if alive(ip, run_id) {
             continue;
         }
-
-        let _ = fs::remove_file(dns_policy_path(ip));
-        let chain = format!("sb_{}", ip.to_string().replace('.', "_"));
-        let _ = run("nft", &["delete", "chain", "inet", "kiln", &chain], None);
-        if fs::remove_file(entry.path()).is_ok() {
-            eprintln!("kiln: reclaimed stale network lease {ip} from {run_id}");
+        match retire(ip, &clear_policy, &[&dns_dir.join(ip.to_string()), &entry.path()]) {
+            Ok(()) => eprintln!("kiln: reclaimed stale network lease {ip} from {run_id}"),
+            Err(e) => eprintln!("kiln: kept stale network lease {ip} of {run_id}: {e:#}; `kiln gc {run_id}` retries it"),
         }
     }
 }
@@ -652,12 +709,7 @@ pub fn remove_run(run_id: &str) -> Result<()> {
         if owner.trim() != run_id { continue; }
         let ip = entry.file_name().to_str().and_then(|s| s.parse::<Ipv4Addr>().ok())
             .ok_or_else(|| anyhow::anyhow!("invalid network lease {}", entry.path().display()))?;
-        let tables = run("nft", &["list", "tables"], None)?;
-        if tables.lines().any(|line| line.split_whitespace().eq(["table", "inet", "kiln"])) {
-            remove_policy(ip).context("remove sandbox firewall policy")?;
-            let table = run("nft", &["-n", "list", "table", "inet", "kiln"], None)?;
-            anyhow::ensure!(policy_is_absent(&table, ip), "firewall objects for {ip} remain after teardown");
-        }
+        clear_policy(ip)?;
         let link = host_if(ip);
         if let Err(e) = Netlink::open()?.delete_link(&link) && !link_already_gone(&e) {
             return Err(e).context("remove sandbox veth");
@@ -749,7 +801,13 @@ fn run(cmd: &str, args: &[&str], stdin: Option<&str>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Context, anyhow};
+    use std::cell::Cell;
+    use std::fs;
+    use std::net::Ipv4Addr;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anyhow::{Context, anyhow, bail};
     use nix::errno::Errno;
 
     use super::{Plan, link_already_gone};
@@ -781,7 +839,7 @@ mod tests {
     #[test]
     fn every_networked_policy_rejects_private_before_accepting() {
         let network = std::mem::ManuallyDrop::new(super::Network {
-            ip: "10.88.0.2".parse().unwrap(), lease: std::path::PathBuf::new(),
+            ip: "10.88.0.2".parse().unwrap(), lease: std::path::PathBuf::new(), run_id: String::new(),
         });
         for plan in [Plan::new("full", &[]).unwrap(),
             Plan::new("none", &["1.1.1.1:443".into()]).unwrap()] {
@@ -808,5 +866,77 @@ mod tests {
 
         let wrapped = Err::<(), _>(Errno::ENODEV).context("delete kv0007").unwrap_err();
         assert!(link_already_gone(&wrapped));
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("kiln-net-{tag}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// `Network::drop`'s order: the lease, the retry identity for the
+    /// firewall policy, goes only after the policy removal succeeded.
+    #[test]
+    fn a_failed_policy_removal_keeps_the_lease() {
+        let root = scratch("retire");
+        let lease = root.join("10.88.0.2");
+        fs::write(&lease, "aaaa-1").unwrap();
+        let ip: Ipv4Addr = "10.88.0.2".parse().unwrap();
+
+        let error = super::retire(ip, |_| Err(anyhow!("nftables transaction: EBUSY")), &[&lease]).unwrap_err();
+        assert!(format!("{error:#}").contains("EBUSY"), "{error:#}");
+        assert_eq!(fs::read_to_string(&lease).unwrap(), "aaaa-1", "a failed removal must keep the lease");
+
+        let mut removed = Vec::new();
+        super::retire(ip, |ip| {
+            assert!(lease.exists(), "the lease must outlive the policy removal");
+            removed.push(ip);
+            Ok(())
+        }, &[&lease]).unwrap();
+        assert_eq!(removed, [ip]);
+        assert!(!lease.exists(), "a successful removal must remove the lease");
+        fs::remove_dir(root).unwrap();
+    }
+
+    /// Reclaiming a stale lease removes its DNS policy file and the lease
+    /// only once its firewall policy is gone, and never touches a live one.
+    #[test]
+    fn reclaiming_keeps_a_stale_lease_until_its_policy_is_gone() {
+        let root = scratch("reconcile");
+        let (leases, dns) = (root.join("leases"), root.join("dns"));
+        fs::create_dir(&leases).unwrap();
+        fs::create_dir(&dns).unwrap();
+        for (ip, run) in [("10.88.0.5", "aaaa-1"), ("10.88.0.6", "bbbb-2")] {
+            fs::write(leases.join(ip), run).unwrap();
+            fs::write(dns.join(ip), "*\n").unwrap();
+        }
+        let stale: Ipv4Addr = "10.88.0.5".parse().unwrap();
+        let alive = |_: Ipv4Addr, run: &str| run == "bbbb-2";
+        let present = |dir: &Path| {
+            let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let both = present(&leases);
+
+        let attempts = Cell::new(0);
+        super::reconcile_leases_in(&leases, &dns, alive, |ip| {
+            assert_eq!(ip, stale);
+            attempts.set(attempts.get() + 1);
+            bail!("firewall objects for {ip} remain after teardown")
+        });
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(present(&leases), both, "a failed reclaim must keep the lease");
+        assert_eq!(present(&dns), both, "a failed reclaim must keep the DNS policy file");
+
+        super::reconcile_leases_in(&leases, &dns, alive, |ip| {
+            assert_eq!(ip, stale);
+            assert!(leases.join("10.88.0.5").exists() && dns.join("10.88.0.5").exists());
+            Ok(())
+        });
+        assert_eq!(present(&leases), ["10.88.0.6"], "only the stale lease is reclaimed");
+        assert_eq!(present(&dns), ["10.88.0.6"], "only the stale DNS policy file is removed");
+        fs::remove_dir_all(root).unwrap();
     }
 }

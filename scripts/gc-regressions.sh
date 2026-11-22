@@ -123,3 +123,54 @@ sudo test ! -e "$run"
 sudo test ! -e "/sys/fs/cgroup/kiln/$id"
 id=
 echo 'PASS: a failed teardown keeps all 1500 levels and its identity, stays listed, logs why, and kiln gc under a soft descriptor limit of 1024 removes the deep tree'
+
+# A firewall teardown that fails keeps the network lease, the only way gc finds
+# the sandbox's nft chain and map element, even once the shim has removed the
+# run directory. Another chain jumping to the sandbox's chain makes the shim's
+# removal transaction fail (EBUSY) and abort as a whole.
+hold=
+cleanup_hold() {
+    if [ -n "$hold" ]; then
+        sudo nft flush chain inet kiln "$hold" 2>/dev/null || true
+        sudo nft delete chain inet kiln "$hold" 2>/dev/null || true
+    fi
+    cleanup_deep
+}
+trap cleanup_hold EXIT HUP INT TERM
+id=$(sudo "$KILN" create --net full)
+run=/var/lib/kiln/runs/$id
+lease=$(sudo grep -lxF "$id" /run/kiln/net/leases/*)
+ip=${lease##*/}
+chain=sb_$(echo "$ip" | tr . _)
+veth=$(echo "$ip" | awk -F . '{ printf "kv%04x", $3 * 256 + $4 }')
+hold=kiln_test_hold
+sudo nft add chain inet kiln "$hold"
+sudo nft add rule inet kiln "$hold" jump "$chain"
+sudo "$KILN" rm "$id"
+sudo test ! -e "$run"
+sudo test -f "$lease" || { echo 'FAIL: a failed firewall teardown removed the network lease'; exit 1; }
+sudo nft list chain inet kiln "$chain" >/dev/null || { echo 'FAIL: the held chain is gone'; exit 1; }
+logged=0
+for _ in 1 2 3 4 5; do
+    if sudo journalctl -q -t kiln -n 50 --no-pager | grep -qF "kept network lease $ip of sandbox $id"; then logged=1; break; fi
+    sleep 0.2
+done
+[ "$logged" = 1 ] || { echo 'FAIL: the shim did not log the kept lease'; exit 1; }
+if sudo "$KILN" gc "$id"; then
+    echo 'FAIL: gc succeeded with the chain still referenced'; exit 1
+fi
+sudo test -f "$lease" || { echo 'FAIL: a failed gc removed the network lease'; exit 1; }
+sudo nft flush chain inet kiln "$hold"
+sudo nft delete chain inet kiln "$hold"
+hold=
+out=$(sudo "$KILN" gc "$id" 2>&1) || { echo "FAIL: gc did not clear the kept lease: $out"; exit 1; }
+echo "$out" | grep -qF "removed network state left by sandbox $id" ||
+    { echo "FAIL: gc did not say it removed the network state: $out"; exit 1; }
+sudo test ! -e "$lease"
+sudo test ! -e "/run/kiln/net/dns/$ip"
+sudo test ! -e "/sys/class/net/$veth"
+if sudo nft -n list table inet kiln | grep -wqF -e "$ip" -e "$chain"; then
+    echo "FAIL: firewall objects for $ip remain after gc"; exit 1
+fi
+id=
+echo 'PASS: a failed firewall teardown keeps the lease past the run directory, and kiln gc ID clears it'

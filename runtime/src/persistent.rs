@@ -975,6 +975,7 @@ fn list_records(root: &Path) -> Result<Vec<(String, bool, String)>> {
 pub fn gc(ids: &[String]) -> Result<()> {
     let root = Path::new(RUNS_ROOT);
     let mut failures = Vec::new();
+    let departed = departed_ids(root, ids)?;
     for (id, dir) in stale_gc_candidates(root, ids)? {
         // Attempt both independent resources, but retain identity until every
         // teardown and its postconditions succeeded.
@@ -983,6 +984,16 @@ pub fn gc(ids: &[String]) -> Result<()> {
         match finish_gc(&dir, cgroup, network) {
             Ok(()) => eprintln!("kiln: removed stale sandbox {id}"),
             Err(e) => failures.push(format!("{id}: {e:#}")),
+        }
+    }
+    // A sandbox whose teardown finished all but its firewall policy has no
+    // run directory left, only the network lease that `Network::drop` kept
+    // as the retry identity. A scoped GC retries it.
+    let leases = crate::net::leases();
+    for id in departed.into_iter().filter(|id| leases.contains_key(id)) {
+        match crate::net::remove_run(&id) {
+            Ok(()) => eprintln!("kiln: removed network state left by sandbox {id}"),
+            Err(e) => failures.push(format!("{id}: network teardown: {e:#}")),
         }
     }
     if !failures.is_empty() {
@@ -995,6 +1006,23 @@ fn finish_gc(dir: &Path, cgroup: Result<()>, network: Result<()>) -> Result<()> 
     cgroup.context("cgroup teardown")?;
     network.context("network teardown")?;
     container::remove_run_dir(dir).with_context(|| format!("remove stale sandbox {}", dir.display()))
+}
+
+/// The requested IDs with no run directory at all: a sandbox's run
+/// directory exists from before its network is leased until after
+/// `Network::drop`, so a lease such an ID still owns is one that teardown
+/// kept. An ID that never existed is here too, and owns no lease.
+fn departed_ids(root: &Path, ids: &[String]) -> Result<Vec<String>> {
+    let mut departed = Vec::new();
+    for id in ids.iter().collect::<std::collections::BTreeSet<_>>() {
+        validate_id(id)?;
+        match fs::symlink_metadata(root.join(id)) {
+            Err(e) if e.kind() == ErrorKind::NotFound => departed.push(id.clone()),
+            Err(e) => return Err(e).with_context(|| format!("inspect sandbox registry entry {id}")),
+            Ok(_) => {}
+        }
+    }
+    Ok(departed)
 }
 
 fn stale_gc_candidates(root: &Path, ids: &[String]) -> Result<Vec<(String, PathBuf)>> {
@@ -2042,6 +2070,22 @@ mod tests {
             "global GC must still fail closed on malformed registry identity"
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A scoped GC looks for a kept network lease only for IDs with no run
+    /// directory at all; a stale run's lease goes with its run directory.
+    #[test]
+    fn scoped_gc_finds_ids_whose_run_directory_is_gone() {
+        let root = std::env::temp_dir().join(format!("kiln-departed-gc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("aaaa-1")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("cccc-3")).unwrap();
+        let ids = ["bbbb-2", "aaaa-1", "bbbb-2", "cccc-3", "dddd-4"].map(String::from);
+        assert_eq!(departed_ids(&root, &ids).unwrap(), ["bbbb-2", "dddd-4"]);
+        assert!(departed_ids(&root, &[]).unwrap().is_empty(), "an unscoped GC has no departed IDs");
+        assert!(departed_ids(&root, &["invalid/id".into()]).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

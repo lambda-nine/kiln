@@ -217,7 +217,7 @@ pub(crate) fn remove_run_dir_with(run_dir: &Path, hook: rmtree::Hook) -> io::Res
 /// A shim's failure that no caller is left to read: its stderr is /dev/null
 /// once `kiln create` has returned, so it also goes to the system log (the
 /// journal on systemd hosts: `journalctl -t kiln`).
-fn report(message: &str) {
+pub(crate) fn report(message: &str) {
     eprintln!("{message}");
     if let Ok(text) = CString::new(message) {
         // SAFETY: the ident is a static C string, and "%s" takes exactly the

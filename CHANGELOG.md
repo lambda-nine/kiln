@@ -5,6 +5,18 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Keep a sandbox's network lease when its firewall teardown fails, so the
+  retry can find it: teardown logged a failed removal of the sandbox's
+  nftables chain and map element, then removed the lease anyway, and `kiln
+  gc` finds that state only through the lease. The lease (and its address)
+  now stays until the removal succeeds, and the shim's log says `kiln gc ID`
+  retries it; a scoped `kiln gc ID` also clears a lease kept by a sandbox
+  whose run directory is already gone. Reclaiming a stale lease at the next
+  networked start now removes it only once the listing shows its chain and
+  elements gone. An nftables transaction that fails at commit, which the
+  kernel reports against the batch marker, now counts as a failure instead
+  of a success.
+
 - Allow exactly what a run's own files use under its inode quota, no margin
   (adversarial review H1): the create preflight kept 32 inodes for them, 22
   more than a persistent run uses, so it refused sandboxes that fit. It now
