@@ -247,7 +247,18 @@ pub(crate) fn create_with_id(
     from_checkpoint: Option<crate::checkpoint::capture::Fork>,
     new_id: impl FnOnce() -> String,
 ) -> Result<String> {
-    before_allocation(container::preflight(cfg))?;
+    create_in(&crate::image::Roots::system(), cfg, from_checkpoint, new_id)
+}
+
+/// `create_with_id` with the preflight's image roots passed in, so tests can
+/// give it a scratch image; the shim always uses the system's.
+pub(crate) fn create_in(
+    roots: &crate::image::Roots,
+    cfg: &Config,
+    from_checkpoint: Option<crate::checkpoint::capture::Fork>,
+    new_id: impl FnOnce() -> String,
+) -> Result<String> {
+    before_allocation(container::preflight_in(roots, cfg))?;
     let id = new_id();
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).context("pipe")?;
     // SAFETY: the CLI is single-threaded here.

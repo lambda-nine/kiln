@@ -144,10 +144,15 @@ const MAX_HOSTNAME_BYTES: usize = 64;
 
 /// The create preflight's checks of a config, before anything is allocated:
 /// its scalar settings (`validate_settings`), then its image
-/// (`validate_image`). The shim repeats them before its run directory.
+/// (`validate_image_in`). The shim repeats them before its run directory.
 pub fn preflight(cfg: &Config) -> Result<()> {
+    preflight_in(&image::Roots::system(), cfg)
+}
+
+/// `preflight` over the images in `roots` (tests pass a scratch directory).
+pub(crate) fn preflight_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
     validate_settings(cfg)?;
-    validate_image(cfg)
+    validate_image_in(roots, cfg)
 }
 
 /// Limits, disk and hostname the sandbox's setup would refuse or that are
@@ -163,6 +168,15 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// What a run's own setup puts under its quota besides the sandbox's root,
+/// as the create preflight allows for it: the run directory itself, `upper`,
+/// `work` and overlayfs's `work/work`, `merged`, the `image`, `policy` and
+/// `layout` records, `control.sock` and `init.pid` are 10, with at most a
+/// few more at a time while a record's temporary or overlayfs's mount-time
+/// probes exist. Rounded up, so a new run file doesn't silently break the
+/// preflight's count.
+pub(crate) const RUN_INODES: u64 = 32;
+
 /// Everything about the image that a create decides before it allocates
 /// (persistent create's preflight, and `kiln run` before its run directory):
 /// the image opens the way the shim's image reference opens it
@@ -173,19 +187,6 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
 /// directories that walk will make fit the run's inode quota. The shim
 /// repeats this before its run directory, so an image changed in between
 /// fails before anything exists.
-pub fn validate_image(cfg: &Config) -> Result<()> {
-    validate_image_in(&image::Roots::system(), cfg)
-}
-
-/// What a run's own setup puts under its quota besides the sandbox's root,
-/// as the create preflight allows for it: the run directory itself, `upper`,
-/// `work` and overlayfs's `work/work`, `merged`, the `image`, `policy` and
-/// `layout` records, `control.sock` and `init.pid` are 10, with at most a
-/// few more at a time while a record's temporary or overlayfs's mount-time
-/// probes exist. Rounded up, so a new run file doesn't silently break the
-/// preflight's count.
-pub(crate) const RUN_INODES: u64 = 32;
-
 fn validate_image_in(roots: &image::Roots, cfg: &Config) -> Result<()> {
     let image = image::open_image(roots, &cfg.image).map_err(|e| {
         let missing = e.root_cause().downcast_ref::<std::io::Error>()

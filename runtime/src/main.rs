@@ -570,6 +570,38 @@ mod create_certainty_tests {
         }
     }
 
+    /// With `--read-only`, writable directories that need more inodes than
+    /// `--disk` leaves the sandbox are refused before ID creation (the
+    /// 2026-11-22 review's finding A), and the set that fits exactly gets past
+    /// the preflight to ID creation.
+    #[test]
+    fn writable_directories_past_the_inode_quota_are_rejected_before_id_creation() {
+        let root = std::env::temp_dir().join(format!("kiln-create-inodes-{}", std::process::id()));
+        let roots = image::Roots { images: root.join("images"), registry: root.join("registry"), runs: root.join("runs") };
+        for dir in ["tmp", "root", "etc"] { std::fs::create_dir_all(roots.images.join("img").join(dir)).unwrap(); }
+        // The image lacks /workspace, which the shim makes too.
+        let room = quota::inode_limit(Some(quota::MIN_DISK)).unwrap() - container::RUN_INODES - 1;
+        let deep = |top: char, components: u64| PathBuf::from(format!("/{top}{}", "/a".repeat(components as usize - 1)));
+        let mut writable: Vec<PathBuf> = ('b'..='h').map(|top| deep(top, 512)).collect();
+        writable.push(deep('i', room - 7 * 512));
+        let mut cfg = container::Config {
+            limits: cgroup::Limits { memory: Some(64 * 1024 * 1024), cpus: Some(1.0), pids: Some(16) },
+            disk: Some(quota::MIN_DISK),
+            net: net::Plan::new("none", &[]).unwrap(),
+            hostname: "kiln".into(), image: "img".into(),
+            keep: true, read_only: true, writable, stats: false, cmd: Vec::new(), fork: None,
+        };
+        let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persistent::create_in(&roots, &cfg, None, || panic!("new_id reached at the boundary"))
+        }));
+        assert!(reached.is_err(), "the boundary set was refused: {:?}", reached.map(|r| r.map_err(|e| format!("{e:#}"))));
+        cfg.writable.push(PathBuf::from("/j"));
+        let error = persistent::create_in(&roots, &cfg, None, || panic!("new_id reached before refusal")).unwrap_err();
+        assert!(error.is::<persistent::CreatePreflightFailure>(), "{error:#}");
+        assert!(format!("{error:#}").contains("--disk"), "{error:#}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn missing_image_is_rejected_before_id_or_resource_creation() {
         let cfg = container::Config {

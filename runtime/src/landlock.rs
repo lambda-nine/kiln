@@ -154,7 +154,7 @@ pub(crate) fn preflight(image: &OwnedFd, writable: &[PathBuf], generated: &[&str
         }
     }
     for file in generated {
-        add(*file);
+        add(file);
     }
     Ok(upper.len() as u64)
 }
