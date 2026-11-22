@@ -232,9 +232,13 @@ pub fn validate_settings(cfg: &Config) -> Result<()> {
 /// What a run's own setup puts under its quota besides the sandbox's root,
 /// as the create preflight allows for it: the run directory itself, `upper`,
 /// `work` and overlayfs's `work/work`, `merged`, the `image`, `policy` and
-/// `layout` records, `control.sock` and `init.pid` are 10, with at most a
-/// few more at a time while a record's temporary or overlayfs's mount-time
-/// probes exist. Rounded up, so a new run file doesn't silently break the
+/// `layout` records, `control.sock` and `init.pid`. Measured on the VM
+/// (Linux 6.8, XFS, 2026-11-22): a persistent run holds 10 at rest and a
+/// one-shot run 8 (no socket or `init.pid`), and the largest writable walk
+/// that still creates at `--disk=64M` (4096 inodes) makes 4086 directories,
+/// so the run's own files peak at 10 while the walk and what follows it run
+/// (a record's temporary and overlayfs's mount-time probes are gone by then).
+/// 32 leaves a margin of 22, so a new run file doesn't silently break the
 /// preflight's count.
 pub(crate) const RUN_INODES: u64 = 32;
 
