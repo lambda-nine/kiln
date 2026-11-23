@@ -36,6 +36,17 @@ pub const FORWARDED: [Signal; 4] =
 /// accept through its final payload byte. Progress does not reset it.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// `REQUEST_READ_TIMEOUT`. Test binaries only: a protocol fixture may be
+/// given its own window, so a test that isn't about the deadline can't lose a
+/// client starved of CPU between connect and send.
+fn request_read_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = std::env::var_os("KILN_PROTOCOL_FIXTURE_READ_TIMEOUT_MS") {
+        return Duration::from_millis(ms.to_str().and_then(|ms| ms.parse().ok()).expect("fixture read timeout"));
+    }
+    REQUEST_READ_TIMEOUT
+}
+
 /// Connections a running exec keeps with an incomplete header. One header holds
 /// at most three descriptors, so this also bounds what they can pin in PID 1.
 const MAX_BUSY_PENDING: usize = 16;
@@ -116,6 +127,8 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
     // Generations name the leases this PID 1 grants: nonzero and increasing.
     let mut leases = 0u64;
     loop {
+        #[cfg(test)]
+        fixture_exec_state("idle");
         let mut stream = match wait_for_request(listener, &signals)? {
             IdleEvent::Request(stream) => stream,
             IdleEvent::Stop(code) => return Ok(code),
@@ -148,6 +161,8 @@ pub fn serve(listener: &UnixListener, scope: &ExecCgroup) -> Result<i32> {
             Request::TypedExec(argv, fds) => (argv, fds, true, None),
             Request::OptionsExec(argv, options, fds) => (argv, fds, true, Some(options)),
         };
+        #[cfg(test)]
+        fixture_exec_state("exec");
         // A client that went away can't take the status; failing to send it
         // must not end PID 1 and with it the sandbox.
         match run_exec(&argv, options.as_ref(), fds, &stream, listener, scope, &signals)? {
@@ -248,7 +263,7 @@ enum FramingOutcome {
 /// occasional progress.
 fn receive_idle_request(stream: &mut UnixStream, signals: &SignalFd) -> Result<FramingOutcome> {
     stream.set_nonblocking(true).context("set control request nonblocking")?;
-    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
+    let deadline = Instant::now() + request_read_timeout();
     let mut reader = RequestReader::new();
     loop {
         if let Some(code) = drain_idle_signals(signals)? {
@@ -601,6 +616,18 @@ fn injected(point: &str) -> Option<i32> {
     errno.parse().ok()
 }
 
+// Test binaries only: a protocol fixture's client can see whether PID 1 is
+// running an exec or back in its idle loop, with that exec's queued backlog
+// answered, and so wait for an exec to end instead of sleeping.
+#[cfg(test)]
+fn fixture_exec_state(state: &str) {
+    let Some(root) = std::env::var_os("KILN_PROTOCOL_FIXTURE") else { return };
+    let root = std::path::PathBuf::from(root);
+    let pending = root.join("exec-state.pending");
+    std::fs::write(&pending, state).and_then(|()| std::fs::rename(&pending, root.join("exec-state")))
+        .expect("record the fixture's exec state");
+}
+
 #[cfg(test)]
 fn fixture_response_backpressure(stream: &UnixStream, outcome: &ExecOutcome) -> Result<()> {
     anyhow::ensure!(outcome.cleanup == Cleanup::Drained, "response preceded exec cleanup");
@@ -881,7 +908,7 @@ impl BusyHeaders {
             self.read(BusyHeader {
                 stream,
                 reader: HeaderReader::new(),
-                deadline: Instant::now() + REQUEST_READ_TIMEOUT,
+                deadline: Instant::now() + request_read_timeout(),
             }, &mut completed);
         }
         Ok(completed)
@@ -1181,9 +1208,15 @@ mod tests {
         else { result.unwrap(); }
     }
 
+    /// The fixture's framing window, unless a test is about the deadline:
+    /// long enough that a client starved of CPU for a while between connect
+    /// and send, as under heavy load, isn't cut off.
+    const FIXTURE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
     struct Server { child: Child, root: std::path::PathBuf }
     impl Server {
-        fn start() -> Self {
+        fn start() -> Self { Self::start_with_read_timeout(FIXTURE_READ_TIMEOUT) }
+        fn start_with_read_timeout(read_timeout: Duration) -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!("kiln-protocol-{}-{id}", std::process::id()));
@@ -1193,7 +1226,9 @@ mod tests {
             }
             let mut command = Command::new(std::env::current_exe().unwrap());
             command.args(["--exact", "init::tests::protocol_server_fixture", "--test-threads=1"])
-                .env("KILN_PROTOCOL_FIXTURE", &root).stdout(Stdio::null()).stderr(Stdio::inherit());
+                .env("KILN_PROTOCOL_FIXTURE", &root)
+                .env("KILN_PROTOCOL_FIXTURE_READ_TIMEOUT_MS", read_timeout.as_millis().to_string())
+                .stdout(Stdio::null()).stderr(Stdio::inherit());
             unsafe { command.pre_exec(|| {
                 let mut mask: libc::sigset_t = std::mem::zeroed();
                 libc::sigfillset(&mut mask);
@@ -1211,6 +1246,15 @@ mod tests {
             let start = Instant::now();
             while !self.root.join(name).exists() {
                 assert!(start.elapsed() < Duration::from_secs(5), "fixture never reached {name}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        /// Waits until PID 1 is back in its idle loop: the exec it was running
+        /// has ended and the connections queued by then have been answered.
+        fn wait_idle(&self) {
+            let start = Instant::now();
+            while fs::read_to_string(self.root.join("exec-state")).ok().as_deref() != Some("idle") {
+                assert!(start.elapsed() < Duration::from_secs(5), "fixture never went idle");
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
@@ -1280,10 +1324,11 @@ mod tests {
         }
         /// A capabilities round trip. The listener is first-in first-out, so an
         /// answer also proves every earlier connection has been accepted.
-        fn probe(&self) {
+        fn probe(&self) { self.probe_within(BUSY_PROMPT) }
+        fn probe_within(&self, within: Duration) {
             let mut probe = self.connect();
             probe.write_all(&[3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-            assert!(matches!(protocol::read_reply(&mut probe, Some(Instant::now() + BUSY_PROMPT)).unwrap(),
+            assert!(matches!(protocol::read_reply(&mut probe, Some(Instant::now() + within)).unwrap(),
                 Frame::Capabilities(_)));
         }
         fn partial_header(&self) -> UnixStream {
@@ -1356,7 +1401,8 @@ mod tests {
             assert!(out.is_empty() && err.is_empty(), "bootstrap leaked output at {point}");
             assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
         }
-        let (active, out, err) = server.start_exec(&["/bin/sleep", "10"]);
+        // Runs until its client leaves, however slowly this test runs.
+        let (active, out, err) = server.start_exec(&["/bin/sleep", "300"]);
         // A complete probe is accepted even with the active exec's output held.
         let mut probe = server.connect();
         probe.write_all(&[3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
@@ -1366,11 +1412,14 @@ mod tests {
         let large = "x".repeat(700_000);
         assert_eq!(server.exec(&["/bin/true", &large]).0.kind, FailureKind::Busy);
         drop((active, out, err));
-        std::thread::sleep(Duration::from_millis(30));
+        server.wait_idle();
         assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
         // Complete request followed by a peer close must remain request-local.
         for _ in 0..5 { drop(server.start_exec(&["/bin/true"])); }
-        std::thread::sleep(Duration::from_millis(30));
+        // Once a later probe is answered, PID 1 has taken all five; then the
+        // exec it may have answered the probe from must end.
+        server.probe_within(Duration::from_secs(5));
+        server.wait_idle();
         assert_eq!(server.exec(&["/bin/true"]).0.status, Some(CommandStatus::Exited(0)));
         fs::write(server.root.join("expect-fatal"), "").unwrap();
         fs::write(server.root.join("events"), "malformed cleanup observation\n").unwrap();
@@ -1604,7 +1653,7 @@ mod tests {
 
     #[test]
     fn partial_busy_header_descriptors_close_at_its_deadline() {
-        let server = Server::start();
+        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
         let (active, out, err, _pid) = server.start_sleeper();
         let start = Instant::now();
         let (partial, partial_out, partial_err) = server.start_exec_prefix(4, 1024, 1);
@@ -1741,7 +1790,7 @@ mod tests {
 
     #[test]
     fn lease_excludes_exec_answers_probes_and_needs_no_timer() {
-        let server = Server::start();
+        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
         let (mut lease, generation) = server.lease();
         assert_eq!(generation, 1);
         let marker = server.root.join("ran-during-lease");
@@ -1813,7 +1862,7 @@ mod tests {
             (FailureKind::Busy, Stage::Lease, Cleanup::NoChildStarted, EXEC_BUSY));
         drop((active, out, err));
         // The exec's end does not turn its queued refusal into a lease.
-        std::thread::sleep(Duration::from_millis(50));
+        server.wait_idle();
         let (mut lease, g) = server.lease();
         assert!(matches!(release(&mut lease, g).unwrap(), Frame::Lease(_)));
     }
@@ -1869,7 +1918,7 @@ mod tests {
     /// reply now waits like an exec reply; its connect stays bounded.
     #[test]
     fn feature_probes_wait_behind_stalled_connections_like_exec() {
-        let server = Server::start();
+        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
         let socket = server.root.join("control.sock");
         for probe in [0, 1] {
             let stalled = [server.partial_header(), server.partial_header()];

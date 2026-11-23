@@ -2767,6 +2767,19 @@ mod tests {
 
     fn raw(files: &[fs::File; 3]) -> [RawFd; 3] { [files[0].as_raw_fd(), files[1].as_raw_fd(), files[2].as_raw_fd()] }
 
+    /// Whether descriptor `number` is open on the same file as `witness`.
+    /// While `witness` is open, its file (and inode number) can't be freed and
+    /// reused, so a closed `number` that another thread reopened on some other
+    /// file reads false, and only a `number` still open on it reads true.
+    fn refers_to(number: RawFd, witness: &OwnedFd) -> bool {
+        let id = |fd: RawFd| {
+            let mut info = unsafe { mem::zeroed::<libc::stat>() };
+            (unsafe { libc::fstat(fd, &mut info) } == 0).then_some((info.st_dev, info.st_ino))
+        };
+        let pinned = id(witness.as_raw_fd()).expect("fstat the witness");
+        id(number) == Some(pinned)
+    }
+
     #[test]
     fn operation_4_bytes_are_unchanged_and_operation_5_appends_the_frame() {
         // Operation 4's golden, as before exec options existed.
@@ -2864,10 +2877,14 @@ mod tests {
         let frame = options(Some("/w"), &[("A", "1")]).encode();
         let all = exec_options::REQUIRED_SEALS;
         let fd = memfd(&frame, true, all);
-        // Taking the frame closes the caller's descriptor.
+        // Taking the frame closes the caller's descriptor. Another test
+        // thread may reuse a closed number at once, so check what the number
+        // refers to, not whether it is free: a kept duplicate pins the memfd,
+        // and afterwards the number must not refer to it.
+        let witness = fd.try_clone().unwrap();
         let number = fd.into_raw_fd();
         assert_eq!(read_options_fd(number, status.as_raw_fd(), stdio_fds).unwrap(), frame);
-        assert_eq!(unsafe { libc::fcntl(number, libc::F_GETFD) }, -1);
+        assert!(!refers_to(number, &witness), "the options fd was left open");
         // The caller's file offset is irrelevant: the frame is read with pread.
         let fd = memfd(&frame, true, all);
         assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 9, libc::SEEK_SET) }, 9);
