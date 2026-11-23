@@ -568,10 +568,11 @@ pub fn verify(roots: &Roots, name: &str) -> Result<Entry> {
     Ok(entry)
 }
 
-// Test hook (compiled out of non-test builds) inside the off-lock verify's
-// first shared-lock scope: `verify_entry_read` right after the registered
-// entry is read, and `verify_opened` once the image directory is opened and
-// checked against it, both before that lock is released.
+// Test hook (compiled out of non-test builds). The off-lock verify's first
+// shared-lock scope reads the registry and the opened directory's identity
+// through `read_entry_observed` and `dir_identity_observed`, which call it as
+// `verify_entry_read` and `verify_dir_identity` from inside the operation, so
+// the observation moves wherever the operation does.
 #[cfg(test)]
 type Hook = Option<Box<dyn FnMut(&str)>>;
 #[cfg(test)]
@@ -582,6 +583,22 @@ thread_local! {
 fn hook(_phase: &str) {
     #[cfg(test)]
     HOOK.with(|h| if let Ok(mut f) = h.try_borrow_mut() && let Some(f) = f.as_mut() { f(_phase) });
+}
+
+/// `read_entry`, then the `verify_entry_read` hook. Outside tests it is the
+/// plain call.
+fn read_entry_observed(registry: &Path, name: &str) -> Result<Option<Entry>> {
+    let entry = read_entry(registry, name);
+    hook("verify_entry_read");
+    entry
+}
+
+/// `dir_identity`, then the `verify_dir_identity` hook. Outside tests it is
+/// the plain call.
+fn dir_identity_observed(dir: &File) -> Result<DirIdentity> {
+    let identity = dir_identity(dir);
+    hook("verify_dir_identity");
+    identity
 }
 
 /// An off-lock rehash (`verify_unlocked_with_deadline`) stopped because its
@@ -621,12 +638,10 @@ fn verify_off_lock(roots: &Roots, name: &str, deadline: Instant, now: &mut dyn F
     -> Result<Entry> {
     let (entry, dir) = {
         let _lock = lock_shared_until(&roots.images, name, deadline, now)?;
-        let entry = read_entry(&roots.registry, name)?.filter(|e| e.state == State::Registered)
+        let entry = read_entry_observed(&roots.registry, name)?.filter(|e| e.state == State::Registered)
             .with_context(|| format!("image {name:?} is not registered"))?;
-        hook("verify_entry_read");
         let dir = open_image(roots, name)?;
-        ensure!(dir_identity(&dir)? == entry.directory, "image {name:?} is not the registered directory");
-        hook("verify_opened");
+        ensure!(dir_identity_observed(&dir)? == entry.directory, "image {name:?} is not the registered directory");
         (entry, dir)
     };
     let tree = tree_digest_checked(&dir, &mut || {
@@ -2063,10 +2078,13 @@ mod tests {
             }).unwrap()
         });
         assert_eq!(got, entry);
-        // Reading the entry, opening the directory and checking it all happen
-        // inside the first shared lock: a writer's lock would block there.
+        // The registry read and the opened directory's identity query each
+        // run inside the first shared lock: their hooks fire from inside the
+        // call, where a writer's lock would block. The directory is opened
+        // between them (the identity is read from it, and the swap test
+        // below shows it is opened after the entry is read), so it is too.
         assert_eq!(*seen.borrow(), [("verify_entry_read".to_owned(), Some(Errno::EWOULDBLOCK)),
-            ("verify_opened".to_owned(), Some(Errno::EWOULDBLOCK))]);
+            ("verify_dir_identity".to_owned(), Some(Errno::EWOULDBLOCK))]);
         // After the first scope the walk proceeds with the lock free (the
         // last sample is the final check, under the final lock).
         let walk = entry.entries as usize;
@@ -2095,15 +2113,16 @@ mod tests {
             fs::rename(roots.images.join("img-held"), roots.images.join("img")).unwrap();
             (e, calls)
         };
-        // Moved once the directory is opened and checked, just before the
-        // first lock is released: the walk goes on through the opened
-        // descriptor (all its entries, not the new directory's one), and the
-        // final recheck refuses the name.
-        let (e, calls) = swap_at("verify_opened");
+        // Moved once the opened directory's identity is read, just before it
+        // is compared and the first lock is released: the walk goes on
+        // through the opened descriptor (all its entries, not the new
+        // directory's one), and the final recheck refuses the name.
+        let (e, calls) = swap_at("verify_dir_identity");
         assert!(format!("{e:#}").contains("image \"img\" changed while it was verified"), "{e:#}");
         assert_eq!(calls, entry.entries, "the walk hashed the directory it opened");
-        // Moved before the open: the identity check on the opened descriptor
-        // refuses it and nothing is walked.
+        // Moved after the entry is read, before the open: the directory is
+        // opened by name after that, so the identity check on it refuses it
+        // and nothing is walked.
         let (e, calls) = swap_at("verify_entry_read");
         assert!(format!("{e:#}").contains("image \"img\" is not the registered directory"), "{e:#}");
         assert_eq!(calls, 0);
