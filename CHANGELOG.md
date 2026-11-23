@@ -5,6 +5,9 @@ before 1.0, any minor release may change the CLI or on-disk layout.
 
 ## Unreleased
 
+- Stop capture's image check from succeeding just after its deadline when
+  the registry lock frees up at the last moment.
+
 - Rehash the image for `kiln checkpoint capture` and a fork's preflight
   without holding the image registry lock, and give it a deadline. Before,
   both ran `kiln image verify`, which holds the lock (shared) for the whole
