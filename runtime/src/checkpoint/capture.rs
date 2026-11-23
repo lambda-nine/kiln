@@ -388,6 +388,7 @@ mod tests {
 
     #[test]
     fn capture_restore_round_trip_is_exact_and_independent() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("roundtrip");
         let store = Store::under(&root.join("runs"), false);
         fs::create_dir(root.join("runs")).unwrap();
@@ -455,6 +456,7 @@ mod tests {
     /// interrupted removal is left for an unchecked removal.
     #[test]
     fn generation_checked_removal_touches_only_its_generation() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("rmgen");
         fs::create_dir(root.join("runs")).unwrap();
         let store = Store::under(&root.join("runs"), false);
@@ -561,6 +563,7 @@ mod tests {
     /// 2, whether it checks a generation or not.
     #[test]
     fn a_stale_removal_never_deletes_a_replacement_generation() {
+        let _no_forks = crate::fork_guard::no_forks();
         for (n, generation) in [(499, Some(1)), (498, None)] {
             let root = scratch("rm-rebound");
             let runs = root.join("runs");
@@ -603,6 +606,7 @@ mod tests {
     /// removal deletes only the directory it locked.
     #[test]
     fn a_capture_publishing_during_a_removal_keeps_its_generation() {
+        let _no_forks = crate::fork_guard::no_forks();
         for (n, remover_at) in [(497, "remove_locked"), (496, "remove_renamed")] {
             let root = scratch("rm-publish");
             let runs = root.join("runs");
@@ -654,6 +658,7 @@ mod tests {
     /// checked; a checked removal leaves the ones it can't parse alone.
     #[test]
     fn an_unchecked_removal_sweeps_malformed_names() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("rm-malformed");
         fs::create_dir(root.join("runs")).unwrap();
         let store = Store::under(&root.join("runs"), false);
@@ -686,6 +691,7 @@ mod tests {
 
     #[test]
     fn empty_upper_and_refusals_leave_no_staging() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("empty");
         fs::create_dir(root.join("runs")).unwrap();
         let store = Store::under(&root.join("runs"), false);
@@ -718,6 +724,7 @@ mod tests {
 
     #[test]
     fn tampered_artifacts_are_corrupt_and_never_restored() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("tamper");
         fs::create_dir(root.join("runs")).unwrap();
         let store = Store::under(&root.join("runs"), false);
@@ -769,6 +776,7 @@ mod tests {
 
     #[test]
     fn restore_refuses_a_non_empty_destination_and_generated_conflicts() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("dest");
         fs::create_dir(root.join("runs")).unwrap();
         let store = Store::under(&root.join("runs"), false);
@@ -865,6 +873,7 @@ mod tests {
     /// capture publishes.
     #[test]
     fn concurrent_captures_never_touch_each_others_staging() {
+        let _no_forks = crate::fork_guard::no_forks();
         use std::sync::{Arc, Barrier, mpsc};
         let root = scratch("lock-race");
         let runs = root.join("runs");
@@ -920,6 +929,7 @@ mod tests {
     /// before the record (derived from the capture's own header) is returned.
     #[test]
     fn capture_never_returns_a_replacement_generation() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("rebound");
         let runs = root.join("runs");
         fs::create_dir(&runs).unwrap();
@@ -954,6 +964,7 @@ mod tests {
     /// the staged directory; nothing is ever published.
     #[test]
     fn oversized_charge_is_never_published() {
+        let _no_forks = crate::fork_guard::no_forks();
         let root = scratch("charge");
         let runs = root.join("runs");
         fs::create_dir(&runs).unwrap();
@@ -990,6 +1001,7 @@ mod tests {
     /// `restore`. Skipped when unset.
     #[test]
     fn prepared_worst_case_within_the_worker_budget() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (Ok(fixture), Ok(runs), Ok(step)) = (std::env::var("KILN_CHECKPOINT_FIXTURE"),
             std::env::var("KILN_CHECKPOINT_RUNS"), std::env::var("KILN_CHECKPOINT_STEP")) else {
             eprintln!("skipped: no fixture"); return;

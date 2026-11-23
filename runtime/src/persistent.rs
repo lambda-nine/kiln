@@ -2327,11 +2327,10 @@ mod tests {
         fs::create_dir_all(run.join("upper/tmp")).unwrap();
         for file in ["shim.start", "shim.pid", crate::image::REFERENCE_FILE] { fs::write(run.join(file), "1").unwrap(); }
         crate::rmtree::tests::chain(&run.join("upper/tmp"), 3000, 499);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::fork_guard::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "persistent::tests::child_gc_removes_a_deep_tree_under_a_low_descriptor_limit",
                 "--ignored", "--nocapture", "--test-threads=1"])
-            .env(DEEP_GC_CHILD, &root)
-            .output().unwrap();
+            .env(DEEP_GC_CHILD, &root)).unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         let left = run.exists();
         if left { crate::container::remove_run_dir(&run).unwrap(); }
@@ -2481,11 +2480,10 @@ mod tests {
 
     fn kill_the_create_in_a_child_process(point: container::Handoff) {
         if unsafe { libc::geteuid() } != 0 { eprintln!("skipped: needs root, kiln's runs root and the alpine image"); return; }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::fork_guard::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "persistent::tests::child_kill_the_create_at_a_handoff_point",
                 "--ignored", "--nocapture", "--test-threads=1"])
-            .env(HANDOFF_CHILD, format!("{point:?}"))
-            .output().unwrap();
+            .env(HANDOFF_CHILD, format!("{point:?}"))).unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success() && text.contains("1 passed"), "{text}");
         eprintln!("{}", text.lines().filter(|l| l.starts_with("handoff ")).collect::<Vec<_>>().join("\n"));
@@ -2590,6 +2588,9 @@ mod tests {
         let run = container::run_dir(&id);
         let (report_rx, report_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
         let (release_rx, release_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        // Until the create is reaped (below), though this process runs
+        // only this test.
+        let forking = crate::fork_guard::forking();
         // SAFETY: this process runs only this test, and the child is the
         // create: it runs `create_in` as the CLI would, then exits.
         let create = match unsafe { fork() }.unwrap() {
@@ -2617,6 +2618,7 @@ mod tests {
         let shim = nix::unistd::Pid::from_raw(i32::from_ne_bytes(pid));
         kill(create, SIGKILL).unwrap();
         waitpid(create, None).unwrap();
+        drop(forking);
 
         let mut h = Handed { run: run.clone(), alive: false, reached: Vec::new(), had_identity: Vec::new(),
             listed_live: Vec::new(), killed_by_test: false, timed_out: false, status: None, left: Left::Absent,

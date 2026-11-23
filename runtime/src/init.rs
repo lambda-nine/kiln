@@ -1172,6 +1172,9 @@ mod tests {
         let held = fs::File::open(&root).unwrap();
         fs::write(root.join("held-dir-fd"), held.as_raw_fd().to_string()).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        // The socket file appears at bind(), before listen(); a connect in
+        // between is refused, so clients wait for this marker instead.
+        fs::write(root.join("listening"), "").unwrap();
         let scope = ExecCgroup::protocol_fixture(&root);
         let result = serve(&listener, &scope);
         if root.join("expect-fatal").exists() { assert!(result.is_err()); }
@@ -1199,9 +1202,9 @@ mod tests {
                 }
                 Ok(())
             }); }
-            let child = command.spawn().unwrap();
+            let child = crate::fork_guard::spawn(&mut command).unwrap();
             let server = Self { child, root };
-            server.wait_for("control.sock");
+            server.wait_for("listening");
             server
         }
         fn wait_for(&self, name: &str) {

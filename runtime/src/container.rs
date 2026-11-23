@@ -1753,11 +1753,10 @@ mod tests {
         crate::rmtree::tests::chain(&run.join("upper/tmp"), DEEP, 997);
         fs::create_dir(root.join("std")).unwrap();
         crate::rmtree::tests::chain(&root.join("std"), DEEP, 997);
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = crate::fork_guard::output(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "container::tests::child_removes_a_deep_tree_under_a_low_descriptor_limit",
                 "--ignored", "--nocapture", "--test-threads=1"])
-            .env(DEEP_CHILD, &root)
-            .output().unwrap();
+            .env(DEEP_CHILD, &root)).unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success() && text.contains("1 passed"), "{text}");
         assert!(!run.exists(), "the deep run directory survived: {text}");

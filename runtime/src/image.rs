@@ -2004,6 +2004,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_matches_verify() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-ok");
         let dir = image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2026,6 +2027,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_stops_at_its_deadline_and_frees_the_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-deadline");
         image(&roots, "img");
         register(&roots, "img").unwrap();
@@ -2057,6 +2059,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_refuses_a_lock_acquired_at_the_deadline() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-relock-deadline");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2087,6 +2090,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_refuses_a_first_lock_acquired_at_the_deadline() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-lock-deadline");
         image(&roots, "img");
         register(&roots, "img").unwrap();
@@ -2118,6 +2122,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_refuses_an_uncontended_relock_after_its_deadline() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-final-deadline");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2146,6 +2151,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_opens_the_image_under_the_first_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-scope");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2185,6 +2191,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_binds_the_directory_opened_under_the_first_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-scope-swap");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2224,6 +2231,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_uses_the_entry_read_under_the_first_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-entry");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2256,6 +2264,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_uses_the_identity_queried_under_the_first_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-identity");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2278,6 +2287,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_keeps_a_missing_first_lock_entry() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-entry-missing");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2298,6 +2308,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_keeps_a_failed_first_lock_entry_read() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-entry-error");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2317,6 +2328,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_keeps_a_failed_first_lock_identity_query() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-first-identity-error");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2339,6 +2351,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_keeps_a_failed_or_missing_recheck_entry_read() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-recheck-entry");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2366,6 +2379,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_refuses_a_name_gone_at_the_recheck() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-recheck-gone");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2398,6 +2412,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_hashes_without_the_registry_lock() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-free");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();
@@ -2418,6 +2433,7 @@ mod tests {
 
     #[test]
     fn off_lock_verify_refuses_a_registration_changed_during_the_walk() {
+        let _no_forks = crate::fork_guard::no_forks();
         let (root, roots) = scratch("offlock-changed");
         image(&roots, "img");
         let entry = register(&roots, "img").unwrap();

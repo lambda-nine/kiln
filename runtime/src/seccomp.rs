@@ -292,6 +292,8 @@ mod tests {
     #[test]
     fn kernel_enforces_ioctl_rule() {
         let prog = program();
+        // Until the child has exited (below).
+        let _forking = crate::fork_guard::forking();
         // SAFETY: the child only makes raw syscalls (no allocation or locks)
         // before _exit, so forking the multi-threaded test process is fine.
         match unsafe { libc::fork() } {

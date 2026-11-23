@@ -5,6 +5,8 @@ mod container;
 mod dns;
 mod exec_options;
 mod exec_protocol;
+#[cfg(test)]
+mod fork_guard;
 mod image;
 mod init;
 mod landlock;
