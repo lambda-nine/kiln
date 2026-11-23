@@ -568,16 +568,25 @@ pub fn verify(roots: &Roots, name: &str) -> Result<Entry> {
     Ok(entry)
 }
 
-// Test hook (compiled out of non-test builds). The off-lock verify's first
+// Test seam (compiled out of non-test builds). The off-lock verify's first
 // shared-lock scope reads the registry and the opened directory's identity
-// through `read_entry_observed` and `dir_identity_observed`, which call it as
-// `verify_entry_read` and `verify_dir_identity` from inside the operation, so
-// the observation moves wherever the operation does.
+// through `read_entry_observed` and `dir_identity_observed`, which call the
+// hook as `verify_entry_read` and `verify_dir_identity` from inside the
+// operation, so the observation moves wherever the operation does. A test
+// can also replace the value each of them returns (`ENTRY_OVERRIDE`,
+// `IDENTITY_OVERRIDE`), so it can tell the observed result from that of any
+// other read or query. The final recheck's registry read
+// (`read_entry_rechecked`) applies the same entry override, without a hook,
+// so an overridden registration reads the same at both ends.
 #[cfg(test)]
 type Hook = Option<Box<dyn FnMut(&str)>>;
 #[cfg(test)]
+type Override<T> = Option<Box<dyn Fn(T) -> T>>;
+#[cfg(test)]
 thread_local! {
     static HOOK: std::cell::RefCell<Hook> = const { std::cell::RefCell::new(None) };
+    static ENTRY_OVERRIDE: std::cell::RefCell<Override<Entry>> = const { std::cell::RefCell::new(None) };
+    static IDENTITY_OVERRIDE: std::cell::RefCell<Override<DirIdentity>> = const { std::cell::RefCell::new(None) };
 }
 
 fn hook(_phase: &str) {
@@ -585,18 +594,34 @@ fn hook(_phase: &str) {
     HOOK.with(|h| if let Ok(mut f) = h.try_borrow_mut() && let Some(f) = f.as_mut() { f(_phase) });
 }
 
-/// `read_entry`, then the `verify_entry_read` hook. Outside tests it is the
-/// plain call.
+/// A test's `ENTRY_OVERRIDE` applied to a registry read's entry. Outside
+/// tests it returns the read unchanged.
+fn entry_overridden(entry: Result<Option<Entry>>) -> Result<Option<Entry>> {
+    #[cfg(test)]
+    let entry = entry.map(|e| e.map(|e| ENTRY_OVERRIDE.with(|o| match o.borrow().as_ref() { Some(f) => f(e), None => e })));
+    entry
+}
+
+/// `read_entry`, its entry override, then the `verify_entry_read` hook.
+/// Outside tests it is the plain call.
 fn read_entry_observed(registry: &Path, name: &str) -> Result<Option<Entry>> {
-    let entry = read_entry(registry, name);
+    let entry = entry_overridden(read_entry(registry, name));
     hook("verify_entry_read");
     entry
 }
 
-/// `dir_identity`, then the `verify_dir_identity` hook. Outside tests it is
-/// the plain call.
+/// `read_entry` and its entry override, with no hook: the off-lock verify's
+/// final recheck. Outside tests it is the plain call.
+fn read_entry_rechecked(registry: &Path, name: &str) -> Result<Option<Entry>> {
+    entry_overridden(read_entry(registry, name))
+}
+
+/// `dir_identity`, its identity override, then the `verify_dir_identity`
+/// hook. Outside tests it is the plain call.
 fn dir_identity_observed(dir: &File) -> Result<DirIdentity> {
     let identity = dir_identity(dir);
+    #[cfg(test)]
+    let identity = identity.map(|i| IDENTITY_OVERRIDE.with(|o| match o.borrow().as_ref() { Some(f) => f(i), None => i }));
     hook("verify_dir_identity");
     identity
 }
@@ -650,7 +675,7 @@ fn verify_off_lock(roots: &Roots, name: &str, deadline: Instant, now: &mut dyn F
     })?;
     {
         let _lock = lock_shared_until(&roots.images, name, deadline, now)?;
-        let current = read_entry(&roots.registry, name)?;
+        let current = read_entry_rechecked(&roots.registry, name)?;
         let resolves = open_image(roots, name).and_then(|d| dir_identity(&d)).is_ok_and(|d| d == entry.directory);
         ensure!(current.as_ref() == Some(&entry) && resolves, "image {name:?} changed while it was verified");
         ensure!(now() < deadline, VerifyDeadline { name: name.to_owned() });
@@ -1919,6 +1944,24 @@ mod tests {
         out
     }
 
+    /// Runs `body` with `f` replacing the entry the off-lock verify's
+    /// first-lock registry read and its final recheck return.
+    fn with_entry_override<T>(f: impl Fn(Entry) -> Entry + 'static, body: impl FnOnce() -> T) -> T {
+        ENTRY_OVERRIDE.with(|o| *o.borrow_mut() = Some(Box::new(f)));
+        let out = body();
+        ENTRY_OVERRIDE.with(|o| *o.borrow_mut() = None);
+        out
+    }
+
+    /// Runs `body` with `f` replacing the identity the off-lock verify's
+    /// first-lock identity query returns.
+    fn with_identity_override<T>(f: impl Fn(DirIdentity) -> DirIdentity + 'static, body: impl FnOnce() -> T) -> T {
+        IDENTITY_OVERRIDE.with(|o| *o.borrow_mut() = Some(Box::new(f)));
+        let out = body();
+        IDENTITY_OVERRIDE.with(|o| *o.borrow_mut() = None);
+        out
+    }
+
     #[test]
     fn off_lock_verify_matches_verify() {
         let (root, roots) = scratch("offlock-ok");
@@ -2080,9 +2123,15 @@ mod tests {
         assert_eq!(got, entry);
         // The registry read and the opened directory's identity query each
         // run inside the first shared lock: their hooks fire from inside the
-        // call, where a writer's lock would block. The directory is opened
-        // between them (the identity is read from it, and the swap test
-        // below shows it is opened after the entry is read), so it is too.
+        // call, where a writer's lock would block (this test). Their results
+        // are the ones verification uses: two tests replace each result and
+        // see verification act on the replacement
+        // (`off_lock_verify_uses_the_entry_read_under_the_first_lock`,
+        // `off_lock_verify_uses_the_identity_queried_under_the_first_lock`).
+        // The directory is opened between them: the identity is read from it,
+        // and `off_lock_verify_binds_the_directory_opened_under_the_first_lock`
+        // shows it is opened after the entry is read. So the open is under
+        // the lock too.
         assert_eq!(*seen.borrow(), [("verify_entry_read".to_owned(), Some(Errno::EWOULDBLOCK)),
             ("verify_dir_identity".to_owned(), Some(Errno::EWOULDBLOCK))]);
         // After the first scope the walk proceeds with the lock free (the
@@ -2126,6 +2175,55 @@ mod tests {
         let (e, calls) = swap_at("verify_entry_read");
         assert!(format!("{e:#}").contains("image \"img\" is not the registered directory"), "{e:#}");
         assert_eq!(calls, 0);
+        assert!(exclusive_is_free(&roots.images));
+        assert_eq!(verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap(), entry);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_lock_verify_uses_the_entry_read_under_the_first_lock() {
+        let (root, roots) = scratch("offlock-first-entry");
+        image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        // The first-lock registry read (and the recheck's, so the two still
+        // agree) records a content digest the image doesn't have. The refusal
+        // is the content mismatch, so the content check used that read's
+        // entry, not one from any other read.
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = reads.clone();
+        let e = with_entry_override(move |mut e| {
+            counted.set(counted.get() + 1);
+            e.sha256 = "0".repeat(64);
+            e
+        }, || verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap_err());
+        assert!(format!("{e:#}").contains("image \"img\" content differs from its registration")
+            && deadline_of(&e).is_none(), "{e:#}");
+        assert_eq!(reads.get(), 2, "the first-lock read and the recheck's");
+        // A registration that differs only in generation verifies, and the
+        // entry returned is the one read under the first lock.
+        let got = with_entry_override(|mut e| { e.generation += 1; e },
+            || verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap());
+        assert_eq!(got, Entry { generation: entry.generation + 1, ..entry.clone() });
+        assert_eq!(verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap(), entry);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_lock_verify_uses_the_identity_queried_under_the_first_lock() {
+        let (root, roots) = scratch("offlock-first-identity");
+        image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        // The first-lock identity query reports a directory other than the
+        // registered one. The refusal comes from the identity check, before
+        // anything is walked, so that check used this query's result, not
+        // one from any other query.
+        let mut calls = 0u64;
+        let e = with_identity_override(|mut i| { i.ino ^= 1; i },
+            || verify_off_lock(&roots, "img", far, &mut || { calls += 1; Instant::now() }).unwrap_err());
+        assert!(format!("{e:#}").contains("image \"img\" is not the registered directory"), "{e:#}");
+        assert_eq!(calls, 0, "nothing was walked");
         assert!(exclusive_is_free(&roots.images));
         assert_eq!(verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap(), entry);
         fs::remove_dir_all(root).unwrap();
