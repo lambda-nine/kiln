@@ -2365,6 +2365,38 @@ mod tests {
     }
 
     #[test]
+    fn off_lock_verify_refuses_a_name_gone_at_the_recheck() {
+        let (root, roots) = scratch("offlock-recheck-gone");
+        image(&roots, "img");
+        let entry = register(&roots, "img").unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        // The name stops resolving once the walk is done (as in
+        // `off_lock_verify_refuses_a_registration_changed_during_the_walk`,
+        // a held registry lock keeps the move out of the walk). The recheck
+        // can't open it, so the image changed while it was verified; the
+        // held descriptor is not queried in its place.
+        let walk_calls = entry.entries;
+        let mut held = None;
+        let mut calls = 0u64;
+        let (e, raw) = raw_calls(|| verify_off_lock(&roots, "img", far, &mut || {
+            calls += 1;
+            if calls == 1 { held = Some(lock(&roots.images, true).unwrap()); }
+            if calls == walk_calls + 1 {
+                fs::rename(roots.images.join("img"), roots.images.join("img-held")).unwrap();
+                held = None;
+            }
+            Instant::now()
+        }).unwrap_err());
+        assert!(held.is_none() && calls == walk_calls + 2, "calls {calls}");
+        assert_eq!(format!("{e:#}"), "image \"img\" changed while it was verified");
+        assert_eq!(raw, RawCalls { read_entry: 2, dir_identity: 1 }, "only the first-lock identity query");
+        assert!(exclusive_is_free(&roots.images));
+        fs::rename(roots.images.join("img-held"), roots.images.join("img")).unwrap();
+        assert_eq!(verify_off_lock(&roots, "img", far, &mut Instant::now).unwrap(), entry);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn off_lock_verify_hashes_without_the_registry_lock() {
         let (root, roots) = scratch("offlock-free");
         image(&roots, "img");
