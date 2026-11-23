@@ -1212,11 +1212,24 @@ mod tests {
     /// long enough that a client starved of CPU for a while between connect
     /// and send, as under heavy load, isn't cut off.
     const FIXTURE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+    const READ_TIMEOUT_ENV: &str = "KILN_PROTOCOL_FIXTURE_READ_TIMEOUT_MS";
+
+    /// The deadline tests run the fixture without a window of its own, so they
+    /// exercise this fallback; pin it and the production window it returns.
+    #[test]
+    fn production_read_timeout_is_two_seconds_without_a_fixture_window() {
+        assert!(std::env::var_os(READ_TIMEOUT_ENV).is_none(), "test process has a fixture window set");
+        assert_eq!(REQUEST_READ_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(request_read_timeout(), REQUEST_READ_TIMEOUT);
+    }
 
     struct Server { child: Child, root: std::path::PathBuf }
     impl Server {
-        fn start() -> Self { Self::start_with_read_timeout(FIXTURE_READ_TIMEOUT) }
-        fn start_with_read_timeout(read_timeout: Duration) -> Self {
+        fn start() -> Self { Self::start_with_read_timeout(Some(FIXTURE_READ_TIMEOUT)) }
+        /// For the tests about the deadline: no fixture window is set, so PID 1
+        /// runs exactly the production fallback, `REQUEST_READ_TIMEOUT`.
+        fn start_production_deadline() -> Self { Self::start_with_read_timeout(None) }
+        fn start_with_read_timeout(read_timeout: Option<Duration>) -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!("kiln-protocol-{}-{id}", std::process::id()));
@@ -1227,8 +1240,11 @@ mod tests {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command.args(["--exact", "init::tests::protocol_server_fixture", "--test-threads=1"])
                 .env("KILN_PROTOCOL_FIXTURE", &root)
-                .env("KILN_PROTOCOL_FIXTURE_READ_TIMEOUT_MS", read_timeout.as_millis().to_string())
                 .stdout(Stdio::null()).stderr(Stdio::inherit());
+            match read_timeout {
+                Some(window) => command.env(READ_TIMEOUT_ENV, window.as_millis().to_string()),
+                None => command.env_remove(READ_TIMEOUT_ENV),
+            };
             unsafe { command.pre_exec(|| {
                 let mut mask: libc::sigset_t = std::mem::zeroed();
                 libc::sigfillset(&mut mask);
@@ -1653,7 +1669,7 @@ mod tests {
 
     #[test]
     fn partial_busy_header_descriptors_close_at_its_deadline() {
-        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
+        let server = Server::start_production_deadline();
         let (active, out, err, _pid) = server.start_sleeper();
         let start = Instant::now();
         let (partial, partial_out, partial_err) = server.start_exec_prefix(4, 1024, 1);
@@ -1790,7 +1806,7 @@ mod tests {
 
     #[test]
     fn lease_excludes_exec_answers_probes_and_needs_no_timer() {
-        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
+        let server = Server::start_production_deadline();
         let (mut lease, generation) = server.lease();
         assert_eq!(generation, 1);
         let marker = server.root.join("ran-during-lease");
@@ -1918,7 +1934,7 @@ mod tests {
     /// reply now waits like an exec reply; its connect stays bounded.
     #[test]
     fn feature_probes_wait_behind_stalled_connections_like_exec() {
-        let server = Server::start_with_read_timeout(REQUEST_READ_TIMEOUT);
+        let server = Server::start_production_deadline();
         let socket = server.root.join("control.sock");
         for probe in [0, 1] {
             let stalled = [server.partial_header(), server.partial_header()];
