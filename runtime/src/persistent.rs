@@ -2894,42 +2894,60 @@ mod tests {
             let error = format!("{:#}", read_options_fd(fd, status.as_raw_fd(), stdio_fds).unwrap_err());
             assert!(error.contains(expected), "{expected}: {error}");
         };
+        // A refused descriptor it took is closed too: checked the same way,
+        // through a kept duplicate the number must no longer refer to.
+        let refused_and_closed = |fd: OwnedFd, expected: &str| {
+            let witness = fd.try_clone().unwrap();
+            let number = fd.into_raw_fd();
+            refused(number, expected);
+            assert!(!refers_to(number, &witness), "{expected}: the refused options fd was left open");
+        };
         for missing in [libc::F_SEAL_SEAL, libc::F_SEAL_SHRINK, libc::F_SEAL_GROW, libc::F_SEAL_WRITE] {
-            refused(memfd(&frame, true, all & !missing).into_raw_fd(), "exactly");
+            refused_and_closed(memfd(&frame, true, all & !missing), "exactly");
         }
-        refused(memfd(&frame, true, 0).into_raw_fd(), "exactly");
-        refused(memfd(&frame, false, 0).into_raw_fd(), "exactly");
-        refused(memfd(&frame, true, all | libc::F_SEAL_FUTURE_WRITE).into_raw_fd(), "exactly");
+        refused_and_closed(memfd(&frame, true, 0), "exactly");
+        refused_and_closed(memfd(&frame, false, 0), "exactly");
+        refused_and_closed(memfd(&frame, true, all | libc::F_SEAL_FUTURE_WRITE), "exactly");
         let regular = std::env::temp_dir().join(format!("kiln-options-{}", std::process::id()));
         fs::write(&regular, &frame).unwrap();
-        refused(fs::File::open(&regular).unwrap().into_raw_fd(), "must be a memfd");
+        refused_and_closed(fs::File::open(&regular).unwrap().into(), "must be a memfd");
+        // Unlinked, it has no links like a memfd, but its fd link isn't /memfd:.
+        let unlinked = fs::File::open(&regular).unwrap();
         fs::remove_file(&regular).unwrap();
+        refused_and_closed(unlinked.into(), "must be a memfd");
         let (pipe_rx, _pipe_tx) = pipe2(OFlag::O_CLOEXEC).unwrap();
-        refused(pipe_rx.into_raw_fd(), "must be a memfd");
+        refused_and_closed(pipe_rx, "must be a memfd");
         refused(fs::File::open("/").unwrap().into_raw_fd(), "must be a memfd");
+        // A directory of this test's own, so no other thread's open of the
+        // same directory can make the number look like it still refers to it.
+        let dir = std::env::temp_dir().join(format!("kiln-options-dir-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        refused_and_closed(fs::File::open(&dir).unwrap().into(), "must be a memfd");
+        fs::remove_dir(&dir).unwrap();
         // One byte past the bound, sealed, is refused before it is read.
-        refused(memfd(&vec![0; exec_options::MAX_FRAME + 1], true, all).into_raw_fd(), "frame bound");
+        refused_and_closed(memfd(&vec![0; exec_options::MAX_FRAME + 1], true, all), "frame bound");
         // Sealed but malformed or out-of-bounds contents.
         let mut bad = frame.clone(); bad[24] = b'w';
-        refused(memfd(&bad, true, all).into_raw_fd(), "cwd must start with /");
-        refused(memfd(&[], true, all).into_raw_fd(), "truncated");
+        refused_and_closed(memfd(&bad, true, all), "cwd must start with /");
+        refused_and_closed(memfd(&[], true, all), "truncated");
         // A write-only or O_PATH descriptor of a valid memfd can't be read.
         let fd = memfd(&frame, true, all);
         let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        refused(fs::OpenOptions::new().write(true).open(&path).unwrap().into_raw_fd(), "readable");
+        refused_and_closed(fs::OpenOptions::new().write(true).open(&path).unwrap().into(), "readable");
         let opath = unsafe { libc::open(std::ffi::CString::new(path).unwrap().as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         assert!(opath >= 0);
-        refused(opath, "readable");
+        refused_and_closed(unsafe { OwnedFd::from_raw_fd(opath) }, "readable");
         // Private numbers only, distinct from status and stdio; no aliasing.
         refused(status.as_raw_fd(), "distinct");
         refused(stdio_fds[1], "distinct");
         refused(2, "distinct");
         refused(9999, "invalid exec options fd");
         let shared = memfd(&frame, true, all);
-        let alias = shared.try_clone().unwrap();
-        let error = format!("{:#}", read_options_fd(alias.into_raw_fd(), status.as_raw_fd(),
+        let alias = shared.try_clone().unwrap().into_raw_fd();
+        let error = format!("{:#}", read_options_fd(alias, status.as_raw_fd(),
             [stdio_fds[0], shared.as_raw_fd(), stdio_fds[2]]).unwrap_err());
         assert!(error.contains("aliases workload stdio"), "{error}");
+        assert!(!refers_to(alias, &shared), "the aliasing options fd was left open");
     }
 
     #[test]
